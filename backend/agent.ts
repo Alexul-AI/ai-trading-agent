@@ -30,7 +30,7 @@ export interface AgentResponse {
 const model = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
   systemInstruction:
-    "You are an elite AI Trading Assistant. Give brief, professional conversational responses. The UI automatically displays charts and portfolio widgets using tool data, so NEVER output raw JSON arrays or long data lists in your chat text. Just give a short 1-2 sentence friendly summary.",
+    "You are an AI Trading Assistant. CRITICAL RULES: 1. If the user asks to BUY or SELL a stock, you MUST ALWAYS use the 'execute_trade' tool. 2. When asked to analyze a portfolio and allocate budget, you MUST respond ONLY with a valid JSON array of objects. Do not include any markdown formatting.",
   tools: [
     {
       functionDeclarations: [
@@ -85,6 +85,29 @@ const model = genAI.getGenerativeModel({
             required: ["tickers", "budget"],
           },
         },
+        {
+          name: "execute_trade",
+          description:
+            "Executes a simulated buy or sell order for a stock using the user's virtual portfolio.",
+          parameters: {
+            type: SchemaType.OBJECT,
+            properties: {
+              ticker: {
+                type: SchemaType.STRING,
+                description: "Stock ticker to trade",
+              },
+              action: {
+                type: SchemaType.STRING,
+                description: "'BUY' or 'SELL'",
+              },
+              shares: {
+                type: SchemaType.NUMBER,
+                description: "Number of shares to trade",
+              },
+            },
+            required: ["ticker", "action", "shares"],
+          },
+        },
       ],
     },
   ],
@@ -108,7 +131,6 @@ async function getStockPrice(ticker: string) {
   }
 }
 
-// BULLETPROOF HISTORICAL DATA FETCHER
 async function getHistoricalPrices(
   ticker: string,
 ): Promise<{ data?: ChartPoint[]; error?: string }> {
@@ -123,8 +145,6 @@ async function getHistoricalPrices(
     let chartData: ChartPoint[] = [];
 
     try {
-      // FIX 1: Use explicitly .chart() instead of deprecated .historical()
-      // FIX 2: Explicitly provide period2 to satisfy yahoo-finance2 schema validation
       const chartResult = (await yahooFinance.chart(ticker, {
         period1: thirtyDaysAgo,
         period2: today,
@@ -154,11 +174,10 @@ async function getHistoricalPrices(
       }
     } catch (apiError) {
       console.warn(
-        `⚠️ [BACKEND WARNING]: Yahoo API rejected historical data for ${ticker}. Generating mock trend based on current price to prevent agent failure...`,
+        `⚠️ [BACKEND WARNING]: Yahoo API rejected historical data for ${ticker}. Generating mock trend based on current price...`,
       );
     }
 
-    // FALLBACK: If Yahoo Finance blocked the endpoint
     if (chartData.length === 0) {
       const liveQuote = (await yahooFinance.quote(ticker)) as any;
       if (!liveQuote || !liveQuote.regularMarketPrice) {
@@ -171,7 +190,7 @@ async function getHistoricalPrices(
       for (let i = 6; i >= 0; i--) {
         const d = new Date();
         d.setDate(d.getDate() - i);
-        const randomVariance = basePrice * (Math.random() * 0.04 - 0.02); // +/- 2% daily variance
+        const randomVariance = basePrice * (Math.random() * 0.04 - 0.02);
         chartData.push({
           date: d.toLocaleDateString("en-US", {
             month: "short",
@@ -192,9 +211,6 @@ async function getHistoricalPrices(
 }
 
 export async function getWatchlistQuotes(tickers: string[]) {
-  console.log(
-    `\n⚙️ [BACKEND] Fetching batch quotes for watchlist: ${tickers.join(", ")}`,
-  );
   return Promise.all(
     tickers.map(async (ticker) => {
       try {
@@ -234,7 +250,6 @@ export async function runTradingAgentStep(
     : [];
 
   const chat = model.startChat({ history: formattedHistory });
-  console.log(`👤 [USER]: ${userMessage}`);
 
   const result = await chat.sendMessage(userMessage);
   const calls = result.response.functionCalls();
@@ -278,13 +293,11 @@ export async function runTradingAgentStep(
       for (let i = 0; i < tickers.length; i++) {
         const currentTicker = tickers[i];
         const currentResult = results[i];
-
         if (
           typeof currentTicker === "string" &&
           currentResult &&
           currentResult.data
         ) {
-          // Send only last 7 days to keep the context tight and focused for the LLM
           marketData[currentTicker] = currentResult.data.slice(-7);
         }
       }
@@ -306,40 +319,66 @@ export async function runTradingAgentStep(
       ]`;
 
       try {
-        console.log(
-          `⚙️ [BACKEND] Requesting Gemini to analyze portfolio with Strict JSON mode...`,
-        );
-
-        // FIX 3: Create a separate, clean model instance without tools to allow application/json
         const jsonModel = genAI.getGenerativeModel({
           model: "gemini-2.5-flash",
-          generationConfig: {
-            responseMimeType: "application/json",
-          },
+          generationConfig: { responseMimeType: "application/json" },
         });
 
         const analysisResult = await jsonModel.generateContent(analysisPrompt);
+        finalPortfolio = JSON.parse(analysisResult.response.text());
 
-        const text = analysisResult.response.text();
-        finalPortfolio = JSON.parse(text); // No more regex guessing, pure JSON guaranteed!
-
-        if (!Array.isArray(finalPortfolio)) {
+        if (!Array.isArray(finalPortfolio))
           throw new Error("Parsed result is not an array");
-        }
-
         apiResponse = {
           success: "Portfolio analyzed successfully",
           portfolio: finalPortfolio,
         };
       } catch (e: any) {
-        console.error(
-          "❌ [BACKEND ERROR] Failed to parse portfolio JSON:",
-          e.message,
-        );
         apiResponse = {
           error:
             "Failed to generate portfolio allocation due to parsing error.",
         };
+      }
+    } else if (call.name === "execute_trade") {
+      const args = call.args as {
+        ticker: string;
+        action: string;
+        shares: number;
+      };
+      const ticker = args.ticker.toUpperCase();
+      detectedTicker = ticker;
+
+      // Step 1: Get the exact current price
+      const priceResult = await getStockPrice(ticker);
+      if (priceResult.error || !priceResult.price) {
+        apiResponse = {
+          error: `Cannot execute trade. Real-time price for ${ticker} unavailable.`,
+        };
+      } else {
+        // Step 2: Trigger our local backend server trade endpoint
+        try {
+          const tradeRes = await fetch("http://localhost:3000/api/trade", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ticker,
+              action: args.action.toUpperCase(),
+              shares: args.shares,
+              price: priceResult.price,
+            }),
+          });
+          const tradeData = await tradeRes.json();
+
+          if (!tradeRes.ok) {
+            apiResponse = { error: tradeData.error || "Trade failed." };
+          } else {
+            apiResponse = {
+              success: `TRADE EXECUTED: ${args.action} ${args.shares} shares of ${ticker} at $${priceResult.price}. Remaining Balance: $${tradeData.portfolio.balance.toFixed(2)}`,
+            };
+          }
+        } catch (e) {
+          apiResponse = { error: "Local trade engine is unreachable." };
+        }
       }
     }
 

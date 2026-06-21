@@ -11,6 +11,7 @@ import {
   RefreshCw,
   Layers,
   PieChart,
+  Wallet,
 } from "lucide-react";
 
 interface ChartPoint {
@@ -42,7 +43,12 @@ interface WatchlistItem {
   isUp: boolean;
 }
 
-// Sub-component: Portfolio Allocation Widget
+interface UserPortfolio {
+  balance: number;
+  currency: string;
+  positions: Record<string, { shares: number; avgPrice: number }>;
+}
+
 function PortfolioWidget({
   allocations,
 }: {
@@ -79,7 +85,6 @@ function PortfolioWidget({
               </span>
             </div>
 
-            {/* Progress bar visual */}
             <div className="w-full bg-slate-800 rounded-full h-1.5 mb-3">
               <div
                 className="bg-blue-500 h-1.5 rounded-full"
@@ -97,7 +102,6 @@ function PortfolioWidget({
   );
 }
 
-// Sub-component: Responsive Premium SVG Chart
 function TradingChart({
   data,
   ticker,
@@ -111,17 +115,15 @@ function TradingChart({
   if (!data || data.length === 0) return null;
 
   const prices = data.map((d) => d.price);
-  const minPrice = Math.min(...prices) * 0.99; // 1% padding
-  const maxPrice = Math.max(...prices) * 1.01; // 1% padding
+  const minPrice = Math.min(...prices) * 0.99;
+  const maxPrice = Math.max(...prices) * 1.01;
   const priceRange = maxPrice - minPrice;
 
-  // SVG parameters
   const width = 500;
   const height = 180;
   const paddingX = 40;
   const paddingY = 20;
 
-  // Convert data coordinates to SVG pixel coordinates
   const points = data.map((d, index) => {
     const x = paddingX + (index / (data.length - 1)) * (width - paddingX * 2);
     const y =
@@ -131,12 +133,10 @@ function TradingChart({
     return { x, y, ...d };
   });
 
-  // Generate SVG Line Path
   const linePath = points.reduce((path, p, i) => {
     return i === 0 ? `M ${p.x} ${p.y}` : `${path} L ${p.x} ${p.y}`;
   }, "");
 
-  // Generate SVG Fill Path (closed loop for gradient area)
   const fillPath =
     points.length > 0
       ? `${linePath} L ${points[points.length - 1].x} ${height - paddingY} L ${points[0].x} ${height - paddingY} Z`
@@ -145,12 +145,9 @@ function TradingChart({
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement, MouseEvent>) => {
     const svgRect = e.currentTarget.getBoundingClientRect();
     const clientX = e.clientX - svgRect.left;
-
-    // Scale factor
     const svgScaleX = width / svgRect.width;
     const svgX = clientX * svgScaleX;
 
-    // Find closest point by X coordinate
     let closestIndex = 0;
     let minDiff = Infinity;
     points.forEach((p, idx) => {
@@ -206,8 +203,6 @@ function TradingChart({
               <stop offset="100%" stopColor="#2563EB" stopOpacity="0.0" />
             </linearGradient>
           </defs>
-
-          {/* Grid lines */}
           <line
             x1={paddingX}
             y1={paddingY}
@@ -232,11 +227,7 @@ function TradingChart({
             stroke="#1E293B"
             strokeDasharray="3,3"
           />
-
-          {/* Glowing Area Fill */}
           <path d={fillPath} fill="url(#chart-glow)" />
-
-          {/* Line Path */}
           <path
             d={linePath}
             fill="none"
@@ -245,8 +236,6 @@ function TradingChart({
             strokeLinecap="round"
             strokeLinejoin="round"
           />
-
-          {/* Axis Labels */}
           <text
             x={paddingX - 10}
             y={paddingY + 4}
@@ -267,8 +256,6 @@ function TradingChart({
           >
             ${minPrice.toFixed(0)}
           </text>
-
-          {/* Date Axis (Start and End) */}
           <text
             x={paddingX}
             y={height - 4}
@@ -287,11 +274,8 @@ function TradingChart({
           >
             {data[data.length - 1].date}
           </text>
-
-          {/* Interactive Hover Indicators */}
           {hoverIndex !== null && (
             <>
-              {/* Vertical dotted track line */}
               <line
                 x1={points[hoverIndex].x}
                 y1={paddingY}
@@ -301,7 +285,6 @@ function TradingChart({
                 strokeWidth="1"
                 strokeDasharray="2,2"
               />
-              {/* Glow Dot */}
               <circle
                 cx={points[hoverIndex].x}
                 cy={points[hoverIndex].y}
@@ -330,8 +313,7 @@ export default function App() {
     {
       id: "1",
       role: "system",
-      content:
-        "AI Trading Engine initialized. Connected to Gemini 2.5 Flash & Yahoo Finance API. Ready for queries.",
+      content: "AI Trading Engine initialized. Paper Trading Simulator Active.",
     },
   ]);
   const [inputMessage, setInputMessage] = useState("");
@@ -348,6 +330,9 @@ export default function App() {
     },
     { ticker: "LUMI.TA", name: "Leumi Bank", price: 0, change: 0, isUp: true },
   ]);
+  const [userPortfolio, setUserPortfolio] = useState<UserPortfolio | null>(
+    null,
+  );
   const [isRefreshingWatchlist, setIsRefreshingWatchlist] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -360,39 +345,60 @@ export default function App() {
     scrollToBottom();
   }, [messages]);
 
-  // FIX FOR ESLINT WARNINGS AND CASCADING RENDERS
-  // Everything is isolated entirely inside the effect. No external dependencies.
+  // Helper function for user actions (refresh, chat)
+  const fetchPortfolio = async () => {
+    try {
+      const res = await fetch("http://localhost:3000/api/portfolio");
+      if (res.ok) {
+        const data = await res.json();
+        setUserPortfolio(data);
+      }
+    } catch (e) {
+      console.error("Failed to load portfolio state", e);
+    }
+  };
+
+  // Safe initial data fetch isolated inside useEffect to prevent cascading render warnings
   useEffect(() => {
     let isMounted = true;
 
-    const fetchInitialWatchlist = async () => {
+    const fetchInitialData = async () => {
       try {
         const tickers = ["TSLA", "AAPL", "VRNS", "LUMI.TA"];
-        const response = await fetch("http://localhost:3000/api/watchlist", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ tickers }),
-        });
 
-        if (response.ok && isMounted) {
-          const updatedQuotes = await response.json();
-          setWatchlist(updatedQuotes);
+        // Fetch both resources in parallel
+        const [watchlistRes, portfolioRes] = await Promise.all([
+          fetch("http://localhost:3000/api/watchlist", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ tickers }),
+          }),
+          fetch("http://localhost:3000/api/portfolio"),
+        ]);
+
+        // Only trigger state updates safely after resolution and if still mounted
+        if (isMounted) {
+          if (watchlistRes.ok) {
+            const updatedQuotes = await watchlistRes.json();
+            setWatchlist(updatedQuotes);
+          }
+          if (portfolioRes.ok) {
+            const portfolioData = await portfolioRes.json();
+            setUserPortfolio(portfolioData);
+          }
         }
       } catch (err) {
-        console.error("Failed to fetch initial watchlist", err);
+        console.error("Failed to fetch initial data", err);
       }
     };
 
-    // Because this is async, the setState will happen asynchronously,
-    // avoiding the synchronous "cascading render" react warning.
-    fetchInitialWatchlist();
+    fetchInitialData();
 
     return () => {
       isMounted = false;
     };
-  }, []); // Empty dependency array is now 100% correct
+  }, []);
 
-  // Manual refresh handler for the UI button
   const handleRefreshClick = async () => {
     setIsRefreshingWatchlist(true);
     try {
@@ -406,6 +412,7 @@ export default function App() {
         const updatedQuotes = await response.json();
         setWatchlist(updatedQuotes);
       }
+      await fetchPortfolio();
     } catch (err) {
       console.error("Failed to refresh watchlist", err);
     } finally {
@@ -455,6 +462,8 @@ export default function App() {
       };
 
       setMessages((prev) => [...prev, newAgentMsg]);
+
+      await fetchPortfolio();
     } catch (error) {
       console.error("Error sending message:", error);
       const errorMsg: Message = {
@@ -475,145 +484,163 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#0B0F19] text-slate-300 font-sans flex items-center justify-center p-2 sm:p-4 selection:bg-blue-500/30">
-      {/* Main Terminal Container with Grid layout */}
       <div className="w-full max-w-7xl bg-[#111827] rounded-xl shadow-2xl border border-slate-800 flex flex-col md:flex-row h-[92vh] overflow-hidden relative">
-        {/* Decorative Grid Background overlay */}
         <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-5 pointer-events-none"></div>
 
-        {/* Left Side: System Information & Watchlist */}
-        <aside className="w-full md:w-80 bg-[#161D30] border-b md:border-b-0 md:border-r border-slate-800/80 p-5 flex flex-col justify-between shrink-0 z-10">
-          <div className="space-y-6">
-            {/* Terminal Header Info */}
-            <div className="flex items-center space-x-3.5">
-              <div className="w-9 h-9 bg-blue-600/20 rounded-lg flex items-center justify-center border border-blue-500/20">
-                <Activity className="w-5 h-5 text-blue-400" />
-              </div>
-              <div>
-                <h2 className="text-md font-semibold text-white tracking-wide">
-                  Alexul-AI Hub
-                </h2>
-                <div className="flex items-center space-x-1.5">
-                  <span className="flex w-2.5 h-2.5 bg-emerald-500 rounded-full animate-pulse"></span>
-                  <span className="text-[11px] text-slate-400 font-mono">
-                    NODE ACTIVE
-                  </span>
-                </div>
-              </div>
+        <aside className="w-full md:w-80 bg-[#161D30] border-b md:border-b-0 md:border-r border-slate-800/80 p-5 flex flex-col shrink-0 z-10 overflow-y-auto custom-scrollbar">
+          <div className="flex items-center space-x-3.5 mb-6">
+            <div className="w-9 h-9 bg-blue-600/20 rounded-lg flex items-center justify-center border border-blue-500/20">
+              <Activity className="w-5 h-5 text-blue-400" />
             </div>
-
-            {/* Quick Prompts presets */}
-            <div className="space-y-2">
-              <h3 className="text-[10px] font-bold tracking-wider text-slate-500 uppercase">
-                Quick Actions
-              </h3>
-              <div className="grid grid-cols-1 gap-1.5">
-                <button
-                  onClick={() =>
-                    triggerPresetMessage(
-                      "I have $1000. Allocate it between AAPL, MSFT, and TSLA based on recent trends.",
-                    )
-                  }
-                  className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-emerald-300 hover:text-emerald-200 transition-all font-medium"
-                >
-                  💰 Optimize $1000 Tech Portfolio
-                </button>
-                <button
-                  onClick={() =>
-                    triggerPresetMessage("Show me the historical trend of TSLA")
-                  }
-                  className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-slate-300 hover:text-white transition-all font-medium"
-                >
-                  📈 Get TSLA 30-day History Chart
-                </button>
-                <button
-                  onClick={() =>
-                    triggerPresetMessage("Analyze the stock prices of AAPL")
-                  }
-                  className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-slate-300 hover:text-white transition-all font-medium"
-                >
-                  🔍 Analyze Apple Inc (AAPL) Trends
-                </button>
-              </div>
-            </div>
-
-            {/* Live Watchlist */}
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <h3 className="text-[10px] font-bold tracking-wider text-slate-500 uppercase">
-                  Local Watchlist
-                </h3>
-                <button
-                  onClick={handleRefreshClick}
-                  disabled={isRefreshingWatchlist}
-                >
-                  <RefreshCw
-                    className={`w-3 h-3 text-slate-500 hover:text-slate-300 cursor-pointer ${isRefreshingWatchlist ? "animate-spin opacity-50" : ""}`}
-                  />
-                </button>
-              </div>
-              <div className="space-y-1.5 max-h-[22vh] md:max-h-full overflow-y-auto">
-                {watchlist.map((stock) => (
-                  <div
-                    key={stock.ticker}
-                    className="flex items-center justify-between p-2.5 rounded bg-[#101524]/60 border border-slate-800/30 hover:border-slate-700 transition"
-                  >
-                    <div>
-                      <div className="text-xs font-bold text-white font-mono">
-                        {stock.ticker}
-                      </div>
-                      <div className="text-[10px] text-slate-500 w-24 truncate">
-                        {stock.name}
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      {stock.price === 0 ? (
-                        <div className="w-10 h-3 bg-slate-800 animate-pulse rounded ml-auto mb-1"></div>
-                      ) : (
-                        <div className="text-xs font-semibold font-mono text-slate-200">
-                          ${stock.price.toFixed(2)}
-                        </div>
-                      )}
-
-                      {stock.price === 0 ? (
-                        <div className="w-8 h-2 bg-slate-800 animate-pulse rounded ml-auto"></div>
-                      ) : (
-                        <div
-                          className={`text-[9px] flex items-center justify-end font-mono font-medium ${stock.isUp ? "text-emerald-400" : "text-rose-400"}`}
-                        >
-                          {stock.isUp ? (
-                            <ArrowUpRight className="w-2.5 h-2.5 mr-0.5" />
-                          ) : (
-                            <ArrowDownRight className="w-2.5 h-2.5 mr-0.5" />
-                          )}
-                          {Math.abs(stock.change).toFixed(2)}%
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                ))}
+            <div>
+              <h2 className="text-md font-semibold text-white tracking-wide">
+                Alexul-AI Hub
+              </h2>
+              <div className="flex items-center space-x-1.5">
+                <span className="flex w-2.5 h-2.5 bg-emerald-500 rounded-full animate-pulse"></span>
+                <span className="text-[11px] text-slate-400 font-mono">
+                  NODE ACTIVE
+                </span>
               </div>
             </div>
           </div>
 
-          {/* Bottom user status */}
-          <div className="pt-4 border-t border-slate-800/60 hidden md:block">
-            <div className="p-3 bg-[#111827]/60 rounded-lg border border-slate-800">
-              <div className="text-[10px] font-bold tracking-wider text-slate-500 uppercase mb-1">
-                Trading Strategy
+          <div className="mb-6 bg-[#0B0F19] rounded-xl border border-slate-800/80 p-4">
+            <div className="flex justify-between items-center mb-3">
+              <h3 className="text-[10px] font-bold tracking-wider text-slate-500 uppercase flex items-center">
+                <Wallet className="w-3 h-3 mr-1.5" /> Paper Trading
+              </h3>
+            </div>
+            <div className="mb-3">
+              <div className="text-[10px] text-slate-500 mb-0.5">
+                Available Cash
               </div>
-              <p className="text-xs text-slate-300 leading-snug font-medium">
-                Swing Trading Active
-              </p>
-              <p className="text-[10px] text-slate-500 mt-0.5">
-                Minimizing daily activity signature.
-              </p>
+              <div className="text-xl font-bold text-white font-mono">
+                ${userPortfolio?.balance.toFixed(2) || "0.00"}
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="text-[10px] text-slate-500 mb-1 border-b border-slate-800 pb-1">
+                Open Positions
+              </div>
+              {userPortfolio &&
+              Object.keys(userPortfolio.positions).length > 0 ? (
+                Object.entries(userPortfolio.positions).map(([tick, pos]) => (
+                  <div
+                    key={tick}
+                    className="flex justify-between items-center text-xs"
+                  >
+                    <span className="font-mono text-blue-400 font-semibold">
+                      {tick}
+                    </span>
+                    <div className="text-right">
+                      <span className="text-slate-300 block">
+                        {pos.shares} shares
+                      </span>
+                      <span className="text-[9px] text-slate-500">
+                        Avg: ${pos.avgPrice.toFixed(2)}
+                      </span>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="text-xs text-slate-500 italic">
+                  No open positions.
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="space-y-2 mb-6">
+            <h3 className="text-[10px] font-bold tracking-wider text-slate-500 uppercase">
+              Quick Actions
+            </h3>
+            <div className="grid grid-cols-1 gap-1.5">
+              <button
+                onClick={() => triggerPresetMessage("Buy 2 shares of TSLA")}
+                className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-emerald-300 hover:text-emerald-200 transition-all font-medium"
+              >
+                🛒 Buy 2 shares of TSLA
+              </button>
+              <button
+                onClick={() =>
+                  triggerPresetMessage(
+                    "I have $1000. Allocate it between AAPL, MSFT, and TSLA",
+                  )
+                }
+                className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-slate-300 hover:text-white transition-all font-medium"
+              >
+                💰 Optimize Tech Portfolio
+              </button>
+              <button
+                onClick={() => triggerPresetMessage("Sell 1 share of TSLA")}
+                className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-rose-300 hover:text-rose-200 transition-all font-medium"
+              >
+                📉 Sell 1 share of TSLA
+              </button>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <h3 className="text-[10px] font-bold tracking-wider text-slate-500 uppercase">
+                Local Watchlist
+              </h3>
+              <button
+                onClick={handleRefreshClick}
+                disabled={isRefreshingWatchlist}
+              >
+                <RefreshCw
+                  className={`w-3 h-3 text-slate-500 hover:text-slate-300 cursor-pointer ${isRefreshingWatchlist ? "animate-spin opacity-50" : ""}`}
+                />
+              </button>
+            </div>
+            <div className="space-y-1.5">
+              {watchlist.map((stock) => (
+                <div
+                  key={stock.ticker}
+                  className="flex items-center justify-between p-2.5 rounded bg-[#101524]/60 border border-slate-800/30 hover:border-slate-700 transition"
+                >
+                  <div>
+                    <div className="text-xs font-bold text-white font-mono">
+                      {stock.ticker}
+                    </div>
+                    <div className="text-[10px] text-slate-500 w-24 truncate">
+                      {stock.name}
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    {stock.price === 0 ? (
+                      <div className="w-10 h-3 bg-slate-800 animate-pulse rounded ml-auto mb-1"></div>
+                    ) : (
+                      <div className="text-xs font-semibold font-mono text-slate-200">
+                        ${stock.price.toFixed(2)}
+                      </div>
+                    )}
+
+                    {stock.price === 0 ? (
+                      <div className="w-8 h-2 bg-slate-800 animate-pulse rounded ml-auto"></div>
+                    ) : (
+                      <div
+                        className={`text-[9px] flex items-center justify-end font-mono font-medium ${stock.isUp ? "text-emerald-400" : "text-rose-400"}`}
+                      >
+                        {stock.isUp ? (
+                          <ArrowUpRight className="w-2.5 h-2.5 mr-0.5" />
+                        ) : (
+                          <ArrowDownRight className="w-2.5 h-2.5 mr-0.5" />
+                        )}
+                        {Math.abs(stock.change).toFixed(2)}%
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         </aside>
 
-        {/* Right Side: Interactive Chat Terminal */}
         <section className="flex-1 flex flex-col h-full bg-[#111827] relative z-10 overflow-hidden">
-          {/* Main header inside the Chat panel */}
           <header className="bg-[#181F30] border-b border-slate-800 px-6 py-4 flex items-center justify-between">
             <div>
               <h1 className="text-sm font-semibold text-white tracking-wide">
@@ -631,7 +658,6 @@ export default function App() {
             </div>
           </header>
 
-          {/* Messaging Window */}
           <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 scroll-smooth custom-scrollbar">
             {messages.map((msg) => (
               <div
@@ -661,12 +687,10 @@ export default function App() {
                       {msg.content}
                     </p>
 
-                    {/* Render Portfolio Widget if data exists */}
                     {msg.portfolio && (
                       <PortfolioWidget allocations={msg.portfolio} />
                     )}
 
-                    {/* Render custom line chart if chartData exists inside this message */}
                     {msg.chartData && (
                       <TradingChart
                         data={msg.chartData}
@@ -684,7 +708,6 @@ export default function App() {
               </div>
             ))}
 
-            {/* Loading animation state */}
             {isLoading && (
               <div className="flex justify-start">
                 <div className="bg-[#1F2937] border border-slate-800/80 text-slate-200 rounded-xl rounded-bl-sm px-5 py-4 shadow-sm flex items-center space-x-4">
@@ -708,7 +731,6 @@ export default function App() {
             <div ref={messagesEndRef} />
           </div>
 
-          {/* Message Prompt Input Field */}
           <div className="p-4 bg-[#111827] border-t border-slate-800">
             <form
               onSubmit={handleSendMessage}
@@ -718,7 +740,7 @@ export default function App() {
                 type="text"
                 value={inputMessage}
                 onChange={(e) => setInputMessage(e.target.value)}
-                placeholder="Ask e.g., 'Allocate $500 between AAPL and TSLA'..."
+                placeholder="Ask e.g., 'Buy 2 shares of TSLA' or 'Sell 1 share of AAPL'..."
                 disabled={isLoading}
                 className="flex-1 bg-transparent border-none focus:outline-none text-[13px] text-white placeholder-slate-500 px-4 py-2"
               />
@@ -735,7 +757,6 @@ export default function App() {
         </section>
       </div>
 
-      {/* Scrollbar CSS Overrides */}
       <style
         dangerouslySetInnerHTML={{
           __html: `
