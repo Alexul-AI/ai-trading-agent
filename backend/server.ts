@@ -1,49 +1,66 @@
 import express from "express";
 import cors from "cors";
-import { runTradingAgentStep } from "./agent.js"; // Keep .js extension for ES Modules resolution
+import { runTradingAgentStep, getWatchlistQuotes } from "./agent.js";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Configure CORS security rules to allow requests from the React frontend (running on port 5173)
-app.use(
-  cors({
-    origin: "http://localhost:5173",
-    methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type"],
-  }),
-);
+const PORT = 3000;
 
 app.use(express.json());
 
-// Main API endpoint for processing chat requests from the frontend
+app.use(
+  cors({
+    origin: "http://localhost:5173",
+  }),
+);
+
 app.post("/api/chat", async (req, res) => {
+  const { message, history } = req.body;
+
+  if (!message) {
+    res.status(400).json({ error: "Message field is required." });
+    return;
+  }
+
+  console.log(`\n💬 [SERVER] Received message from user: "${message}"`);
+
   try {
-    const { message } = req.body;
-
-    if (!message) {
-      return res.status(400).json({ error: "Message is required" });
-    }
-
-    console.log(`\n💬 [SERVER] Received message from user: "${message}"`);
-
-    // Execute a single turn of the Gemini AI Trading Agent
-    const agentResponse = await runTradingAgentStep(message);
+    const agentResponse = await (runTradingAgentStep as any)(message, history);
 
     console.log(`✉️ [SERVER] Sending response back to client`);
-    res.json({ response: agentResponse });
+    res.json({
+      reply: agentResponse.text,
+      chartData: agentResponse.chartData,
+      ticker: agentResponse.ticker,
+    });
   } catch (error: any) {
-    console.error("❌ [SERVER ERROR]:", error);
-    res
-      .status(500)
-      .json({ error: "Internal Server Error", details: error.message });
+    console.error(`\n❌ [SERVER ERROR]:`, error);
+    res.status(500).json({
+      error: "Failed to process request with AI Engine.",
+      details: error.message || error,
+    });
   }
 });
 
-// Start the Express HTTP server
+app.post("/api/watchlist", async (req, res) => {
+  const { tickers } = req.body;
+
+  if (!tickers || !Array.isArray(tickers)) {
+    res.status(400).json({ error: "Tickers array is required." });
+    return;
+  }
+
+  try {
+    const quotes = await getWatchlistQuotes(tickers);
+    res.json(quotes);
+  } catch (error: any) {
+    console.error(`\n❌ [SERVER ERROR] Watchlist API failed:`, error);
+    res.status(500).json({ error: "Failed to fetch watchlist quotes" });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(
-    `\n🚀 [SERVER] Trading Agent API is running on http://localhost:${PORT}`,
+    `\n🚀 [SERVER] Trading Agent API is running on http://localhost:3000`,
   );
-  console.log(`📡 [SERVER] Awaiting requests from frontend...`);
+  console.log(`📡 [SERVER] Awaiting requests from frontend...\n`);
 });

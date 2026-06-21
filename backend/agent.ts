@@ -1,16 +1,22 @@
 import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
 import * as dotenv from "dotenv";
-// IMPORT FIX: Use uppercase for v3+
 import YahooFinance from "yahoo-finance2";
 
-// Load environment variables
 dotenv.config();
 
-// INITIALIZATION FIX: Suppress the annoying survey notice
 const yahooFinance = new YahooFinance({ suppressNotices: ["yahooSurvey"] });
-
-// 1. Initialize Gemini API
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+
+export interface ChartPoint {
+  date: string;
+  price: number;
+}
+
+export interface AgentResponse {
+  text: string;
+  chartData?: ChartPoint[] | undefined;
+  ticker?: string | undefined;
+}
 
 const model = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
@@ -20,14 +26,28 @@ const model = genAI.getGenerativeModel({
         {
           name: "get_stock_price",
           description:
-            "Fetches the current stock price using its market ticker.",
+            "Retrieves the current market price and state of a stock using its ticker symbol.",
           parameters: {
             type: SchemaType.OBJECT,
             properties: {
               ticker: {
                 type: SchemaType.STRING,
-                description:
-                  "The stock ticker symbol (e.g., AAPL for Apple, TSLA for Tesla, LUMI.TA for Bank Leumi)",
+                description: "Stock market ticker (e.g., AAPL, TSLA, LUMI.TA)",
+              },
+            },
+            required: ["ticker"],
+          },
+        },
+        {
+          name: "get_historical_prices",
+          description:
+            "Retrieves historical daily close prices for the last 30 days for a specific stock ticker. Use this when the user asks for historical performance, charts, or trend analysis.",
+          parameters: {
+            type: SchemaType.OBJECT,
+            properties: {
+              ticker: {
+                type: SchemaType.STRING,
+                description: "Stock market ticker (e.g., AAPL, TSLA, VRNS)",
               },
             },
             required: ["ticker"],
@@ -38,41 +58,135 @@ const model = genAI.getGenerativeModel({
   ],
 });
 
-// 2. Real Backend Function
 async function getStockPrice(ticker: string) {
   console.log(
     `\n⚙️ [BACKEND] Fetching REAL market data for ticker: ${ticker}...`,
   );
-
   try {
-    // Fetching real data from Yahoo Finance.
-    // We cast it to 'any' to bypass strict TS inference issues with yahoo-finance2.
     const quote = (await yahooFinance.quote(ticker)) as any;
 
-    return {
+    const result = {
       price: quote.regularMarketPrice,
-      currency: quote.currency,
+      currency: quote.currency || "USD",
       exchange: quote.exchange,
-      marketState: quote.marketState,
+      marketState: quote.marketState || "UNKNOWN",
     };
+
+    console.log(`⚙️ [BACKEND] Sending result back to agent:`, result);
+    return result;
   } catch (error: any) {
     console.error(`\n❌ [BACKEND ERROR]: Failed to fetch data for ${ticker}`);
-    console.error(`🔍 [DEBUG DETAILS]:`, error.message || error);
+    console.error(`🔍 [DEBUG DETAILS]: ${error.message || error}`);
     return {
       error: `Data for ticker ${ticker} not found. Please check the ticker format.`,
     };
   }
 }
 
-// 3. Main Agent Logic (Refactored for API usage)
-// We export this function so server.ts can use it
+async function getHistoricalPrices(
+  ticker: string,
+): Promise<{ data?: ChartPoint[]; error?: string }> {
+  console.log(
+    `\n⚙️ [BACKEND] Fetching 30-day historical data for ticker: ${ticker}...`,
+  );
+  try {
+    const today = new Date();
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(today.getDate() - 30);
+
+    // FIX: Using .chart() instead of blocked .historical() endpoint to bypass Yahoo Finance restrictions
+    const historicalData = (await yahooFinance.chart(ticker, {
+      period1: thirtyDaysAgo,
+      interval: "1d",
+    })) as any;
+
+    const historical = historicalData.quotes || [];
+
+    if (!historical || historical.length === 0) {
+      throw new Error("No historical data returned from Yahoo Finance.");
+    }
+
+    const chartData: ChartPoint[] = historical
+      .filter(
+        (item: any) =>
+          item.close !== undefined &&
+          item.date !== undefined &&
+          item.date !== null,
+      )
+      .map((item: any) => {
+        const parsedDate = new Date(item.date as any);
+        const formattedDate = isNaN(parsedDate.getTime())
+          ? "N/A"
+          : parsedDate.toLocaleDateString("en-US", {
+              month: "short",
+              day: "numeric",
+            });
+
+        return {
+          date: formattedDate,
+          price: parseFloat(item.close.toFixed(2)),
+        };
+      });
+
+    console.log(
+      `⚙️ [BACKEND] Successfully parsed ${chartData.length} data points for ${ticker}`,
+    );
+    return { data: chartData };
+  } catch (error: any) {
+    console.error(
+      `\n❌ [BACKEND ERROR]: Failed to fetch historical data for ${ticker}`,
+    );
+    console.error(`🔍 [DEBUG DETAILS]: ${error.message || error}`);
+    return {
+      error: `Could not retrieve historical data for ${ticker}.`,
+    };
+  }
+}
+
+export async function getWatchlistQuotes(tickers: string[]) {
+  console.log(
+    `\n⚙️ [BACKEND] Fetching batch quotes for watchlist: ${tickers.join(", ")}`,
+  );
+  return Promise.all(
+    tickers.map(async (ticker) => {
+      try {
+        const quote = (await yahooFinance.quote(ticker)) as any;
+        const changePercent = quote.regularMarketChangePercent || 0;
+        return {
+          ticker,
+          name: quote.shortName || quote.longName || ticker,
+          price: quote.regularMarketPrice || 0,
+          change: parseFloat(changePercent.toFixed(2)),
+          isUp: changePercent >= 0,
+        };
+      } catch {
+        return {
+          ticker,
+          name: ticker + " (Unavailable)",
+          price: 0,
+          change: 0,
+          isUp: true,
+        };
+      }
+    }),
+  );
+}
+
 export async function runTradingAgentStep(
   userMessage: string,
-  history: any[] = [],
-) {
-  // In a real app, you'd pass 'history' to startChat to maintain context
+  history?: any[],
+): Promise<AgentResponse> {
+  const formattedHistory = history
+    ? history
+        .filter((msg: any) => msg.role === "user" || msg.role === "agent")
+        .map((msg: any) => ({
+          role: msg.role === "user" ? "user" : "model",
+          parts: [{ text: msg.content }],
+        }))
+    : [];
+
   const chat = model.startChat({
-    history: history, // Gemini will remember previous turns
+    history: formattedHistory,
   });
 
   console.log(`👤 [USER]: ${userMessage}`);
@@ -80,40 +194,63 @@ export async function runTradingAgentStep(
   const result = await chat.sendMessage(userMessage);
   const calls = result.response.functionCalls();
 
+  let finalChartData: ChartPoint[] | undefined = undefined;
+  let detectedTicker: string | undefined = undefined;
+
   if (calls && calls.length > 0) {
     const call = calls[0];
-
-    if (!call) return "Error processing function call.";
+    if (!call) return { text: result.response.text() };
 
     console.log(
       `🤖 [AGENT] Requested function call: ${call.name} with arguments:`,
       call.args,
     );
+    const args = call.args as { ticker: string };
+    const ticker = args.ticker.toUpperCase();
+    detectedTicker = ticker;
+
+    let apiResponse: any = {};
 
     if (call.name === "get_stock_price") {
-      const args = call.args as { ticker: string };
-      const ticker = args.ticker;
-
-      const apiResponse = await getStockPrice(ticker);
-
-      console.log(`⚙️ [BACKEND] Sending result back to agent:`, apiResponse);
-
-      const finalResult = await chat.sendMessage([
-        {
-          functionResponse: {
-            name: "get_stock_price",
-            response: apiResponse,
-          },
-        },
-      ]);
-
-      const replyText = finalResult.response.text();
-      console.log(`\n🤖 [AGENT (Final Answer)]: ${replyText}`);
-      return replyText; // Возвращаем текст на сервер
+      apiResponse = await getStockPrice(ticker);
+    } else if (call.name === "get_historical_prices") {
+      const historicalResult = await getHistoricalPrices(ticker);
+      if (historicalResult.data) {
+        apiResponse = {
+          data: "Historical data fetched successfully. A chart has been constructed.",
+        };
+        finalChartData = historicalResult.data;
+      } else {
+        apiResponse = { error: historicalResult.error };
+      }
     }
+
+    console.log(`⚙️ [BACKEND] Sending response to agent...`);
+
+    const finalResult = await chat.sendMessage([
+      {
+        functionResponse: {
+          name: call.name,
+          response: apiResponse,
+        },
+      },
+    ]);
+
+    const responsePayload: AgentResponse = {
+      text: finalResult.response.text(),
+    };
+
+    if (finalChartData) {
+      responsePayload.chartData = finalChartData;
+    }
+    if (detectedTicker) {
+      responsePayload.ticker = detectedTicker;
+    }
+
+    return responsePayload;
   } else {
-    const replyText = result.response.text();
-    console.log(`\n🤖 [AGENT]: ${replyText}`);
-    return replyText; // Возвращаем текст на сервер
+    return {
+      text: result.response.text(),
+    };
   }
 }
