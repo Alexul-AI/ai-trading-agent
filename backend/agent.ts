@@ -19,11 +19,22 @@ export interface PortfolioAllocation {
   reasoning: string;
 }
 
+export interface TechnicalIndicatorData {
+  ticker: string;
+  rsi: number;
+  macd: number;
+  signal: number;
+  histogram: number;
+  state: "OVERBOUGHT" | "OVERSOLD" | "NEUTRAL";
+  recommendation: "BUY" | "SELL" | "HOLD";
+}
+
 export interface AgentResponse {
   text: string;
   chartData?: ChartPoint[] | undefined;
   ticker?: string | undefined;
   portfolio?: PortfolioAllocation[] | undefined;
+  indicators?: TechnicalIndicatorData | undefined;
 }
 
 // Calculates 14-day Relative Strength Index (RSI) with strict undefined checking
@@ -119,11 +130,12 @@ function calculateMACD(prices: number[]): {
     histogram: parseFloat((currentMacd - currentSignal).toFixed(4)),
   };
 }
-
+// 1. Tool Declaration for Gemini 2.5
 const model = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
+  // CHANGED: We now explicitly forbid raw JSON output in the text bubble
   systemInstruction:
-    "You are an AI Trading Assistant. CRITICAL RULES: 1. If the user asks to BUY or SELL a stock, you MUST ALWAYS use the 'execute_trade' tool. 2. When asked to analyze a portfolio and allocate budget, you MUST respond ONLY with a valid JSON array of objects. Do not include any markdown formatting. 3. Use technical indicators like RSI and MACD whenever available to make highly professional and data-driven recommendations.",
+    "You are an AI Trading Assistant. When analyzing a portfolio, provide a short, professional summary of your reasoning. Do NOT output raw JSON data in your text response. Your structured data is handled automatically by the system.",
   tools: [
     {
       functionDeclarations: [
@@ -365,6 +377,7 @@ export async function runTradingAgentStep(
   let finalChartData: ChartPoint[] | undefined = undefined;
   let detectedTicker: string | undefined = undefined;
   let finalPortfolio: PortfolioAllocation[] | undefined = undefined;
+  let finalIndicators: TechnicalIndicatorData | undefined = undefined;
 
   if (calls && calls.length > 0) {
     const call = calls[0];
@@ -398,19 +411,20 @@ export async function runTradingAgentStep(
         const prices = historicalResult.data.map((p) => p.price);
         const rsiValue = calculateRSI(prices, 14);
         const macdValue = calculateMACD(prices);
-        apiResponse = {
+        const stateVal =
+          rsiValue > 70 ? "OVERBOUGHT" : rsiValue < 30 ? "OVERSOLD" : "NEUTRAL";
+        const recVal = rsiValue < 35 ? "BUY" : rsiValue > 65 ? "SELL" : "HOLD";
+
+        finalIndicators = {
           ticker: detectedTicker,
           rsi: rsiValue,
           macd: macdValue.macd,
           signal: macdValue.signal,
           histogram: macdValue.histogram,
-          state:
-            rsiValue > 70
-              ? "OVERBOUGHT"
-              : rsiValue < 30
-                ? "OVERSOLD"
-                : "NEUTRAL",
+          state: stateVal,
+          recommendation: recVal,
         };
+        apiResponse = finalIndicators;
         console.log(
           `📊 [ANALYSIS] Technical analysis completed for ${detectedTicker}: RSI=${rsiValue}`,
         );
@@ -457,6 +471,12 @@ export async function runTradingAgentStep(
       ]`;
 
       try {
+        console.log(
+          `⚙️ [BACKEND] Requesting Gemini to analyze portfolio with Strict JSON mode...`,
+        );
+
+        // This clean model instance is used ONLY for internal calculations,
+        // it doesn't affect the chat conversation, so it can safely use JSON mode.
         const jsonModel = genAI.getGenerativeModel({
           model: "gemini-2.5-flash",
           generationConfig: { responseMimeType: "application/json" },
@@ -530,6 +550,7 @@ export async function runTradingAgentStep(
       chartData: finalChartData,
       ticker: detectedTicker,
       portfolio: finalPortfolio,
+      indicators: finalIndicators,
     };
   } else {
     return { text: result.response.text() };

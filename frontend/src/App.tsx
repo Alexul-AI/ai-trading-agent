@@ -26,6 +26,16 @@ interface PortfolioAllocation {
   reasoning: string;
 }
 
+interface TechnicalIndicatorData {
+  ticker: string;
+  rsi: number;
+  macd: number;
+  signal: number;
+  histogram: number;
+  state: "OVERBOUGHT" | "OVERSOLD" | "NEUTRAL";
+  recommendation: "BUY" | "SELL" | "HOLD";
+}
+
 interface Message {
   id: string;
   role: "user" | "agent" | "system";
@@ -33,6 +43,7 @@ interface Message {
   chartData?: ChartPoint[];
   ticker?: string;
   portfolio?: PortfolioAllocation[];
+  indicators?: TechnicalIndicatorData;
 }
 
 interface WatchlistItem {
@@ -97,6 +108,93 @@ function PortfolioWidget({
             </p>
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+function TechnicalWidget({
+  indicators,
+}: {
+  indicators: TechnicalIndicatorData;
+}) {
+  if (!indicators) return null;
+
+  const getRecColor = (rec: string) => {
+    if (rec === "BUY")
+      return "text-emerald-400 bg-emerald-500/10 border-emerald-500/20";
+    if (rec === "SELL")
+      return "text-rose-400 bg-rose-500/10 border-rose-500/20";
+    return "text-amber-400 bg-amber-500/10 border-amber-500/20";
+  };
+
+  return (
+    <div className="mt-4 bg-[#0B0F19] rounded-lg p-4 border border-slate-800/80 w-full">
+      <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-800/80">
+        <span className="text-xs font-semibold uppercase tracking-wider text-blue-400 flex items-center">
+          <Activity className="w-4 h-4 mr-2 text-blue-400" />
+          {indicators.ticker} Technical Indicators
+        </span>
+        <span
+          className={`text-xs px-2.5 py-1 rounded border font-mono font-bold tracking-wider ${getRecColor(indicators.recommendation)}`}
+        >
+          {indicators.recommendation}
+        </span>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {/* RSI Speedometer Indicator */}
+        <div className="bg-[#111827] rounded-md p-3 border border-slate-800/50">
+          <div className="flex justify-between items-center mb-2">
+            <span className="text-[11px] text-slate-400 uppercase font-semibold">
+              RSI (14-Day)
+            </span>
+            <span className="text-sm font-bold text-white font-mono">
+              {indicators.rsi.toFixed(2)}
+            </span>
+          </div>
+          {/* Visual bar */}
+          <div className="relative w-full bg-slate-800 rounded-full h-2 overflow-hidden mb-2">
+            <div
+              className="bg-gradient-to-r from-blue-500 via-emerald-500 to-rose-500 h-full rounded-full transition-all duration-500"
+              style={{ width: `${indicators.rsi}%` }}
+            ></div>
+            {/* Threshold zones lines (30 and 70) */}
+            <div className="absolute top-0 bottom-0 left-[30%] w-0.5 bg-slate-900"></div>
+            <div className="absolute top-0 bottom-0 left-[70%] w-0.5 bg-slate-900"></div>
+          </div>
+          <div className="flex justify-between text-[9px] text-slate-500 font-mono">
+            <span>OVERSOLD (&lt;30)</span>
+            <span className="text-slate-400 font-bold">{indicators.state}</span>
+            <span>OVERBOUGHT (&gt;70)</span>
+          </div>
+        </div>
+
+        {/* MACD Trend Analyst */}
+        <div className="bg-[#111827] rounded-md p-3 border border-slate-800/50">
+          <div className="flex justify-between items-center mb-1">
+            <span className="text-[11px] text-slate-400 uppercase font-semibold">
+              MACD (12, 26, 9)
+            </span>
+            <span className="text-xs font-mono text-slate-300">
+              Hist: {indicators.histogram.toFixed(4)}
+            </span>
+          </div>
+          <div className="space-y-1 font-mono text-[10px] text-slate-400">
+            <div className="flex justify-between">
+              <span>MACD Line:</span>
+              <span className="text-blue-400 font-semibold">
+                {indicators.macd.toFixed(4)}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span>Signal Line:</span>
+              <span className="text-amber-400 font-semibold">
+                {indicators.signal.toFixed(4)}
+              </span>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -459,6 +557,7 @@ export default function App() {
         chartData: data.chartData || undefined,
         ticker: data.ticker || undefined,
         portfolio: data.portfolio || undefined,
+        indicators: data.indicators || undefined, // Bind indicators data to message
       };
 
       setMessages((prev) => [...prev, newAgentMsg]);
@@ -689,6 +788,10 @@ export default function App() {
 
                     {msg.portfolio && (
                       <PortfolioWidget allocations={msg.portfolio} />
+                    )}
+
+                    {msg.indicators && (
+                      <TechnicalWidget indicators={msg.indicators} />
                     )}
 
                     {msg.chartData && (

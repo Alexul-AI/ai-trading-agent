@@ -105,6 +105,7 @@ app.post("/api/chat", async (req, res) => {
       chartData: agentResponse.chartData,
       ticker: agentResponse.ticker,
       portfolio: agentResponse.portfolio,
+      indicators: agentResponse.indicators, // Forward computed RSI/MACD parameters
     });
   } catch (error: any) {
     console.error(`\n❌ [SERVER ERROR]:`, error);
