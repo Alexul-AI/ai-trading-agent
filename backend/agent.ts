@@ -26,11 +26,104 @@ export interface AgentResponse {
   portfolio?: PortfolioAllocation[] | undefined;
 }
 
-// 1. Tool Declaration for Gemini 2.5
+// Calculates 14-day Relative Strength Index (RSI) with strict undefined checking
+function calculateRSI(prices: number[], periods = 14): number {
+  if (prices.length <= periods) return 50; // Return neutral RSI if not enough data
+
+  let gains = 0;
+  let losses = 0;
+
+  // First RSI calculation loop
+  for (let i = 1; i <= periods; i++) {
+    const current = prices[i];
+    const prev = prices[i - 1];
+    if (current !== undefined && prev !== undefined) {
+      const diff = current - prev;
+      if (diff > 0) gains += diff;
+      else losses -= diff;
+    }
+  }
+
+  let avgGain = gains / periods;
+  let avgLoss = losses / periods;
+
+  // Smooth RSI calculations with strict boundary safety
+  for (let i = periods + 1; i < prices.length; i++) {
+    const current = prices[i];
+    const prev = prices[i - 1];
+    if (current !== undefined && prev !== undefined) {
+      const diff = current - prev;
+      avgGain = (avgGain * (periods - 1) + (diff > 0 ? diff : 0)) / periods;
+      avgLoss = (avgLoss * (periods - 1) + (diff < 0 ? -diff : 0)) / periods;
+    }
+  }
+
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return parseFloat((100 - 100 / (1 + rs)).toFixed(2));
+}
+
+// Calculates Exponential Moving Average (EMA) with strict undefined checking
+function calculateEMA(prices: number[], period: number): number[] {
+  const k = 2 / (period + 1);
+  const ema: number[] = [];
+  if (prices.length === 0) return ema;
+
+  const firstPrice = prices[0];
+  if (firstPrice !== undefined) {
+    ema.push(firstPrice);
+  }
+
+  for (let i = 1; i < prices.length; i++) {
+    const currentPrice = prices[i];
+    const prevEma = ema[i - 1];
+    if (currentPrice !== undefined && prevEma !== undefined) {
+      ema.push(currentPrice * k + prevEma * (1 - k));
+    }
+  }
+  return ema;
+}
+
+// Calculates MACD (12, 26, 9) with index safety guarantees
+function calculateMACD(prices: number[]): {
+  macd: number;
+  signal: number;
+  histogram: number;
+} {
+  if (prices.length < 26) {
+    return { macd: 0, signal: 0, histogram: 0 };
+  }
+
+  const ema12 = calculateEMA(prices, 12);
+  const ema26 = calculateEMA(prices, 26);
+
+  const macdLine: number[] = [];
+  for (let i = 0; i < prices.length; i++) {
+    const val12 = ema12[i];
+    const val26 = ema26[i];
+    if (val12 !== undefined && val26 !== undefined) {
+      macdLine.push(val12 - val26);
+    } else {
+      macdLine.push(0);
+    }
+  }
+
+  const signalLine = calculateEMA(macdLine.slice(25), 9);
+
+  const currentMacd = macdLine[macdLine.length - 1] ?? 0;
+  const currentSignal = signalLine[signalLine.length - 1] ?? 0;
+
+  return {
+    macd: parseFloat(currentMacd.toFixed(4)),
+    signal: parseFloat(currentSignal.toFixed(4)),
+    histogram: parseFloat((currentMacd - currentSignal).toFixed(4)),
+  };
+}
+
 const model = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
   systemInstruction:
-    "You are an AI Trading Assistant. CRITICAL RULES: 1. If the user asks to BUY or SELL a stock, you MUST ALWAYS use the 'execute_trade' tool. 2. When asked to analyze a portfolio and allocate budget, you MUST respond ONLY with a valid JSON array of objects. Do not include any markdown formatting.",
+    "You are an AI Trading Assistant. CRITICAL RULES: 1. If the user asks to BUY or SELL a stock, you MUST ALWAYS use the 'execute_trade' tool. 2. When asked to analyze a portfolio and allocate budget, you MUST respond ONLY with a valid JSON array of objects. Do not include any markdown formatting. 3. Use technical indicators like RSI and MACD whenever available to make highly professional and data-driven recommendations.",
   tools: [
     {
       functionDeclarations: [
@@ -59,6 +152,21 @@ const model = genAI.getGenerativeModel({
               ticker: {
                 type: SchemaType.STRING,
                 description: "Stock market ticker (e.g., AAPL, TSLA)",
+              },
+            },
+            required: ["ticker"],
+          },
+        },
+        {
+          name: "get_technical_indicators",
+          description:
+            "Calculates advanced technical analysis metrics (RSI, MACD) for a stock ticker based on recent history.",
+          parameters: {
+            type: SchemaType.OBJECT,
+            properties: {
+              ticker: {
+                type: SchemaType.STRING,
+                description: "Stock ticker (e.g., AAPL, TSLA)",
               },
             },
             required: ["ticker"],
@@ -187,7 +295,7 @@ async function getHistoricalPrices(
       }
 
       const basePrice = liveQuote.regularMarketPrice;
-      for (let i = 6; i >= 0; i--) {
+      for (let i = 29; i >= 0; i--) {
         const d = new Date();
         d.setDate(d.getDate() - i);
         const randomVariance = basePrice * (Math.random() * 0.04 - 0.02);
@@ -281,6 +389,36 @@ export async function runTradingAgentStep(
       } else {
         apiResponse = { error: historicalResult.error };
       }
+    } else if (call.name === "get_technical_indicators") {
+      const args = call.args as { ticker: string };
+      detectedTicker = args.ticker.toUpperCase();
+      const historicalResult = await getHistoricalPrices(detectedTicker);
+
+      if (historicalResult.data && historicalResult.data.length > 0) {
+        const prices = historicalResult.data.map((p) => p.price);
+        const rsiValue = calculateRSI(prices, 14);
+        const macdValue = calculateMACD(prices);
+        apiResponse = {
+          ticker: detectedTicker,
+          rsi: rsiValue,
+          macd: macdValue.macd,
+          signal: macdValue.signal,
+          histogram: macdValue.histogram,
+          state:
+            rsiValue > 70
+              ? "OVERBOUGHT"
+              : rsiValue < 30
+                ? "OVERSOLD"
+                : "NEUTRAL",
+        };
+        console.log(
+          `📊 [ANALYSIS] Technical analysis completed for ${detectedTicker}: RSI=${rsiValue}`,
+        );
+      } else {
+        apiResponse = {
+          error: `Failed to calculate indicators for ${detectedTicker}`,
+        };
+      }
     } else if (call.name === "analyze_portfolio") {
       const args = call.args as { tickers: string[]; budget: number };
       const { tickers, budget } = args;
@@ -348,14 +486,12 @@ export async function runTradingAgentStep(
       const ticker = args.ticker.toUpperCase();
       detectedTicker = ticker;
 
-      // Step 1: Get the exact current price
       const priceResult = await getStockPrice(ticker);
       if (priceResult.error || !priceResult.price) {
         apiResponse = {
           error: `Cannot execute trade. Real-time price for ${ticker} unavailable.`,
         };
       } else {
-        // Step 2: Trigger our local backend server trade endpoint
         try {
           const tradeRes = await fetch("http://localhost:3000/api/trade", {
             method: "POST",
