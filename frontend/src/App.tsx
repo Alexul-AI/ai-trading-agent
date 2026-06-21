@@ -10,11 +10,19 @@ import {
   ArrowDownRight,
   RefreshCw,
   Layers,
+  PieChart,
 } from "lucide-react";
 
 interface ChartPoint {
   date: string;
   price: number;
+}
+
+interface PortfolioAllocation {
+  ticker: string;
+  percentage: number;
+  amount: number;
+  reasoning: string;
 }
 
 interface Message {
@@ -23,6 +31,7 @@ interface Message {
   content: string;
   chartData?: ChartPoint[];
   ticker?: string;
+  portfolio?: PortfolioAllocation[];
 }
 
 interface WatchlistItem {
@@ -31,6 +40,61 @@ interface WatchlistItem {
   price: number;
   change: number;
   isUp: boolean;
+}
+
+// Sub-component: Portfolio Allocation Widget
+function PortfolioWidget({
+  allocations,
+}: {
+  allocations: PortfolioAllocation[];
+}) {
+  if (!allocations || allocations.length === 0) return null;
+
+  return (
+    <div className="mt-4 bg-[#0B0F19] rounded-lg p-4 border border-slate-800/80 w-full">
+      <div className="flex items-center mb-4 pb-3 border-b border-slate-800/80">
+        <PieChart className="w-4 h-4 text-emerald-400 mr-2" />
+        <span className="text-xs font-semibold uppercase tracking-wider text-emerald-400">
+          Recommended Portfolio Allocation
+        </span>
+      </div>
+
+      <div className="space-y-4">
+        {allocations.map((item, idx) => (
+          <div
+            key={idx}
+            className="bg-[#111827] rounded-md p-3 border border-slate-800/50"
+          >
+            <div className="flex justify-between items-center mb-2">
+              <div className="flex items-center space-x-2">
+                <span className="text-sm font-bold text-white bg-blue-500/10 px-2 py-0.5 rounded border border-blue-500/20 font-mono">
+                  {item.ticker}
+                </span>
+                <span className="text-xs font-medium text-slate-400">
+                  {Number(item.percentage || 0)}%
+                </span>
+              </div>
+              <span className="text-sm font-semibold text-emerald-400 font-mono">
+                ${Number(item.amount || 0).toFixed(2)}
+              </span>
+            </div>
+
+            {/* Progress bar visual */}
+            <div className="w-full bg-slate-800 rounded-full h-1.5 mb-3">
+              <div
+                className="bg-blue-500 h-1.5 rounded-full"
+                style={{ width: `${Number(item.percentage || 0)}%` }}
+              ></div>
+            </div>
+
+            <p className="text-[11px] text-slate-400 leading-relaxed italic">
+              "{item.reasoning}"
+            </p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 // Sub-component: Responsive Premium SVG Chart
@@ -272,36 +336,19 @@ export default function App() {
   ]);
   const [inputMessage, setInputMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [watchlist] = useState<WatchlistItem[]>([
-    {
-      ticker: "TSLA",
-      name: "Tesla Inc.",
-      price: 400.49,
-      change: 2.45,
-      isUp: true,
-    },
-    {
-      ticker: "AAPL",
-      name: "Apple Inc.",
-      price: 175.5,
-      change: -1.2,
-      isUp: false,
-    },
+  const [watchlist, setWatchlist] = useState<WatchlistItem[]>([
+    { ticker: "TSLA", name: "Tesla Inc.", price: 0, change: 0, isUp: true },
+    { ticker: "AAPL", name: "Apple Inc.", price: 0, change: 0, isUp: true },
     {
       ticker: "VRNS",
       name: "Varonis Systems",
-      price: 48.92,
-      change: 0.85,
+      price: 0,
+      change: 0,
       isUp: true,
     },
-    {
-      ticker: "LUMI.TA",
-      name: "Leumi Bank",
-      price: 31.45,
-      change: -0.15,
-      isUp: false,
-    },
+    { ticker: "LUMI.TA", name: "Leumi Bank", price: 0, change: 0, isUp: true },
   ]);
+  const [isRefreshingWatchlist, setIsRefreshingWatchlist] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -312,6 +359,59 @@ export default function App() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  // FIX FOR ESLINT WARNINGS AND CASCADING RENDERS
+  // Everything is isolated entirely inside the effect. No external dependencies.
+  useEffect(() => {
+    let isMounted = true;
+
+    const fetchInitialWatchlist = async () => {
+      try {
+        const tickers = ["TSLA", "AAPL", "VRNS", "LUMI.TA"];
+        const response = await fetch("http://localhost:3000/api/watchlist", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tickers }),
+        });
+
+        if (response.ok && isMounted) {
+          const updatedQuotes = await response.json();
+          setWatchlist(updatedQuotes);
+        }
+      } catch (err) {
+        console.error("Failed to fetch initial watchlist", err);
+      }
+    };
+
+    // Because this is async, the setState will happen asynchronously,
+    // avoiding the synchronous "cascading render" react warning.
+    fetchInitialWatchlist();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []); // Empty dependency array is now 100% correct
+
+  // Manual refresh handler for the UI button
+  const handleRefreshClick = async () => {
+    setIsRefreshingWatchlist(true);
+    try {
+      const tickers = watchlist.map((item) => item.ticker);
+      const response = await fetch("http://localhost:3000/api/watchlist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tickers }),
+      });
+      if (response.ok) {
+        const updatedQuotes = await response.json();
+        setWatchlist(updatedQuotes);
+      }
+    } catch (err) {
+      console.error("Failed to refresh watchlist", err);
+    } finally {
+      setIsRefreshingWatchlist(false);
+    }
+  };
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -351,6 +451,7 @@ export default function App() {
         content: data.reply || "No response received from the engine.",
         chartData: data.chartData || undefined,
         ticker: data.ticker || undefined,
+        portfolio: data.portfolio || undefined,
       };
 
       setMessages((prev) => [...prev, newAgentMsg]);
@@ -409,12 +510,12 @@ export default function App() {
                 <button
                   onClick={() =>
                     triggerPresetMessage(
-                      "What is the current price of VRNS shares?",
+                      "I have $1000. Allocate it between AAPL, MSFT, and TSLA based on recent trends.",
                     )
                   }
-                  className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-slate-300 hover:text-white transition-all font-medium"
+                  className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-emerald-300 hover:text-emerald-200 transition-all font-medium"
                 >
-                  ⚡ Fetch Varonis (VRNS) Quote
+                  💰 Optimize $1000 Tech Portfolio
                 </button>
                 <button
                   onClick={() =>
@@ -441,7 +542,14 @@ export default function App() {
                 <h3 className="text-[10px] font-bold tracking-wider text-slate-500 uppercase">
                   Local Watchlist
                 </h3>
-                <RefreshCw className="w-3 h-3 text-slate-500 hover:text-slate-300 cursor-pointer" />
+                <button
+                  onClick={handleRefreshClick}
+                  disabled={isRefreshingWatchlist}
+                >
+                  <RefreshCw
+                    className={`w-3 h-3 text-slate-500 hover:text-slate-300 cursor-pointer ${isRefreshingWatchlist ? "animate-spin opacity-50" : ""}`}
+                  />
+                </button>
               </div>
               <div className="space-y-1.5 max-h-[22vh] md:max-h-full overflow-y-auto">
                 {watchlist.map((stock) => (
@@ -453,24 +561,33 @@ export default function App() {
                       <div className="text-xs font-bold text-white font-mono">
                         {stock.ticker}
                       </div>
-                      <div className="text-[10px] text-slate-500">
+                      <div className="text-[10px] text-slate-500 w-24 truncate">
                         {stock.name}
                       </div>
                     </div>
                     <div className="text-right">
-                      <div className="text-xs font-semibold font-mono text-slate-200">
-                        ${stock.price.toFixed(2)}
-                      </div>
-                      <div
-                        className={`text-[9px] flex items-center justify-end font-mono font-medium ${stock.isUp ? "text-emerald-400" : "text-rose-400"}`}
-                      >
-                        {stock.isUp ? (
-                          <ArrowUpRight className="w-2.5 h-2.5 mr-0.5" />
-                        ) : (
-                          <ArrowDownRight className="w-2.5 h-2.5 mr-0.5" />
-                        )}
-                        {Math.abs(stock.change).toFixed(2)}%
-                      </div>
+                      {stock.price === 0 ? (
+                        <div className="w-10 h-3 bg-slate-800 animate-pulse rounded ml-auto mb-1"></div>
+                      ) : (
+                        <div className="text-xs font-semibold font-mono text-slate-200">
+                          ${stock.price.toFixed(2)}
+                        </div>
+                      )}
+
+                      {stock.price === 0 ? (
+                        <div className="w-8 h-2 bg-slate-800 animate-pulse rounded ml-auto"></div>
+                      ) : (
+                        <div
+                          className={`text-[9px] flex items-center justify-end font-mono font-medium ${stock.isUp ? "text-emerald-400" : "text-rose-400"}`}
+                        >
+                          {stock.isUp ? (
+                            <ArrowUpRight className="w-2.5 h-2.5 mr-0.5" />
+                          ) : (
+                            <ArrowDownRight className="w-2.5 h-2.5 mr-0.5" />
+                          )}
+                          {Math.abs(stock.change).toFixed(2)}%
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -544,6 +661,11 @@ export default function App() {
                       {msg.content}
                     </p>
 
+                    {/* Render Portfolio Widget if data exists */}
+                    {msg.portfolio && (
+                      <PortfolioWidget allocations={msg.portfolio} />
+                    )}
+
                     {/* Render custom line chart if chartData exists inside this message */}
                     {msg.chartData && (
                       <TradingChart
@@ -596,7 +718,7 @@ export default function App() {
                 type="text"
                 value={inputMessage}
                 onChange={(e) => setInputMessage(e.target.value)}
-                placeholder="Ask e.g., 'Show me the historical trend of TSLA' or 'Compare TSLA price'..."
+                placeholder="Ask e.g., 'Allocate $500 between AAPL and TSLA'..."
                 disabled={isLoading}
                 className="flex-1 bg-transparent border-none focus:outline-none text-[13px] text-white placeholder-slate-500 px-4 py-2"
               />

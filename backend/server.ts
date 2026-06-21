@@ -31,6 +31,7 @@ app.post("/api/chat", async (req, res) => {
       reply: agentResponse.text,
       chartData: agentResponse.chartData,
       ticker: agentResponse.ticker,
+      portfolio: agentResponse.portfolio, // <-- ИМЕННО ЭТУ СТРОЧКУ Я ЗАБЫЛ ДОБАВИТЬ В ПРОШЛЫЙ РАЗ!
     });
   } catch (error: any) {
     console.error(`\n❌ [SERVER ERROR]:`, error);
