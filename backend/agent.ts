@@ -19,54 +19,34 @@ export interface PortfolioAllocation {
   reasoning: string;
 }
 
-export interface TechnicalIndicatorData {
-  ticker: string;
-  rsi: number;
-  macd: number;
-  signal: number;
-  histogram: number;
-  state: "OVERBOUGHT" | "OVERSOLD" | "NEUTRAL";
-  recommendation: "BUY" | "SELL" | "HOLD";
-}
-
 export interface AgentResponse {
   text: string;
   chartData?: ChartPoint[] | undefined;
   ticker?: string | undefined;
   portfolio?: PortfolioAllocation[] | undefined;
-  indicators?: TechnicalIndicatorData | undefined;
 }
 
-// Calculates 14-day Relative Strength Index (RSI) with strict undefined checking
+// --- TECHNICAL ANALYSIS MATHEMATICAL UTILITIES ---
+
 function calculateRSI(prices: number[], periods = 14): number {
-  if (prices.length <= periods) return 50; // Return neutral RSI if not enough data
+  if (prices.length <= periods) return 50;
 
   let gains = 0;
   let losses = 0;
 
-  // First RSI calculation loop
   for (let i = 1; i <= periods; i++) {
-    const current = prices[i];
-    const prev = prices[i - 1];
-    if (current !== undefined && prev !== undefined) {
-      const diff = current - prev;
-      if (diff > 0) gains += diff;
-      else losses -= diff;
-    }
+    const diff = (prices[i] ?? 0) - (prices[i - 1] ?? 0);
+    if (diff > 0) gains += diff;
+    else losses -= diff;
   }
 
   let avgGain = gains / periods;
   let avgLoss = losses / periods;
 
-  // Smooth RSI calculations with strict boundary safety
   for (let i = periods + 1; i < prices.length; i++) {
-    const current = prices[i];
-    const prev = prices[i - 1];
-    if (current !== undefined && prev !== undefined) {
-      const diff = current - prev;
-      avgGain = (avgGain * (periods - 1) + (diff > 0 ? diff : 0)) / periods;
-      avgLoss = (avgLoss * (periods - 1) + (diff < 0 ? -diff : 0)) / periods;
-    }
+    const diff = (prices[i] ?? 0) - (prices[i - 1] ?? 0);
+    avgGain = (avgGain * (periods - 1) + (diff > 0 ? diff : 0)) / periods;
+    avgLoss = (avgLoss * (periods - 1) + (diff < 0 ? -diff : 0)) / periods;
   }
 
   if (avgLoss === 0) return 100;
@@ -74,28 +54,20 @@ function calculateRSI(prices: number[], periods = 14): number {
   return parseFloat((100 - 100 / (1 + rs)).toFixed(2));
 }
 
-// Calculates Exponential Moving Average (EMA) with strict undefined checking
 function calculateEMA(prices: number[], period: number): number[] {
   const k = 2 / (period + 1);
   const ema: number[] = [];
   if (prices.length === 0) return ema;
 
-  const firstPrice = prices[0];
-  if (firstPrice !== undefined) {
-    ema.push(firstPrice);
-  }
-
+  ema.push(prices[0] ?? 0);
   for (let i = 1; i < prices.length; i++) {
-    const currentPrice = prices[i];
-    const prevEma = ema[i - 1];
-    if (currentPrice !== undefined && prevEma !== undefined) {
-      ema.push(currentPrice * k + prevEma * (1 - k));
-    }
+    const currentPrice = prices[i] ?? 0;
+    const prevEma = ema[i - 1] ?? 0;
+    ema.push(currentPrice * k + prevEma * (1 - k));
   }
   return ema;
 }
 
-// Calculates MACD (12, 26, 9) with index safety guarantees
 function calculateMACD(prices: number[]): {
   macd: number;
   signal: number;
@@ -110,13 +82,9 @@ function calculateMACD(prices: number[]): {
 
   const macdLine: number[] = [];
   for (let i = 0; i < prices.length; i++) {
-    const val12 = ema12[i];
-    const val26 = ema26[i];
-    if (val12 !== undefined && val26 !== undefined) {
-      macdLine.push(val12 - val26);
-    } else {
-      macdLine.push(0);
-    }
+    const val12 = ema12[i] ?? 0;
+    const val26 = ema26[i] ?? 0;
+    macdLine.push(val12 - val26);
   }
 
   const signalLine = calculateEMA(macdLine.slice(25), 9);
@@ -130,12 +98,13 @@ function calculateMACD(prices: number[]): {
     histogram: parseFloat((currentMacd - currentSignal).toFixed(4)),
   };
 }
-// 1. Tool Declaration for Gemini 2.5
+
+// --- GEMINI MODEL & TOOLS SETUP ---
+
 const model = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
-  // CHANGED: We now explicitly forbid raw JSON output in the text bubble
   systemInstruction:
-    "You are an AI Trading Assistant. When analyzing a portfolio, provide a short, professional summary of your reasoning. Do NOT output raw JSON data in your text response. Your structured data is handled automatically by the system.",
+    "You are an AI Trading Assistant. CRITICAL RULES:\n1. If the user asks to BUY or SELL a stock, you MUST ALWAYS use the 'execute_trade' tool.\n2. When asked to analyze a portfolio and allocate budget, you MUST respond ONLY with a valid JSON array of objects. Do not include any markdown formatting.\n3. Use technical indicators like RSI and MACD whenever available to make highly professional and data-driven recommendations.\n4. Always respect risk management. When allocating budgets, strictly avoid recommending more than 30% of the total budget for a single stock unless explicitly overridden by the user.",
   tools: [
     {
       functionDeclarations: [
@@ -182,6 +151,14 @@ const model = genAI.getGenerativeModel({
               },
             },
             required: ["ticker"],
+          },
+        },
+        {
+          name: "get_transaction_history",
+          description: "Retrieves the user's paper trading transaction logs.",
+          parameters: {
+            type: SchemaType.OBJECT,
+            properties: {},
           },
         },
         {
@@ -358,7 +335,14 @@ export async function getWatchlistQuotes(tickers: string[]) {
 
 export async function runTradingAgentStep(
   userMessage: string,
-  history?: any[],
+  history: any[] = [],
+  transactionHistory: any[] = [],
+  executeTradeCallback?: (
+    ticker: string,
+    action: string,
+    shares: number,
+    price: number,
+  ) => Promise<any>,
 ): Promise<AgentResponse> {
   const formattedHistory = history
     ? history
@@ -377,7 +361,6 @@ export async function runTradingAgentStep(
   let finalChartData: ChartPoint[] | undefined = undefined;
   let detectedTicker: string | undefined = undefined;
   let finalPortfolio: PortfolioAllocation[] | undefined = undefined;
-  let finalIndicators: TechnicalIndicatorData | undefined = undefined;
 
   if (calls && calls.length > 0) {
     const call = calls[0];
@@ -411,20 +394,19 @@ export async function runTradingAgentStep(
         const prices = historicalResult.data.map((p) => p.price);
         const rsiValue = calculateRSI(prices, 14);
         const macdValue = calculateMACD(prices);
-        const stateVal =
-          rsiValue > 70 ? "OVERBOUGHT" : rsiValue < 30 ? "OVERSOLD" : "NEUTRAL";
-        const recVal = rsiValue < 35 ? "BUY" : rsiValue > 65 ? "SELL" : "HOLD";
-
-        finalIndicators = {
+        apiResponse = {
           ticker: detectedTicker,
           rsi: rsiValue,
           macd: macdValue.macd,
           signal: macdValue.signal,
           histogram: macdValue.histogram,
-          state: stateVal,
-          recommendation: recVal,
+          state:
+            rsiValue > 70
+              ? "OVERBOUGHT"
+              : rsiValue < 30
+                ? "OVERSOLD"
+                : "NEUTRAL",
         };
-        apiResponse = finalIndicators;
         console.log(
           `📊 [ANALYSIS] Technical analysis completed for ${detectedTicker}: RSI=${rsiValue}`,
         );
@@ -432,6 +414,22 @@ export async function runTradingAgentStep(
         apiResponse = {
           error: `Failed to calculate indicators for ${detectedTicker}`,
         };
+      }
+    } else if (call.name === "get_transaction_history") {
+      console.log(`⚙️ [BACKEND] Resolving trade history from memory logs...`);
+
+      // THE ULTIMATE FIX: Completely flatten the array into a pure string.
+      // This mathematically guarantees no arrays exist in the JSON payload, perfectly bypassing the Protobuf bug.
+      if (!transactionHistory || transactionHistory.length === 0) {
+        apiResponse = {
+          result:
+            "No trades have been executed yet. The portfolio is at default state.",
+        };
+      } else {
+        const textLog = transactionHistory
+          .map((t) => `${t.action} ${t.shares}x ${t.ticker} at $${t.price}`)
+          .join(" | ");
+        apiResponse = { result: "Here is the transaction history: " + textLog };
       }
     } else if (call.name === "analyze_portfolio") {
       const args = call.args as { tickers: string[]; budget: number };
@@ -471,12 +469,6 @@ export async function runTradingAgentStep(
       ]`;
 
       try {
-        console.log(
-          `⚙️ [BACKEND] Requesting Gemini to analyze portfolio with Strict JSON mode...`,
-        );
-
-        // This clean model instance is used ONLY for internal calculations,
-        // it doesn't affect the chat conversation, so it can safely use JSON mode.
         const jsonModel = genAI.getGenerativeModel({
           model: "gemini-2.5-flash",
           generationConfig: { responseMimeType: "application/json" },
@@ -487,9 +479,10 @@ export async function runTradingAgentStep(
 
         if (!Array.isArray(finalPortfolio))
           throw new Error("Parsed result is not an array");
+        // Safe flat object return
         apiResponse = {
           success: "Portfolio analyzed successfully",
-          portfolio: finalPortfolio,
+          portfolio_string: JSON.stringify(finalPortfolio),
         };
       } catch (e: any) {
         apiResponse = {
@@ -512,28 +505,18 @@ export async function runTradingAgentStep(
           error: `Cannot execute trade. Real-time price for ${ticker} unavailable.`,
         };
       } else {
-        try {
-          const tradeRes = await fetch("http://localhost:3000/api/trade", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              ticker,
-              action: args.action.toUpperCase(),
-              shares: args.shares,
-              price: priceResult.price,
-            }),
-          });
-          const tradeData = await tradeRes.json();
-
-          if (!tradeRes.ok) {
-            apiResponse = { error: tradeData.error || "Trade failed." };
-          } else {
-            apiResponse = {
-              success: `TRADE EXECUTED: ${args.action} ${args.shares} shares of ${ticker} at $${priceResult.price}. Remaining Balance: $${tradeData.portfolio.balance.toFixed(2)}`,
-            };
-          }
-        } catch (e) {
-          apiResponse = { error: "Local trade engine is unreachable." };
+        if (executeTradeCallback) {
+          const tradeResult = await executeTradeCallback(
+            ticker,
+            args.action.toUpperCase(),
+            args.shares,
+            priceResult.price,
+          );
+          apiResponse = tradeResult; // Flat object {success: "..."}
+        } else {
+          apiResponse = {
+            error: "Local trade executor callback is unconfigured.",
+          };
         }
       }
     }
@@ -550,7 +533,6 @@ export async function runTradingAgentStep(
       chartData: finalChartData,
       ticker: detectedTicker,
       portfolio: finalPortfolio,
-      indicators: finalIndicators,
     };
   } else {
     return { text: result.response.text() };
