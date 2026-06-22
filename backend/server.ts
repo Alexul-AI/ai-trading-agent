@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import Database from "better-sqlite3";
 import { runTradingAgentStep, getWatchlistQuotes } from "./agent.js";
 
 const app = express();
@@ -8,11 +9,49 @@ const PORT = 3000;
 app.use(express.json());
 app.use(cors({ origin: "http://localhost:5173" }));
 
-// --- PORTFOLIO & HISTORY STATE ---
-let userPortfolio = {
-  balance: 1000.0,
-  currency: "USD",
-  positions: {} as Record<
+// --- DATABASE SETUP (SQLite) ---
+// This creates a local file 'trading_bot.db' to persist data across server restarts
+const db = new Database("trading_bot.db");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS portfolio (
+    id INTEGER PRIMARY KEY,
+    balance REAL NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS positions (
+    ticker TEXT PRIMARY KEY,
+    shares REAL NOT NULL,
+    avgPrice REAL NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    action TEXT NOT NULL,
+    shares REAL NOT NULL,
+    price REAL NOT NULL,
+    date TEXT NOT NULL
+  );
+`);
+
+// Initialize default balance if the database is completely empty
+const initPortfolio = db.prepare("SELECT * FROM portfolio WHERE id = 1").get();
+if (!initPortfolio) {
+  db.prepare("INSERT INTO portfolio (id, balance) VALUES (1, 1000.0)").run();
+  console.log(
+    `🌱 [DB] Initialized new portfolio with default $1000.00 balance.`,
+  );
+}
+
+// --- DB ACCESS HELPERS ---
+const getPortfolioState = () => {
+  const pRow = db
+    .prepare("SELECT balance FROM portfolio WHERE id = 1")
+    .get() as { balance: number };
+  const positions = db
+    .prepare("SELECT ticker, shares, avgPrice FROM positions")
+    .all() as Array<{ ticker: string; shares: number; avgPrice: number }>;
+
+  const posMap: Record<
     string,
     {
       shares: number;
@@ -21,57 +60,20 @@ let userPortfolio = {
       pnl?: number;
       pnlPercent?: number;
     }
-  >,
-};
-
-let transactionHistory: Array<{
-  ticker: string;
-  action: string;
-  shares: number;
-  price: number;
-  date: string;
-}> = [];
-
-// --- DYNAMIC MARKET DRIFT SIMULATOR ---
-// Keeps persistent randomized price drifts in memory so stock prices fluctuate realistically
-let priceDrifts: Record<string, number> = {};
-
-const getDriftedPrice = (ticker: string, basePrice: number): number => {
-  if (!priceDrifts[ticker]) {
-    priceDrifts[ticker] = 1.0; // Start with no drift (base market price)
-  }
-  // Apply a tiny random walk (-0.15% to +0.15% per tick/refresh)
-  const change = Math.random() * 0.003 - 0.0015;
-  priceDrifts[ticker] = priceDrifts[ticker] * (1 + change);
-
-  // Guardrail: Keep the drifted price within a realistic +/- 3% band of the real-world market price
-  if (priceDrifts[ticker] > 1.03) priceDrifts[ticker] = 1.03;
-  if (priceDrifts[ticker] < 0.97) priceDrifts[ticker] = 0.97;
-
-  return basePrice * priceDrifts[ticker];
-};
-
-// Enrichment helper to keep watchlist and open position prices perfectly in sync
-const getDriftedWatchlistQuotes = async (tickers: string[]) => {
-  const rawQuotes = await getWatchlistQuotes(tickers);
-  return rawQuotes.map((quote) => {
-    const basePrice = quote.price;
-    const currentPrice = getDriftedPrice(quote.ticker, basePrice);
-
-    // Adjust daily change ratio based on our drifted price
-    const driftRatio = currentPrice / (basePrice || 1);
-    const newChange = quote.change * driftRatio;
-
-    return {
-      ...quote,
-      price: parseFloat(currentPrice.toFixed(2)),
-      change: parseFloat(newChange.toFixed(2)),
-      isUp: newChange >= 0,
-    };
+  > = {};
+  positions.forEach((p) => {
+    posMap[p.ticker] = { shares: p.shares, avgPrice: p.avgPrice };
   });
+
+  return {
+    balance: pRow.balance,
+    currency: "USD",
+    positions: posMap,
+  };
 };
 
-const executeTradeInMemory = async (
+// Database execution layer ensuring atomicity with DB Transactions
+const executeDbTrade = (
   ticker: string,
   action: string,
   shares: number,
@@ -80,76 +82,90 @@ const executeTradeInMemory = async (
   ticker = ticker.toUpperCase();
   const cost = shares * price;
 
-  if (action === "BUY") {
-    if (userPortfolio.balance >= cost) {
-      userPortfolio.balance -= cost;
-      if (!userPortfolio.positions[ticker]) {
-        userPortfolio.positions[ticker] = { shares: 0, avgPrice: 0 };
+  let resultMessage = "";
+
+  const tradeTx = db.transaction(() => {
+    const pRow = db
+      .prepare("SELECT balance FROM portfolio WHERE id = 1")
+      .get() as { balance: number };
+    let currentBalance = pRow.balance;
+
+    const posRow = db
+      .prepare("SELECT shares, avgPrice FROM positions WHERE ticker = ?")
+      .get(ticker) as { shares: number; avgPrice: number } | undefined;
+    let posShares = posRow ? posRow.shares : 0;
+    let posAvgPrice = posRow ? posRow.avgPrice : 0;
+
+    if (action === "BUY") {
+      if (currentBalance < cost) throw new Error("Insufficient funds.");
+      currentBalance -= cost;
+
+      const newAvgPrice =
+        (posShares * posAvgPrice + cost) / (posShares + shares);
+      posShares += shares;
+
+      db.prepare("UPDATE portfolio SET balance = ? WHERE id = 1").run(
+        currentBalance,
+      );
+      db.prepare(
+        `
+        INSERT INTO positions (ticker, shares, avgPrice) 
+        VALUES (?, ?, ?) 
+        ON CONFLICT(ticker) DO UPDATE SET shares=excluded.shares, avgPrice=excluded.avgPrice
+      `,
+      ).run(ticker, posShares, newAvgPrice);
+
+      resultMessage = `Successfully executed: BUY ${shares} shares of ${ticker} at $${price.toFixed(2)}.`;
+    } else if (action === "SELL") {
+      if (posShares < shares) throw new Error("Insufficient shares.");
+      currentBalance += cost;
+      posShares -= shares;
+
+      db.prepare("UPDATE portfolio SET balance = ? WHERE id = 1").run(
+        currentBalance,
+      );
+      if (posShares === 0) {
+        db.prepare("DELETE FROM positions WHERE ticker = ?").run(ticker);
+      } else {
+        db.prepare("UPDATE positions SET shares = ? WHERE ticker = ?").run(
+          posShares,
+          ticker,
+        );
       }
 
-      const pos = userPortfolio.positions[ticker]!;
-      pos.avgPrice = (pos.shares * pos.avgPrice + cost) / (pos.shares + shares);
-      pos.shares += shares;
-
-      transactionHistory.push({
-        ticker,
-        action,
-        shares,
-        price,
-        date: new Date().toISOString(),
-      });
-      console.log(
-        `✅ [SERVER] Bought ${shares}x ${ticker}. Balance: $${userPortfolio.balance.toFixed(2)}`,
-      );
-      return {
-        success: `Successfully executed: BUY ${shares} shares of ${ticker} at $${price.toFixed(2)}.`,
-      };
+      resultMessage = `Successfully executed: SELL ${shares} shares of ${ticker} at $${price.toFixed(2)}.`;
     } else {
-      return { error: "Insufficient funds." };
+      throw new Error("Invalid action.");
     }
-  } else if (action === "SELL") {
-    const pos = userPortfolio.positions[ticker];
-    if (pos && pos.shares >= shares) {
-      userPortfolio.balance += cost;
-      pos.shares -= shares;
 
-      if (pos.shares === 0) {
-        delete userPortfolio.positions[ticker];
-      }
+    db.prepare(
+      "INSERT INTO history (ticker, action, shares, price, date) VALUES (?, ?, ?, ?, ?)",
+    ).run(ticker, action, shares, price, new Date().toISOString());
+  });
 
-      transactionHistory.push({
-        ticker,
-        action,
-        shares,
-        price,
-        date: new Date().toISOString(),
-      });
-      console.log(
-        `✅ [SERVER] Sold ${shares}x ${ticker}. Balance: $${userPortfolio.balance.toFixed(2)}`,
-      );
-      return {
-        success: `Successfully executed: SELL ${shares} shares of ${ticker} at $${price.toFixed(2)}.`,
-      };
-    } else {
-      return { error: "Insufficient shares." };
-    }
+  try {
+    tradeTx();
+    console.log(`✅ [DB] Trade committed: ${action} ${shares}x ${ticker}`);
+    return { success: resultMessage };
+  } catch (error: any) {
+    console.warn(`⚠️ [DB] Trade rejected: ${error.message}`);
+    return { error: error.message };
   }
-  return { error: "Invalid action." };
 };
 
-// --- ENRICHED PORTFOLIO ENDPOINT (CALCULATES PNL) ---
+// --- ENDPOINTS ---
 app.get("/api/portfolio", async (req, res) => {
   try {
-    const enrichedPortfolio = JSON.parse(JSON.stringify(userPortfolio));
-    const tickers = Object.keys(enrichedPortfolio.positions);
+    const portfolio = getPortfolioState();
+    const tickers = Object.keys(portfolio.positions);
 
     if (tickers.length > 0) {
-      // Fetch fresh, drifted quotes for all open positions to calculate dynamic P&L
-      const quotes = await getDriftedWatchlistQuotes(tickers);
+      // Fetch fresh, live quotes for all open positions directly from Yahoo API
+      const quotes = await getWatchlistQuotes(tickers);
 
       for (const ticker of tickers) {
         const quote = quotes.find((q) => q.ticker === ticker);
-        const pos = enrichedPortfolio.positions[ticker];
+        const pos = portfolio.positions[ticker]!;
 
         const currentPrice = quote?.price || pos.avgPrice;
 
@@ -162,14 +178,21 @@ app.get("/api/portfolio", async (req, res) => {
       }
     }
 
-    res.json(enrichedPortfolio);
+    res.json(portfolio);
   } catch (error) {
     console.error("Portfolio enrichment error:", error);
-    res.json(userPortfolio);
+    res.json(getPortfolioState());
   }
 });
 
-app.get("/api/history", (req, res) => res.json(transactionHistory));
+app.get("/api/history", (req, res) => {
+  const history = db
+    .prepare(
+      "SELECT ticker, action, shares, price, date FROM history ORDER BY id ASC",
+    )
+    .all();
+  res.json(history);
+});
 
 app.post("/api/trade", async (req, res) => {
   const { ticker, action, shares, price } = req.body;
@@ -177,19 +200,39 @@ app.post("/api/trade", async (req, res) => {
     res.status(400).json({ error: "Missing parameters." });
     return;
   }
-  const result = await executeTradeInMemory(ticker, action, shares, price);
-  if (result.error) res.status(400).json(result);
-  else res.json({ success: true, portfolio: userPortfolio });
+
+  const result = executeDbTrade(ticker, action, shares, price);
+  if (result.error) {
+    res.status(400).json(result);
+  } else {
+    res.json({ success: true, portfolio: getPortfolioState() });
+  }
 });
 
 app.post("/api/chat", async (req, res) => {
   const { message, history } = req.body;
   try {
+    const transactionHistory = db
+      .prepare(
+        "SELECT ticker, action, shares, price, date FROM history ORDER BY id ASC",
+      )
+      .all();
+
+    // Wrapper to ensure standard Promise resolution expected by the agent runner
+    const asyncExecuteTrade = async (
+      t: string,
+      a: string,
+      s: number,
+      p: number,
+    ) => {
+      return executeDbTrade(t, a, s, p);
+    };
+
     const agentResponse = await runTradingAgentStep(
       message,
       history,
-      transactionHistory,
-      executeTradeInMemory,
+      transactionHistory as any[],
+      asyncExecuteTrade,
     );
 
     res.json({
@@ -209,7 +252,8 @@ app.post("/api/chat", async (req, res) => {
 app.post("/api/watchlist", async (req, res) => {
   const { tickers } = req.body;
   try {
-    res.json(await getDriftedWatchlistQuotes(tickers));
+    // Live execution data without drift
+    res.json(await getWatchlistQuotes(tickers));
   } catch (error) {
     console.error("Watchlist fetch error:", error);
     res.status(500).json({ error: "Watchlist error" });
