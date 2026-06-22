@@ -104,7 +104,7 @@ function calculateMACD(prices: number[]): {
 const model = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
   systemInstruction:
-    "You are an AI Trading Assistant. CRITICAL RULES:\n1. If the user asks to BUY or SELL a stock, you MUST ALWAYS use the 'execute_trade' tool.\n2. When asked to analyze a portfolio and allocate budget, you MUST respond ONLY with a valid JSON array of objects. Do not include any markdown formatting.\n3. Use technical indicators like RSI and MACD whenever available to make highly professional and data-driven recommendations.\n4. Always respect risk management. When allocating budgets, strictly avoid recommending more than 30% of the total budget for a single stock unless explicitly overridden by the user.",
+    "You are an AI Trading Assistant. CRITICAL RULES:\n1. If the user asks to BUY or SELL a stock, you MUST ALWAYS use the 'execute_trade' tool.\n2. When asked to analyze a portfolio and allocate budget, you MUST respond ONLY with a valid JSON array of objects. Do not include any markdown formatting.\n3. Use technical indicators like RSI and MACD whenever available to make highly professional and data-driven recommendations.\n4. Always respect risk management. When allocating budgets, strictly avoid recommending more than 30% of the total budget for a single stock unless explicitly overridden by the user.\n5. When asked about news, market mood, or sentiment, use the 'analyze_news_sentiment' tool.",
   tools: [
     {
       functionDeclarations: [
@@ -142,6 +142,21 @@ const model = genAI.getGenerativeModel({
           name: "get_technical_indicators",
           description:
             "Calculates advanced technical analysis metrics (RSI, MACD) for a stock ticker based on recent history.",
+          parameters: {
+            type: SchemaType.OBJECT,
+            properties: {
+              ticker: {
+                type: SchemaType.STRING,
+                description: "Stock ticker (e.g., AAPL, TSLA)",
+              },
+            },
+            required: ["ticker"],
+          },
+        },
+        {
+          name: "analyze_news_sentiment",
+          description:
+            "Fetches recent news headlines for a stock ticker and analyzes the overall sentiment (BULLISH, BEARISH, or NEUTRAL).",
           parameters: {
             type: SchemaType.OBJECT,
             properties: {
@@ -307,6 +322,22 @@ async function getHistoricalPrices(
   }
 }
 
+async function getNewsSentiment(ticker: string) {
+  console.log(`\n⚙️ [BACKEND] Fetching recent news for ticker: ${ticker}...`);
+  try {
+    const searchResult = await yahooFinance.search(ticker);
+    if (!searchResult.news || searchResult.news.length === 0) {
+      return { error: `No recent news found for ${ticker}.` };
+    }
+    // Extract the top 5 recent headlines
+    const headlines = searchResult.news.slice(0, 5).map((n: any) => n.title);
+    return { headlines };
+  } catch (error: any) {
+    console.error(`\n❌ [BACKEND ERROR]: Failed to fetch news for ${ticker}`);
+    return { error: `Could not retrieve news for ${ticker}.` };
+  }
+}
+
 export async function getWatchlistQuotes(tickers: string[]) {
   return Promise.all(
     tickers.map(async (ticker) => {
@@ -415,11 +446,52 @@ export async function runTradingAgentStep(
           error: `Failed to calculate indicators for ${detectedTicker}`,
         };
       }
+    } else if (call.name === "analyze_news_sentiment") {
+      const args = call.args as { ticker: string };
+      detectedTicker = args.ticker.toUpperCase();
+
+      const newsResult = await getNewsSentiment(detectedTicker);
+
+      if (newsResult.error) {
+        apiResponse = { error: newsResult.error };
+      } else {
+        const sentimentPrompt = `Analyze the following recent news headlines for ${detectedTicker} and determine the overall market sentiment.
+          Headlines:
+          ${JSON.stringify(newsResult.headlines)}
+
+          Respond ONLY with a raw JSON object. Do NOT use markdown code blocks (\`\`\`json).
+          Structure MUST be exactly:
+          {
+            "sentiment": "BULLISH" | "BEARISH" | "NEUTRAL",
+            "summary": "A concise 1-2 sentence explanation based on the headlines."
+          }`;
+
+        try {
+          console.log(
+            `🧠 [BACKEND] Running secondary LLM for sentiment analysis...`,
+          );
+          const jsonModel = genAI.getGenerativeModel({
+            model: "gemini-2.5-flash",
+            generationConfig: { responseMimeType: "application/json" },
+          });
+          const analysisResult =
+            await jsonModel.generateContent(sentimentPrompt);
+          const parsedSentiment = JSON.parse(analysisResult.response.text());
+
+          // THE FIX: Stringify the array to completely bypass the Protobuf SDK bug
+          apiResponse = {
+            success: "News analyzed successfully",
+            sentiment_json: JSON.stringify(parsedSentiment),
+          };
+          console.log(
+            `📰 [NEWS] Sentiment for ${detectedTicker}: ${parsedSentiment.sentiment}`,
+          );
+        } catch (e: any) {
+          apiResponse = { error: "Failed to analyze news sentiment." };
+        }
+      }
     } else if (call.name === "get_transaction_history") {
       console.log(`⚙️ [BACKEND] Resolving trade history from memory logs...`);
-
-      // THE ULTIMATE FIX: Completely flatten the array into a pure string.
-      // This mathematically guarantees no arrays exist in the JSON payload, perfectly bypassing the Protobuf bug.
       if (!transactionHistory || transactionHistory.length === 0) {
         apiResponse = {
           result:
@@ -479,7 +551,7 @@ export async function runTradingAgentStep(
 
         if (!Array.isArray(finalPortfolio))
           throw new Error("Parsed result is not an array");
-        // Safe flat object return
+        // THE FIX: Stringify the array to completely bypass the Protobuf SDK bug
         apiResponse = {
           success: "Portfolio analyzed successfully",
           portfolio_string: JSON.stringify(finalPortfolio),
