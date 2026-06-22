@@ -59,7 +59,16 @@ interface WatchlistItem {
 interface UserPortfolio {
   balance: number;
   currency: string;
-  positions: Record<string, { shares: number; avgPrice: number }>;
+  positions: Record<
+    string,
+    {
+      shares: number;
+      avgPrice: number;
+      currentPrice?: number;
+      pnl?: number;
+      pnlPercent?: number;
+    }
+  >;
 }
 
 function SentimentWidget({ data }: { data?: SentimentData }) {
@@ -114,32 +123,28 @@ function TechnicalWidget({ data }: { data?: TechnicalData }) {
             <span className="text-slate-400 font-medium">RSI (14 Days)</span>
             <span className="font-mono text-white font-bold">{data.rsi}</span>
           </div>
-          {/* Visual RSI Gauge Bar */}
           <div className="relative w-full h-2.5 bg-slate-800 rounded-full overflow-hidden flex">
             <div
               className="h-full bg-emerald-500/60"
               style={{ width: "30%" }}
-              title="Oversold (Buy Zone)"
+              title="Oversold (Buy)"
             ></div>
             <div
               className="h-full bg-slate-600/60"
               style={{ width: "40%" }}
-              title="Neutral Zone"
+              title="Neutral"
             ></div>
             <div
               className="h-full bg-rose-500/60"
               style={{ width: "30%" }}
-              title="Overbought (Sell Zone)"
+              title="Overbought (Sell)"
             ></div>
-            {/* Current RSI Marker */}
             <div
               className="absolute top-0 bottom-0 w-1.5 bg-white rounded shadow-[0_0_8px_rgba(255,255,255,0.9)]"
               style={{ left: `${rsiPos}%`, transform: "translateX(-50%)" }}
             ></div>
           </div>
         </div>
-
-        {/* MACD Data Grid */}
         <div className="grid grid-cols-3 gap-3">
           <div className="bg-[#111827] p-2.5 rounded border border-slate-800/50">
             <div className="text-[10px] text-slate-500 mb-0.5">MACD</div>
@@ -228,7 +233,6 @@ function TradingChart({
   const minPrice = Math.min(...prices) * 0.99;
   const maxPrice = Math.max(...prices) * 1.01;
   const priceRange = maxPrice - minPrice;
-
   const width = 500;
   const height = 180;
   const paddingX = 40;
@@ -267,7 +271,6 @@ function TradingChart({
     setHoverIndex(closestIndex);
     setHoveredPoint(data[closestIndex]);
   };
-
   const handleMouseLeave = () => {
     setHoveredPoint(null);
     setHoverIndex(null);
@@ -290,9 +293,7 @@ function TradingChart({
             </span>
           </div>
         ) : (
-          <span className="text-xs text-slate-500">
-            Hover graph for details
-          </span>
+          <span className="text-xs text-slate-500">Hover graph</span>
         )}
       </div>
       <div className="relative">
@@ -423,7 +424,6 @@ export default function App() {
   ]);
   const [inputMessage, setInputMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>([
     { ticker: "TSLA", name: "Tesla Inc.", price: 0, change: 0, isUp: true },
     { ticker: "AAPL", name: "Apple Inc.", price: 0, change: 0, isUp: true },
@@ -436,7 +436,6 @@ export default function App() {
     },
     { ticker: "LUMI.TA", name: "Leumi Bank", price: 0, change: 0, isUp: true },
   ]);
-
   const [userPortfolio, setUserPortfolio] = useState<UserPortfolio | null>(
     null,
   );
@@ -451,8 +450,8 @@ export default function App() {
     try {
       const res = await fetch("http://localhost:3000/api/portfolio");
       if (res.ok) setUserPortfolio(await res.json());
-    } catch {
-      console.warn("Failed to fetch portfolio data.");
+    } catch (error) {
+      console.error("Portfolio fetch error:", error);
     }
   };
 
@@ -469,13 +468,12 @@ export default function App() {
           }),
           fetch("http://localhost:3000/api/portfolio"),
         ]);
-
         if (isMounted) {
           if (wRes.ok) setWatchlist(await wRes.json());
           if (pRes.ok) setUserPortfolio(await pRes.json());
         }
-      } catch {
-        console.warn("Failed to fetch initial data on mount.");
+      } catch (error) {
+        console.error("Initial data fetch error:", error);
       }
     };
     fetchInitialData();
@@ -494,8 +492,8 @@ export default function App() {
       });
       if (res.ok) setWatchlist(await res.json());
       await fetchPortfolio();
-    } catch {
-      console.error("Watchlist refresh failed.");
+    } catch (error) {
+      console.error("Watchlist refresh error:", error);
     } finally {
       setIsRefreshingWatchlist(false);
     }
@@ -504,7 +502,6 @@ export default function App() {
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputMessage.trim()) return;
-
     const newUserMsg: Message = {
       id: Date.now().toString(),
       role: "user",
@@ -524,7 +521,22 @@ export default function App() {
         }),
       });
 
-      if (!response.ok) throw new Error("Network error during AI execution");
+      if (!response.ok) {
+        if (response.status === 503) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: (Date.now() + 1).toString(),
+              role: "system",
+              content:
+                "The Gemini API is currently overloaded (503). The backend tried multiple times but failed. Please wait 10 seconds and try again.",
+            },
+          ]);
+          return;
+        }
+        throw new Error("Network error");
+      }
+
       const data = await response.json();
 
       setMessages((prev) => [
@@ -540,7 +552,6 @@ export default function App() {
           sentimentData: data.sentimentData,
         },
       ]);
-
       await fetchPortfolio();
     } catch {
       setMessages((prev) => [
@@ -548,7 +559,8 @@ export default function App() {
         {
           id: (Date.now() + 1).toString(),
           role: "system",
-          content: "Connection Error: Unable to reach the backend server.",
+          content:
+            "Connection Error: Unable to reach the backend server. Is it running?",
         },
       ]);
     } finally {
@@ -559,11 +571,9 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#0B0F19] text-slate-300 font-sans flex items-center justify-center p-2 sm:p-4 selection:bg-blue-500/30">
       <div className="w-full max-w-7xl bg-[#111827] rounded-xl shadow-2xl border border-slate-800 flex flex-col md:flex-row h-[92vh] overflow-hidden relative">
-        {/* Ambient Noise Background */}
         <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-5 pointer-events-none"></div>
 
-        {/* Sidebar Panel */}
-        <aside className="w-full md:w-80 bg-[#161D30] border-b md:border-b-0 md:border-r border-slate-800/80 p-5 flex flex-col shrink-0 z-10 overflow-y-auto scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
+        <aside className="w-full md:w-80 bg-[#161D30] border-b md:border-b-0 md:border-r border-slate-800/80 p-5 flex flex-col shrink-0 z-10 overflow-y-auto custom-scrollbar">
           <div className="flex items-center space-x-3.5 mb-6">
             <div className="w-9 h-9 bg-blue-600/20 rounded-lg flex items-center justify-center border border-blue-500/20">
               <Activity className="w-5 h-5 text-blue-400" />
@@ -601,24 +611,36 @@ export default function App() {
               </div>
               {userPortfolio &&
               Object.keys(userPortfolio.positions).length > 0 ? (
-                Object.entries(userPortfolio.positions).map(([tick, pos]) => (
-                  <div
-                    key={tick}
-                    className="flex justify-between items-center text-xs"
-                  >
-                    <span className="font-mono text-blue-400 font-semibold">
-                      {tick}
-                    </span>
-                    <div className="text-right">
-                      <span className="text-slate-300 block">
-                        {pos.shares} shares
-                      </span>
-                      <span className="text-[9px] text-slate-500">
-                        Avg: ${pos.avgPrice.toFixed(2)}
-                      </span>
+                Object.entries(userPortfolio.positions).map(([tick, pos]) => {
+                  const isProfit = (pos.pnl || 0) >= 0;
+                  return (
+                    <div
+                      key={tick}
+                      className="flex justify-between items-center p-2 rounded bg-[#101524]/60 border border-slate-800/30"
+                    >
+                      <div>
+                        <span className="font-mono text-blue-400 font-semibold text-xs">
+                          {tick}
+                        </span>
+                        <div className="text-[9px] text-slate-500">
+                          {pos.shares} shares @ ${pos.avgPrice.toFixed(2)}
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <span className="text-slate-200 block text-xs font-mono">
+                          ${(pos.currentPrice || pos.avgPrice).toFixed(2)}
+                        </span>
+                        <span
+                          className={`text-[9px] font-mono font-medium ${isProfit ? "text-emerald-400" : "text-rose-400"}`}
+                        >
+                          {isProfit ? "+" : ""}
+                          {(pos.pnl || 0).toFixed(2)} (
+                          {(pos.pnlPercent || 0).toFixed(2)}%)
+                        </span>
+                      </div>
                     </div>
-                  </div>
-                ))
+                  );
+                })
               ) : (
                 <div className="text-xs text-slate-500 italic">
                   No open positions.
@@ -663,9 +685,10 @@ export default function App() {
               <button
                 onClick={handleRefreshClick}
                 disabled={isRefreshingWatchlist}
+                className="cursor-pointer"
               >
                 <RefreshCw
-                  className={`w-3 h-3 text-slate-500 hover:text-slate-300 cursor-pointer ${isRefreshingWatchlist ? "animate-spin opacity-50" : ""}`}
+                  className={`w-3 h-3 text-slate-500 hover:text-slate-300 ${isRefreshingWatchlist ? "animate-spin opacity-50" : ""}`}
                 />
               </button>
             </div>
@@ -712,7 +735,6 @@ export default function App() {
           </div>
         </aside>
 
-        {/* Chat / Terminal Area */}
         <section className="flex-1 flex flex-col h-full bg-[#111827] relative z-10 overflow-hidden">
           <header className="bg-[#181F30] border-b border-slate-800 px-6 py-4 flex items-center justify-between">
             <div>
@@ -725,13 +747,13 @@ export default function App() {
             </div>
             <div className="flex items-center space-x-2 text-xs">
               <span className="flex items-center bg-[#0B0F19] px-3 py-1.5 rounded border border-slate-800 text-[10px] font-mono text-emerald-400">
-                <TrendingUp className="w-3.5 h-3.5 mr-1.5" /> Live Feed
-                Connective
+                <TrendingUp className="w-3.5 h-3.5 mr-1.5" />
+                Live Feed Connective
               </span>
             </div>
           </header>
 
-          <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 scroll-smooth scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
+          <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 scroll-smooth custom-scrollbar">
             {messages.map((msg) => (
               <div
                 key={msg.id}
@@ -753,8 +775,6 @@ export default function App() {
                     <p className="text-[13px] sm:text-[14px] leading-relaxed whitespace-pre-wrap">
                       {msg.content}
                     </p>
-
-                    {/* WIDGETS RENDER ZONE */}
                     <TechnicalWidget data={msg.technicalData} />
                     <SentimentWidget data={msg.sentimentData} />
                     {msg.portfolio && (
@@ -808,14 +828,14 @@ export default function App() {
                 type="text"
                 value={inputMessage}
                 onChange={(e) => setInputMessage(e.target.value)}
-                placeholder="Ask e.g., 'Analyze recent news for AAPL' or 'Show TSLA technicals'..."
+                placeholder="Ask e.g., 'Analyze recent news for AAPL'..."
                 disabled={isLoading}
                 className="flex-1 bg-transparent border-none focus:outline-none text-[13px] text-white placeholder-slate-500 px-4 py-2"
               />
               <button
                 type="submit"
                 disabled={isLoading || !inputMessage.trim()}
-                className="bg-blue-600 text-white px-4 py-2.5 rounded-lg hover:bg-blue-500 disabled:opacity-50 disabled:hover:bg-blue-600 transition-colors shadow-sm flex items-center cursor-pointer"
+                className="cursor-pointer bg-blue-600 text-white px-4 py-2.5 rounded-lg hover:bg-blue-500 disabled:opacity-50 disabled:hover:bg-blue-600 transition-colors shadow-sm flex items-center"
               >
                 <Send className="w-4 h-4 mr-2" />
                 <span className="text-xs sm:text-sm font-medium">Send</span>
@@ -824,6 +844,11 @@ export default function App() {
           </div>
         </section>
       </div>
+      <style
+        dangerouslySetInnerHTML={{
+          __html: `.custom-scrollbar::-webkit-scrollbar { width: 6px; } .custom-scrollbar::-webkit-scrollbar-track { background: transparent; } .custom-scrollbar::-webkit-scrollbar-thumb { background: #1F2937; border-radius: 4px; } .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #374151; }`,
+        }}
+      />
     </div>
   );
 }

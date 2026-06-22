@@ -39,9 +39,10 @@ export interface AgentResponse {
 }
 
 // --- API RETRY UTILITY (Prevents 503/429 crashes) ---
+// INCREASED RETRIES TO 5 FOR BETTER STABILITY
 async function executeWithRetry<T>(
   operation: () => Promise<T>,
-  retries = 3,
+  retries = 5,
 ): Promise<T> {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -119,7 +120,7 @@ function calculateMACD(prices: number[]): {
 const model = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
   systemInstruction:
-    "You are an AI Trading Assistant. CRITICAL RULES:\n1. If the user asks to BUY or SELL a stock, you MUST ALWAYS use the 'execute_trade' tool.\n2. When asked to analyze a portfolio and allocate budget, you MUST respond ONLY with a valid JSON array of objects. Do not include any markdown formatting.\n3. Always respect risk management. Strictly avoid recommending more than 30% of the total budget for a single stock unless explicitly overridden.\n4. CRITICAL UI RULE: The UI automatically renders beautiful graphical widgets for Technical Analysis, News Sentiment, and Portfolio Allocations. DO NOT output raw data, numbers, or bullet lists in your text response. Instead, provide a short, single-sentence conversational transition (e.g., 'Here are the technical indicators for TSLA:' or 'I have analyzed the news for AAPL:'). Keep your text extremely brief when using tools.",
+    "You are an AI Trading Assistant. CRITICAL RULES:\n1. If the user asks to BUY or SELL a stock, you MUST ALWAYS use the 'execute_trade' tool.\n2. When asked to analyze a portfolio and allocate budget, you MUST respond ONLY with a valid JSON array of objects. Do not include any markdown formatting.\n3. CRITICAL UI RULE: The UI automatically renders beautiful graphical widgets for Technical Analysis, News Sentiment, and Portfolio Allocations. DO NOT output raw data, numbers, or bullet lists in your text response. Instead, provide a short, single-sentence conversational transition (e.g., 'Here are the technical indicators for TSLA:' or 'I have analyzed the news for AAPL:'). Keep your text extremely brief when using tools.",
   tools: [
     {
       functionDeclarations: [
@@ -447,19 +448,26 @@ export async function runTradingAgentStep(
     }
 
     console.log(`⚙️ [BACKEND] Sending response to agent...`);
-    // Wrapped in Retry Logic
-    const finalResult = await executeWithRetry(() =>
-      chat.sendMessage([
-        { functionResponse: { name: call.name, response: apiResponse } },
-      ]),
-    );
+    const finalResult = await chat.sendMessage([
+      {
+        functionResponse: { name: call.name, response: apiResponse },
+      },
+    ]);
+
+    let responseText = finalResult.response.text();
+    if (!responseText.trim()) {
+      responseText = `Here are the results for ${detectedTicker || "your request"}:`;
+    }
+
     return {
-      text: finalResult.response.text(),
+      text: responseText,
       chartData: finalChartData,
       ticker: detectedTicker,
       portfolio: finalPortfolio,
       technicalData: finalTechData,
       sentimentData: finalSentiment,
     };
-  } else return { text: result.response.text() };
+  } else {
+    return { text: result.response.text() };
+  }
 }
