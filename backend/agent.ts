@@ -6,7 +6,6 @@ dotenv.config();
 
 const yahooFinance = new YahooFinance({ suppressNotices: ["yahooSurvey"] });
 
-// OpenAI client with built-in exponential backoff (maxRetries: 5)
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
   maxRetries: 5,
@@ -14,6 +13,7 @@ const openai = new OpenAI({
 
 export interface ChartPoint {
   date: string;
+  time: string;
   price: number;
 }
 export interface PortfolioAllocation {
@@ -98,7 +98,8 @@ const SYSTEM_PROMPT = `You are an AI Trading Assistant. STRICT ANTI-HALLUCINATIO
 1. NEVER pretend to execute trades using plain text. You MUST ALWAYS invoke the 'execute_trade' tool if the user wants to buy or sell.
 2. Do NOT output raw numbers that are already displayed in UI widgets (like RSI or Portfolio JSON).
 3. When asked to analyze a portfolio, respond ONLY with a valid JSON array of objects.
-4. You can execute 'market' orders or 'limit' orders. If the user specifies a target price, use a 'limit' order.`;
+4. You can execute 'market' orders or 'limit' orders. If the user specifies a target price, use a 'limit' order.
+5. RISK MANAGEMENT IS AUTOMATIC: When you issue a BUY order, the backend will automatically attach strict Stop-Loss (-5%) and Take-Profit (+15%) bracket orders. You do not need to calculate them manually unless the user specifically asks you to override the defaults.`;
 
 const tools: any[] = [
   {
@@ -176,8 +177,7 @@ const tools: any[] = [
     type: "function",
     function: {
       name: "execute_trade",
-      description:
-        "Executes a buy or sell order. Use 'market' for current price, or 'limit' with a specific price.",
+      description: "Executes a buy or sell order.",
       parameters: {
         type: "object",
         properties: {
@@ -185,10 +185,9 @@ const tools: any[] = [
           action: { type: "string", description: "BUY or SELL" },
           shares: { type: "number" },
           orderType: { type: "string", description: "'market' or 'limit'" },
-          limitPrice: {
-            type: "number",
-            description: "Required only if orderType is 'limit'",
-          },
+          limitPrice: { type: "number" },
+          stopLoss: { type: "number" },
+          takeProfit: { type: "number" },
         },
         required: ["ticker", "action", "shares"],
       },
@@ -227,13 +226,17 @@ async function getHistoricalPrices(
       return {
         data: res.quotes
           .filter((i: any) => i.close !== undefined && i.date !== undefined)
-          .map((i: any) => ({
-            date: new Date(i.date as any).toLocaleDateString("en-US", {
-              month: "short",
-              day: "numeric",
-            }),
-            price: parseFloat(i.close.toFixed(2)),
-          })),
+          .map((i: any) => {
+            const d = new Date(i.date as any);
+            return {
+              date: d.toLocaleDateString("en-US", {
+                month: "short",
+                day: "numeric",
+              }),
+              time: d.toISOString().split("T")[0], // Added strictly formatted time for TradingView
+              price: parseFloat(i.close.toFixed(2)),
+            };
+          }),
       };
     }
     return { data: [] };
@@ -253,6 +256,7 @@ async function getNewsSentiment(ticker: string) {
   }
 }
 
+// CRITICAL: Explicit export for server.ts consumption
 export async function getWatchlistQuotes(tickers: string[]) {
   return Promise.all(
     tickers.map(async (t) => {
@@ -288,6 +292,8 @@ export async function runTradingAgentStep(
     shares: number,
     orderType: string,
     limitPrice?: number,
+    stopLoss?: number,
+    takeProfit?: number,
   ) => Promise<any>,
 ): Promise<AgentResponse> {
   const messages: any[] = [
@@ -306,8 +312,6 @@ export async function runTradingAgentStep(
     messages: messages,
     tools: tools,
   });
-
-  // 1. Безопасное извлечение сообщения (чтобы не было undefined)
   const message = response.choices[0]?.message;
   if (!message) return { text: "No response generated." };
 
@@ -319,12 +323,8 @@ export async function runTradingAgentStep(
 
   if (message.tool_calls && message.tool_calls.length > 0) {
     const toolCall = message.tool_calls[0];
-
-    // 2. Строгая проверка для TypeScript (доказываем, что это function call)
-    if (!toolCall || toolCall.type !== "function") {
+    if (!toolCall || toolCall.type !== "function")
       return { text: message.content || "Error processing tool call." };
-    }
-
     const args = JSON.parse(toolCall.function.arguments);
     const funcName = toolCall.function.name;
 
@@ -369,7 +369,6 @@ export async function runTradingAgentStep(
             messages: [{ role: "user", content: prompt }],
             response_format: { type: "json_object" },
           });
-          // 3. Безопасное извлечение с помощью ?.
           finalSentiment = JSON.parse(jm.choices[0]?.message?.content || "{}");
           apiResponse = {
             success: "Analyzed",
@@ -406,7 +405,6 @@ export async function runTradingAgentStep(
           messages: [{ role: "user", content: prompt }],
           response_format: { type: "json_object" },
         });
-        // 4. Безопасное извлечение с помощью ?.
         finalPortfolio = JSON.parse(
           jm.choices[0]?.message?.content || "{}",
         ).portfolio;
@@ -424,7 +422,21 @@ export async function runTradingAgentStep(
         apiResponse = { error: "Price unavailable." };
       } else {
         const orderType = args.orderType || "market";
-        const limitPrice = args.limitPrice;
+        let limitPrice = args.limitPrice;
+        let finalStopLoss = args.stopLoss;
+        let finalTakeProfit = args.takeProfit;
+
+        if (args.action.toUpperCase() === "BUY") {
+          const basePrice = limitPrice || p.price;
+          if (!finalStopLoss)
+            finalStopLoss = parseFloat((basePrice * 0.95).toFixed(2));
+          if (!finalTakeProfit)
+            finalTakeProfit = parseFloat((basePrice * 1.15).toFixed(2));
+          console.log(
+            `🛡️ [RISK MANAGEMENT] Auto-calculated SL: $${finalStopLoss}, TP: $${finalTakeProfit} for ${detectedTicker}`,
+          );
+        }
+
         apiResponse = executeTradeCallback
           ? await executeTradeCallback(
               detectedTicker!,
@@ -432,12 +444,13 @@ export async function runTradingAgentStep(
               args.shares,
               orderType,
               limitPrice || p.price,
+              finalStopLoss,
+              finalTakeProfit,
             )
           : { error: "No callback." };
       }
     }
 
-    // Append the assistant's tool call and the tool's result to the message array
     messages.push(message);
     messages.push({
       role: "tool",
@@ -445,12 +458,10 @@ export async function runTradingAgentStep(
       content: JSON.stringify(apiResponse),
     });
 
-    // Get the final human-readable response from OpenAI
     const finalResult = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: messages,
     });
-
     const replyText =
       finalResult.choices[0]?.message?.content ||
       "Here is the requested analysis:";

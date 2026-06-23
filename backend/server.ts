@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import Alpaca from "@alpacahq/alpaca-trade-api";
 import * as dotenv from "dotenv";
+// IMPORTANT: Using .js extension is required when moduleResolution is Node16/NodeNext in tsconfig
 import { runTradingAgentStep, getWatchlistQuotes } from "./agent.js";
 
 dotenv.config();
@@ -12,7 +13,7 @@ const PORT = 3000;
 app.use(express.json());
 app.use(cors({ origin: "http://localhost:5173" }));
 
-// Alpaca API setup (Casting to 'any' resolves TypeScript CommonJS issues)
+// Alpaca API setup
 const alpaca = new (Alpaca as any)({
   keyId: process.env.APCA_API_KEY_ID,
   secretKey: process.env.APCA_API_SECRET_KEY,
@@ -62,22 +63,47 @@ const executeAlpacaTrade = async (
   shares: number,
   orderType: string = "market",
   limitPrice?: number,
+  stopLoss?: number,
+  takeProfit?: number,
 ) => {
   ticker = ticker.toUpperCase();
   try {
     console.log(
-      `[ALPACA] Sending ${action} ${orderType.toUpperCase()} order for ${shares}x ${ticker} to the exchange...`,
+      `[ALPACA] Sending ${action} ${orderType.toUpperCase()} order for ${shares}x ${ticker}...`,
     );
+
     const orderPayload: any = {
       symbol: ticker,
       qty: shares,
       side: action.toLowerCase() as "buy" | "sell",
       type: orderType.toLowerCase(),
-      time_in_force: "day",
+      time_in_force: orderType.toLowerCase() === "limit" ? "gtc" : "day", // Market usually requires 'day', Limit can be 'gtc'
     };
 
-    if (orderType.toLowerCase() === "limit" && limitPrice)
+    if (orderType.toLowerCase() === "limit" && limitPrice) {
       orderPayload.limit_price = limitPrice;
+    }
+
+    // Advanced Risk Management: Bracket Orders
+    if (action.toLowerCase() === "buy" && (stopLoss || takeProfit)) {
+      orderPayload.order_class = "bracket";
+
+      if (takeProfit) {
+        orderPayload.take_profit = { limit_price: takeProfit };
+      }
+
+      if (stopLoss) {
+        orderPayload.stop_loss = {
+          stop_price: stopLoss,
+          // Limit price prevents extreme slippage on flash crashes. Rounded to 2 decimals to prevent API rejection.
+          limit_price: parseFloat((stopLoss * 0.99).toFixed(2)),
+        };
+      }
+      console.log(
+        `[ALPACA] Attached risk management brackets -> SL: $${stopLoss || "None"}, TP: $${takeProfit || "None"}`,
+      );
+    }
+
     const order = await alpaca.createOrder(orderPayload);
 
     console.log(`[ALPACA] Order acknowledged! Status: ${order.status}`);
@@ -139,7 +165,15 @@ app.get("/api/history", async (req, res) => {
 });
 
 app.post("/api/trade", async (req, res) => {
-  const { ticker, action, shares, orderType, limitPrice } = req.body;
+  const {
+    ticker,
+    action,
+    shares,
+    orderType,
+    limitPrice,
+    stopLoss,
+    takeProfit,
+  } = req.body;
   if (!ticker || !action || !shares) {
     res.status(400).json({ error: "Missing parameters." });
     return;
@@ -151,6 +185,8 @@ app.post("/api/trade", async (req, res) => {
     shares,
     orderType || "market",
     limitPrice,
+    stopLoss,
+    takeProfit,
   );
   if (result.error) res.status(400).json(result);
   else res.json({ success: true, portfolio: await getAlpacaPortfolio() });
