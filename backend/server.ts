@@ -1,7 +1,12 @@
 import express from "express";
 import cors from "cors";
 import Database from "better-sqlite3";
+import Alpaca from "@alpacahq/alpaca-trade-api";
+import * as dotenv from "dotenv";
 import { runTradingAgentStep, getWatchlistQuotes } from "./agent.js";
+
+// Load environment variables from .env
+dotenv.config();
 
 const app = express();
 const PORT = 3000;
@@ -9,20 +14,17 @@ const PORT = 3000;
 app.use(express.json());
 app.use(cors({ origin: "http://localhost:5173" }));
 
-// --- DATABASE SETUP (SQLite) ---
-// This creates a local file 'trading_bot.db' to persist data across server restarts
-const db = new Database("trading_bot.db");
+// --- ALPACA BROKER SETUP ---
+// Casting Alpaca to 'any' resolves TypeScript error TS2351 caused by CommonJS to ES Module interop missing construct signatures.
+const alpaca = new (Alpaca as any)({
+  keyId: process.env.APCA_API_KEY_ID,
+  secretKey: process.env.APCA_API_SECRET_KEY,
+  paper: true, // IMPORTANT: We are operating in Paper Trading (simulation) mode
+});
 
+// --- DATABASE SETUP (For transaction history logging only) ---
+const db = new Database("trading_bot.db");
 db.exec(`
-  CREATE TABLE IF NOT EXISTS portfolio (
-    id INTEGER PRIMARY KEY,
-    balance REAL NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS positions (
-    ticker TEXT PRIMARY KEY,
-    shares REAL NOT NULL,
-    avgPrice REAL NOT NULL
-  );
   CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker TEXT NOT NULL,
@@ -33,162 +35,99 @@ db.exec(`
   );
 `);
 
-// Initialize default balance if the database is completely empty
-const initPortfolio = db.prepare("SELECT * FROM portfolio WHERE id = 1").get();
-if (!initPortfolio) {
-  db.prepare("INSERT INTO portfolio (id, balance) VALUES (1, 1000.0)").run();
-  console.log(
-    `🌱 [DB] Initialized new portfolio with default $1000.00 balance.`,
-  );
-}
+// --- BROKER ACCESS HELPERS ---
+const getAlpacaPortfolio = async () => {
+  try {
+    // 1. Fetch real account balance from the broker
+    const account = await alpaca.getAccount();
+    // 2. Fetch all open positions from the exchange
+    const positions = await alpaca.getPositions();
 
-// --- DB ACCESS HELPERS ---
-const getPortfolioState = () => {
-  const pRow = db
-    .prepare("SELECT balance FROM portfolio WHERE id = 1")
-    .get() as { balance: number };
-  const positions = db
-    .prepare("SELECT ticker, shares, avgPrice FROM positions")
-    .all() as Array<{ ticker: string; shares: number; avgPrice: number }>;
+    const posMap: Record<
+      string,
+      {
+        shares: number;
+        avgPrice: number;
+        currentPrice?: number;
+        pnl?: number;
+        pnlPercent?: number;
+      }
+    > = {};
 
-  const posMap: Record<
-    string,
-    {
-      shares: number;
-      avgPrice: number;
-      currentPrice?: number;
-      pnl?: number;
-      pnlPercent?: number;
-    }
-  > = {};
-  positions.forEach((p) => {
-    posMap[p.ticker] = { shares: p.shares, avgPrice: p.avgPrice };
-  });
+    // Map broker data to match our frontend interface
+    positions.forEach((p: any) => {
+      posMap[p.symbol] = {
+        shares: parseFloat(p.qty),
+        avgPrice: parseFloat(p.avg_entry_price),
+        currentPrice: parseFloat(p.current_price),
+        pnl: parseFloat(p.unrealized_pl), // Broker calculates PnL
+        pnlPercent: parseFloat(p.unrealized_plpc) * 100, // Convert decimal to percentage
+      };
+    });
 
-  return {
-    balance: pRow.balance,
-    currency: "USD",
-    positions: posMap,
-  };
+    return {
+      balance: parseFloat(account.cash), // Available cash balance
+      currency: account.currency || "USD",
+      positions: posMap,
+    };
+  } catch (error) {
+    console.error("[ALPACA] Error fetching portfolio:", error);
+    throw error;
+  }
 };
 
-// Database execution layer ensuring atomicity with DB Transactions
-const executeDbTrade = (
+const executeAlpacaTrade = async (
   ticker: string,
   action: string,
   shares: number,
   price: number,
 ) => {
   ticker = ticker.toUpperCase();
-  const cost = shares * price;
 
-  let resultMessage = "";
+  try {
+    console.log(
+      `[ALPACA] Sending ${action} order for ${shares}x ${ticker} to the exchange...`,
+    );
 
-  const tradeTx = db.transaction(() => {
-    const pRow = db
-      .prepare("SELECT balance FROM portfolio WHERE id = 1")
-      .get() as { balance: number };
-    let currentBalance = pRow.balance;
+    // Send a real market order to the broker
+    const order = await alpaca.createOrder({
+      symbol: ticker,
+      qty: shares,
+      side: action.toLowerCase() as "buy" | "sell",
+      type: "market",
+      time_in_force: "day", // Order is valid until the end of the trading day
+    });
 
-    const posRow = db
-      .prepare("SELECT shares, avgPrice FROM positions WHERE ticker = ?")
-      .get(ticker) as { shares: number; avgPrice: number } | undefined;
-    let posShares = posRow ? posRow.shares : 0;
-    let posAvgPrice = posRow ? posRow.avgPrice : 0;
-
-    if (action === "BUY") {
-      if (currentBalance < cost) throw new Error("Insufficient funds.");
-      currentBalance -= cost;
-
-      const newAvgPrice =
-        (posShares * posAvgPrice + cost) / (posShares + shares);
-      posShares += shares;
-
-      db.prepare("UPDATE portfolio SET balance = ? WHERE id = 1").run(
-        currentBalance,
-      );
-      db.prepare(
-        `
-        INSERT INTO positions (ticker, shares, avgPrice) 
-        VALUES (?, ?, ?) 
-        ON CONFLICT(ticker) DO UPDATE SET shares=excluded.shares, avgPrice=excluded.avgPrice
-      `,
-      ).run(ticker, posShares, newAvgPrice);
-
-      resultMessage = `Successfully executed: BUY ${shares} shares of ${ticker} at $${price.toFixed(2)}.`;
-    } else if (action === "SELL") {
-      if (posShares < shares) throw new Error("Insufficient shares.");
-      currentBalance += cost;
-      posShares -= shares;
-
-      db.prepare("UPDATE portfolio SET balance = ? WHERE id = 1").run(
-        currentBalance,
-      );
-      if (posShares === 0) {
-        db.prepare("DELETE FROM positions WHERE ticker = ?").run(ticker);
-      } else {
-        db.prepare("UPDATE positions SET shares = ? WHERE ticker = ?").run(
-          posShares,
-          ticker,
-        );
-      }
-
-      resultMessage = `Successfully executed: SELL ${shares} shares of ${ticker} at $${price.toFixed(2)}.`;
-    } else {
-      throw new Error("Invalid action.");
-    }
-
+    // Save history for agent context in SQLite
     db.prepare(
       "INSERT INTO history (ticker, action, shares, price, date) VALUES (?, ?, ?, ?, ?)",
     ).run(ticker, action, shares, price, new Date().toISOString());
-  });
 
-  try {
-    tradeTx();
-    console.log(`✅ [DB] Trade committed: ${action} ${shares}x ${ticker}`);
-    return { success: resultMessage };
+    console.log(`[ALPACA] Order acknowledged! Status: ${order.status}`);
+
+    return {
+      success: `Order placed successfully at broker: ${action} ${shares} shares of ${ticker}. Current status: ${order.status}.`,
+    };
   } catch (error: any) {
-    console.warn(`⚠️ [DB] Trade rejected: ${error.message}`);
-    return { error: error.message };
+    console.warn(`[ALPACA] Trade rejected by broker: ${error.message}`);
+    return { error: `Broker rejected the trade: ${error.message}` };
   }
 };
 
 // --- ENDPOINTS ---
 app.get("/api/portfolio", async (req, res) => {
   try {
-    const portfolio = getPortfolioState();
-    const tickers = Object.keys(portfolio.positions);
-
-    if (tickers.length > 0) {
-      // Fetch fresh, live quotes for all open positions directly from Yahoo API
-      const quotes = await getWatchlistQuotes(tickers);
-
-      for (const ticker of tickers) {
-        const quote = quotes.find((q) => q.ticker === ticker);
-        const pos = portfolio.positions[ticker]!;
-
-        const currentPrice = quote?.price || pos.avgPrice;
-
-        pos.currentPrice = currentPrice;
-        pos.pnl = (currentPrice - pos.avgPrice) * pos.shares;
-        pos.pnlPercent =
-          pos.avgPrice > 0
-            ? ((currentPrice - pos.avgPrice) / pos.avgPrice) * 100
-            : 0;
-      }
-    }
-
+    const portfolio = await getAlpacaPortfolio();
     res.json(portfolio);
   } catch (error) {
-    console.error("Portfolio enrichment error:", error);
-    res.json(getPortfolioState());
+    res.status(500).json({ error: "Failed to fetch portfolio from broker" });
   }
 });
 
 app.get("/api/history", (req, res) => {
   const history = db
     .prepare(
-      "SELECT ticker, action, shares, price, date FROM history ORDER BY id ASC",
+      "SELECT ticker, action, shares, price, date FROM history ORDER BY id DESC LIMIT 50",
     )
     .all();
   res.json(history);
@@ -201,11 +140,11 @@ app.post("/api/trade", async (req, res) => {
     return;
   }
 
-  const result = executeDbTrade(ticker, action, shares, price);
+  const result = await executeAlpacaTrade(ticker, action, shares, price);
   if (result.error) {
     res.status(400).json(result);
   } else {
-    res.json({ success: true, portfolio: getPortfolioState() });
+    res.json({ success: true, portfolio: await getAlpacaPortfolio() });
   }
 });
 
@@ -218,21 +157,12 @@ app.post("/api/chat", async (req, res) => {
       )
       .all();
 
-    // Wrapper to ensure standard Promise resolution expected by the agent runner
-    const asyncExecuteTrade = async (
-      t: string,
-      a: string,
-      s: number,
-      p: number,
-    ) => {
-      return executeDbTrade(t, a, s, p);
-    };
-
+    // Wrapper for agent integration
     const agentResponse = await runTradingAgentStep(
       message,
       history,
       transactionHistory as any[],
-      asyncExecuteTrade,
+      executeAlpacaTrade,
     );
 
     res.json({
@@ -252,7 +182,6 @@ app.post("/api/chat", async (req, res) => {
 app.post("/api/watchlist", async (req, res) => {
   const { tickers } = req.body;
   try {
-    // Live execution data without drift
     res.json(await getWatchlistQuotes(tickers));
   } catch (error) {
     console.error("Watchlist fetch error:", error);
@@ -261,5 +190,5 @@ app.post("/api/watchlist", async (req, res) => {
 });
 
 app.listen(PORT, () =>
-  console.log(`🚀 [SERVER] Running on http://localhost:${PORT}`),
+  console.log(`[SERVER] Running on http://localhost:${PORT}`),
 );
