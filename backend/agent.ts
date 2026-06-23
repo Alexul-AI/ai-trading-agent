@@ -100,7 +100,8 @@ const SYSTEM_PROMPT = `You are an AI Trading Assistant. STRICT ANTI-HALLUCINATIO
 3. When asked to analyze a portfolio, respond ONLY with a valid JSON array of objects.
 4. You can execute 'market' orders or 'limit' orders. If the user specifies a target price, use a 'limit' order.
 5. RISK MANAGEMENT IS AUTOMATIC: When you issue a BUY order, the backend will automatically attach strict Stop-Loss (-5%) and Take-Profit (+15%) bracket orders. You do not need to calculate them manually.
-6. YOU CAN DISPLAY CHARTS! If the user asks for a chart, a trend, or historical prices, ALWAYS invoke the 'get_historical_prices' tool. The frontend has a built-in interactive chart widget that will automatically render the data you fetch. NEVER apologize or say you can't display charts.`;
+6. YOU CAN DISPLAY CHARTS! If the user asks for a chart, a trend, or historical prices, ALWAYS invoke the 'get_historical_prices' tool. The frontend has a built-in interactive chart widget that will automatically render the data you fetch. NEVER apologize or say you can't display charts.
+7. FUNDAMENTAL ANALYSIS: If the user asks if a stock is a good long-term investment, or asks for valuation, P/E ratio, market cap, or dividends, invoke the 'get_fundamental_data' tool to provide deep financial context.`;
 
 const tools: any[] = [
   {
@@ -194,6 +195,20 @@ const tools: any[] = [
       },
     },
   },
+  // NEW TOOL: Fundamental Analysis
+  {
+    type: "function",
+    function: {
+      name: "get_fundamental_data",
+      description:
+        "Retrieves deep fundamental data for a stock (P/E, Market Cap, Dividends, 52-Week High/Low).",
+      parameters: {
+        type: "object",
+        properties: { ticker: { type: "string" } },
+        required: ["ticker"],
+      },
+    },
+  },
 ];
 
 async function getStockPrice(ticker: string) {
@@ -254,6 +269,37 @@ async function getNewsSentiment(ticker: string) {
     return { headlines: res.news.slice(0, 5).map((n: any) => n.title) };
   } catch (e) {
     return { error: `Could not retrieve news for ${ticker}.` };
+  }
+}
+
+// NEW FUNCTION: Fetch Fundamental Data
+async function getFundamentalData(ticker: string) {
+  try {
+    const quote = (await yahooFinance.quote(ticker)) as any;
+
+    // Safely extract and format fundamental metrics
+    const formatNumber = (num: number) => {
+      if (!num) return "N/A";
+      if (num >= 1e12) return (num / 1e12).toFixed(2) + " Trillion";
+      if (num >= 1e9) return (num / 1e9).toFixed(2) + " Billion";
+      if (num >= 1e6) return (num / 1e6).toFixed(2) + " Million";
+      return num.toLocaleString();
+    };
+
+    return {
+      ticker: ticker.toUpperCase(),
+      marketCap: formatNumber(quote.marketCap),
+      peRatio: quote.trailingPE ? quote.trailingPE.toFixed(2) : "N/A",
+      forwardPE: quote.forwardPE ? quote.forwardPE.toFixed(2) : "N/A",
+      dividendYield: quote.trailingAnnualDividendYield
+        ? (quote.trailingAnnualDividendYield * 100).toFixed(2) + "%"
+        : "0.00%",
+      fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh || "N/A",
+      fiftyTwoWeekLow: quote.fiftyTwoWeekLow || "N/A",
+      analystRating: quote.averageAnalystRating || "N/A",
+    };
+  } catch (e) {
+    return { error: `Fundamental data for ${ticker} could not be retrieved.` };
   }
 }
 
@@ -455,6 +501,10 @@ export async function runTradingAgentStep(
               )
             : { error: "No callback." };
         }
+        // NEW BRANCH: Handle Fundamental Data request
+      } else if (funcName === "get_fundamental_data") {
+        detectedTicker = args.ticker.toUpperCase();
+        apiResponse = await getFundamentalData(detectedTicker!);
       }
 
       messages.push({
