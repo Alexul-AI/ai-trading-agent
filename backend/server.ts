@@ -5,7 +5,6 @@ import Alpaca from "@alpacahq/alpaca-trade-api";
 import * as dotenv from "dotenv";
 import { runTradingAgentStep, getWatchlistQuotes } from "./agent.js";
 
-// Load environment variables from .env
 dotenv.config();
 
 const app = express();
@@ -14,15 +13,12 @@ const PORT = 3000;
 app.use(express.json());
 app.use(cors({ origin: "http://localhost:5173" }));
 
-// --- ALPACA BROKER SETUP ---
-// Casting Alpaca to 'any' resolves TypeScript error TS2351 caused by CommonJS to ES Module interop missing construct signatures.
 const alpaca = new (Alpaca as any)({
   keyId: process.env.APCA_API_KEY_ID,
   secretKey: process.env.APCA_API_SECRET_KEY,
-  paper: true, // IMPORTANT: We are operating in Paper Trading (simulation) mode
+  paper: true,
 });
 
-// --- DATABASE SETUP (For transaction history logging only) ---
 const db = new Database("trading_bot.db");
 db.exec(`
   CREATE TABLE IF NOT EXISTS history (
@@ -35,12 +31,9 @@ db.exec(`
   );
 `);
 
-// --- BROKER ACCESS HELPERS ---
 const getAlpacaPortfolio = async () => {
   try {
-    // 1. Fetch real account balance from the broker
     const account = await alpaca.getAccount();
-    // 2. Fetch all open positions from the exchange
     const positions = await alpaca.getPositions();
 
     const posMap: Record<
@@ -54,19 +47,18 @@ const getAlpacaPortfolio = async () => {
       }
     > = {};
 
-    // Map broker data to match our frontend interface
     positions.forEach((p: any) => {
       posMap[p.symbol] = {
         shares: parseFloat(p.qty),
         avgPrice: parseFloat(p.avg_entry_price),
         currentPrice: parseFloat(p.current_price),
-        pnl: parseFloat(p.unrealized_pl), // Broker calculates PnL
-        pnlPercent: parseFloat(p.unrealized_plpc) * 100, // Convert decimal to percentage
+        pnl: parseFloat(p.unrealized_pl),
+        pnlPercent: parseFloat(p.unrealized_plpc) * 100,
       };
     });
 
     return {
-      balance: parseFloat(account.cash), // Available cash balance
+      balance: parseFloat(account.cash),
       currency: account.currency || "USD",
       positions: posMap,
     };
@@ -80,33 +72,38 @@ const executeAlpacaTrade = async (
   ticker: string,
   action: string,
   shares: number,
-  price: number,
+  orderType: string = "market",
+  limitPrice?: number,
 ) => {
   ticker = ticker.toUpperCase();
 
   try {
     console.log(
-      `[ALPACA] Sending ${action} order for ${shares}x ${ticker} to the exchange...`,
+      `[ALPACA] Sending ${action} ${orderType.toUpperCase()} order for ${shares}x ${ticker} to the exchange...`,
     );
 
-    // Send a real market order to the broker
-    const order = await alpaca.createOrder({
+    const orderPayload: any = {
       symbol: ticker,
       qty: shares,
       side: action.toLowerCase() as "buy" | "sell",
-      type: "market",
-      time_in_force: "day", // Order is valid until the end of the trading day
-    });
+      type: orderType.toLowerCase(),
+      time_in_force: "day",
+    };
 
-    // Save history for agent context in SQLite
+    if (orderType.toLowerCase() === "limit" && limitPrice) {
+      orderPayload.limit_price = limitPrice;
+    }
+
+    const order = await alpaca.createOrder(orderPayload);
+
     db.prepare(
       "INSERT INTO history (ticker, action, shares, price, date) VALUES (?, ?, ?, ?, ?)",
-    ).run(ticker, action, shares, price, new Date().toISOString());
+    ).run(ticker, action, shares, limitPrice || 0, new Date().toISOString());
 
     console.log(`[ALPACA] Order acknowledged! Status: ${order.status}`);
 
     return {
-      success: `Order placed successfully at broker: ${action} ${shares} shares of ${ticker}. Current status: ${order.status}.`,
+      success: `Order placed successfully at broker: ${action} ${shares} shares of ${ticker}. Type: ${orderType}. Current status: ${order.status}.`,
     };
   } catch (error: any) {
     console.warn(`[ALPACA] Trade rejected by broker: ${error.message}`);
@@ -114,13 +111,31 @@ const executeAlpacaTrade = async (
   }
 };
 
-// --- ENDPOINTS ---
 app.get("/api/portfolio", async (req, res) => {
   try {
     const portfolio = await getAlpacaPortfolio();
     res.json(portfolio);
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch portfolio from broker" });
+  }
+});
+
+app.get("/api/orders", async (req, res) => {
+  try {
+    const orders = await alpaca.getOrders({ status: "open" });
+    const formattedOrders = orders.map((o: any) => ({
+      id: o.id,
+      ticker: o.symbol,
+      action: o.side.toUpperCase(),
+      qty: parseFloat(o.qty),
+      orderType: o.order_type.toUpperCase(),
+      limitPrice: o.limit_price ? parseFloat(o.limit_price) : null,
+      status: o.status,
+    }));
+    res.json(formattedOrders);
+  } catch (error) {
+    console.error("[ALPACA] Error fetching orders:", error);
+    res.status(500).json({ error: "Failed to fetch pending orders" });
   }
 });
 
@@ -134,13 +149,21 @@ app.get("/api/history", (req, res) => {
 });
 
 app.post("/api/trade", async (req, res) => {
-  const { ticker, action, shares, price } = req.body;
-  if (!ticker || !action || !shares || !price) {
+  const { ticker, action, shares, orderType, limitPrice } = req.body;
+  if (!ticker || !action || !shares) {
     res.status(400).json({ error: "Missing parameters." });
     return;
   }
 
-  const result = await executeAlpacaTrade(ticker, action, shares, price);
+  const type = orderType || "market";
+
+  const result = await executeAlpacaTrade(
+    ticker,
+    action,
+    shares,
+    type,
+    limitPrice,
+  );
   if (result.error) {
     res.status(400).json(result);
   } else {
@@ -157,7 +180,6 @@ app.post("/api/chat", async (req, res) => {
       )
       .all();
 
-    // Wrapper for agent integration
     const agentResponse = await runTradingAgentStep(
       message,
       history,

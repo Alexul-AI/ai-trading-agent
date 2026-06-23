@@ -38,35 +38,45 @@ export interface AgentResponse {
   sentimentData?: SentimentData | undefined;
 }
 
-// --- API RETRY UTILITY (Prevents 503/429 crashes) ---
-// INCREASED RETRIES TO 5 FOR BETTER STABILITY
-async function executeWithRetry<T>(
-  operation: () => Promise<T>,
+// --- UTILITY: EXPONENTIAL BACKOFF WITH JITTER FOR GEMINI API ---
+const executeWithRetry = async (
+  fn: () => Promise<any>,
   retries = 5,
-): Promise<T> {
-  for (let attempt = 1; attempt <= retries; attempt++) {
+  baseDelay = 2000,
+): Promise<any> => {
+  let attempt = 0;
+  while (attempt < retries) {
     try {
-      return await operation();
+      return await fn();
     } catch (error: any) {
+      // Only retry on specific server-side errors or rate limits
       if (
-        (error.status === 503 ||
-          error.status === 429 ||
-          error.status === 500) &&
-        attempt < retries
+        error.status === 503 ||
+        error.status === 429 ||
+        error.status === 500
       ) {
-        console.warn(
-          `⏳ [BACKEND] Gemini API overloaded (${error.status}). Retrying attempt ${attempt + 1}/${retries} in ${attempt * 1.5}s...`,
+        attempt++;
+        // Exponential backoff: 2s, 4s, 8s, etc., plus random jitter (0-500ms) to prevent thundering herd
+        const jitter = Math.floor(Math.random() * 500);
+        const delay = baseDelay * Math.pow(2, attempt - 1) + jitter;
+
+        console.log(
+          `[BACKEND] Gemini API issue (${error.status}). Retrying attempt ${attempt}/${retries} in ${delay}ms...`,
         );
-        await new Promise((res) => setTimeout(res, attempt * 1500));
+        await new Promise((res) => setTimeout(res, delay));
       } else {
+        // If it's a 400 Bad Request or other client error, don't retry, fail fast.
+        console.error(`[BACKEND] Fatal Gemini API Error:`, error.message);
         throw error;
       }
     }
   }
-  throw new Error("Max retries reached");
-}
+  throw new Error(
+    "Gemini API completely overloaded after multiple retries. Please try again later.",
+  );
+};
 
-// --- TECHNICAL ANALYSIS MATHEMATICAL UTILITIES ---
+// --- TECHNICAL ANALYSIS ---
 function calculateRSI(prices: number[], periods = 14): number {
   if (prices.length <= periods) return 50;
   let gains = 0;
@@ -120,7 +130,7 @@ function calculateMACD(prices: number[]): {
 const model = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
   systemInstruction:
-    "You are an AI Trading Assistant. CRITICAL RULES:\n1. If the user asks to BUY or SELL a stock, you MUST ALWAYS use the 'execute_trade' tool.\n2. When asked to analyze a portfolio and allocate budget, you MUST respond ONLY with a valid JSON array of objects. Do not include any markdown formatting.\n3. CRITICAL UI RULE: The UI automatically renders beautiful graphical widgets for Technical Analysis, News Sentiment, and Portfolio Allocations. DO NOT output raw data, numbers, or bullet lists in your text response. Instead, provide a short, single-sentence conversational transition (e.g., 'Here are the technical indicators for TSLA:' or 'I have analyzed the news for AAPL:'). Keep your text extremely brief when using tools.",
+    "You are an AI Trading Assistant. STRICT ANTI-HALLUCINATION RULES:\n1. NEVER pretend to execute trades using plain text. You MUST ALWAYS invoke the 'execute_trade' tool if the user wants to buy or sell.\n2. Do NOT output raw numbers that are already displayed in UI widgets (like RSI or Portfolio JSON).\n3. When asked to analyze a portfolio, respond ONLY with a valid JSON array of objects.\n4. You can execute 'market' orders or 'limit' orders. If the user specifies a target price, use a 'limit' order.",
   tools: [
     {
       functionDeclarations: [
@@ -182,13 +192,22 @@ const model = genAI.getGenerativeModel({
         },
         {
           name: "execute_trade",
-          description: "Executes a buy or sell order.",
+          description:
+            "Executes a buy or sell order. Use 'market' for current price, or 'limit' with a specific price.",
           parameters: {
             type: SchemaType.OBJECT,
             properties: {
               ticker: { type: SchemaType.STRING },
-              action: { type: SchemaType.STRING },
+              action: { type: SchemaType.STRING, description: "BUY or SELL" },
               shares: { type: SchemaType.NUMBER },
+              orderType: {
+                type: SchemaType.STRING,
+                description: "'market' or 'limit'",
+              },
+              limitPrice: {
+                type: SchemaType.NUMBER,
+                description: "Required only if orderType is 'limit'",
+              },
             },
             required: ["ticker", "action", "shares"],
           },
@@ -214,64 +233,37 @@ async function getStockPrice(ticker: string) {
 
 async function getHistoricalPrices(
   ticker: string,
-): Promise<{ data?: ChartPoint[]; fullData?: ChartPoint[]; error?: string }> {
-  console.log(
-    `\n⚙️ [BACKEND] Fetching 60-day historical data for ticker: ${ticker}...`,
-  );
+  days = 30,
+): Promise<{ data?: ChartPoint[]; error?: string }> {
   try {
     const today = new Date();
-    const sixtyDaysAgo = new Date();
-    sixtyDaysAgo.setDate(today.getDate() - 60);
+    const pastDate = new Date();
+    pastDate.setDate(today.getDate() - days);
     const res = (await yahooFinance.chart(ticker, {
-      period1: sixtyDaysAgo,
+      period1: pastDate,
       period2: today,
       interval: "1d",
     })) as any;
-    let chartData: ChartPoint[] = [];
     if (res && res.quotes && res.quotes.length > 0) {
-      chartData = res.quotes
-        .filter(
-          (i: any) =>
-            i.close !== undefined && i.date !== undefined && i.date !== null,
-        )
-        .map((i: any) => ({
-          date: new Date(i.date as any).toLocaleDateString("en-US", {
-            month: "short",
-            day: "numeric",
-          }),
-          price: parseFloat(i.close.toFixed(2)),
-        }));
+      return {
+        data: res.quotes
+          .filter((i: any) => i.close !== undefined && i.date !== undefined)
+          .map((i: any) => ({
+            date: new Date(i.date as any).toLocaleDateString("en-US", {
+              month: "short",
+              day: "numeric",
+            }),
+            price: parseFloat(i.close.toFixed(2)),
+          })),
+      };
     }
-
-    // Fallback if API rejects data
-    if (chartData.length === 0) {
-      const liveQuote = (await yahooFinance.quote(ticker)) as any;
-      if (!liveQuote || !liveQuote.regularMarketPrice)
-        throw new Error(`Fallback failed`);
-      const basePrice = liveQuote.regularMarketPrice;
-      for (let i = 59; i >= 0; i--) {
-        const d = new Date();
-        d.setDate(d.getDate() - i);
-        chartData.push({
-          date: d.toLocaleDateString("en-US", {
-            month: "short",
-            day: "numeric",
-          }),
-          price: parseFloat(
-            (basePrice + basePrice * (Math.random() * 0.04 - 0.02)).toFixed(2),
-          ),
-        });
-      }
-    }
-    // Return 30 days for UI chart, but all 60 days for technical math (MACD needs 26+ days)
-    return { data: chartData.slice(-30), fullData: chartData };
+    return { data: [] };
   } catch (e) {
     return { error: `Could not retrieve data for ${ticker}.` };
   }
 }
 
 async function getNewsSentiment(ticker: string) {
-  console.log(`\n⚙️ [BACKEND] Fetching recent news for ticker: ${ticker}...`);
   try {
     const res = await yahooFinance.search(ticker);
     if (!res.news || res.news.length === 0)
@@ -289,7 +281,7 @@ export async function getWatchlistQuotes(tickers: string[]) {
         const q = (await yahooFinance.quote(t)) as any;
         return {
           ticker: t,
-          name: q.shortName || q.longName || t,
+          name: q.shortName || t,
           price: q.regularMarketPrice || 0,
           change: parseFloat((q.regularMarketChangePercent || 0).toFixed(2)),
           isUp: (q.regularMarketChangePercent || 0) >= 0,
@@ -315,7 +307,8 @@ export async function runTradingAgentStep(
     ticker: string,
     action: string,
     shares: number,
-    price: number,
+    orderType: string,
+    limitPrice?: number,
   ) => Promise<any>,
 ): Promise<AgentResponse> {
   const formattedHistory = history
@@ -328,7 +321,6 @@ export async function runTradingAgentStep(
     : [];
   const chat = model.startChat({ history: formattedHistory });
 
-  // Wrapped in Retry Logic
   const result = await executeWithRetry(() => chat.sendMessage(userMessage));
   const calls = result.response.functionCalls();
 
@@ -341,7 +333,7 @@ export async function runTradingAgentStep(
   if (calls && calls.length > 0) {
     const call = calls[0];
     if (!call) return { text: result.response.text() };
-    console.log(`🤖 [AGENT] Requested: ${call.name}`);
+    console.log(`[AGENT] Requested: ${call.name}`);
     let apiResponse: any = {};
 
     if (call.name === "get_stock_price") {
@@ -349,16 +341,16 @@ export async function runTradingAgentStep(
       apiResponse = await getStockPrice(detectedTicker!);
     } else if (call.name === "get_historical_prices") {
       detectedTicker = (call.args as any).ticker.toUpperCase();
-      const hr = await getHistoricalPrices(detectedTicker!);
+      const hr = await getHistoricalPrices(detectedTicker!, 30);
       if (hr.data) {
         apiResponse = { data: "Chart created." };
         finalChartData = hr.data;
       } else apiResponse = { error: hr.error };
     } else if (call.name === "get_technical_indicators") {
       detectedTicker = (call.args as any).ticker.toUpperCase();
-      const hr = await getHistoricalPrices(detectedTicker!);
-      if (hr.fullData && hr.fullData.length > 0) {
-        const prices = hr.fullData.map((p) => p.price);
+      const hr = await getHistoricalPrices(detectedTicker!, 60);
+      if (hr.data && hr.data.length > 0) {
+        const prices = hr.data.map((p) => p.price);
         const rsi = calculateRSI(prices, 14);
         const macd = calculateMACD(prices);
         finalTechData = {
@@ -369,9 +361,6 @@ export async function runTradingAgentStep(
           state: rsi > 70 ? "OVERBOUGHT" : rsi < 30 ? "OVERSOLD" : "NEUTRAL",
         };
         apiResponse = { ticker: detectedTicker, ...finalTechData };
-        console.log(
-          `📊 [ANALYSIS] Technical analysis completed for ${detectedTicker}: RSI=${rsi}`,
-        );
       } else apiResponse = { error: "Failed to calculate indicators." };
     } else if (call.name === "analyze_news_sentiment") {
       detectedTicker = (call.args as any).ticker.toUpperCase();
@@ -384,6 +373,7 @@ export async function runTradingAgentStep(
             model: "gemini-2.5-flash",
             generationConfig: { responseMimeType: "application/json" },
           });
+          // We also wrap the nested generation call in the retry logic
           const r = await executeWithRetry(() => jm.generateContent(prompt));
           finalSentiment = JSON.parse(r.response.text());
           apiResponse = {
@@ -391,7 +381,7 @@ export async function runTradingAgentStep(
             sentiment_json: JSON.stringify(finalSentiment),
           };
         } catch (e) {
-          apiResponse = { error: "Failed sentiment." };
+          apiResponse = { error: "Failed sentiment analysis due to API load." };
         }
       }
     } else if (call.name === "get_transaction_history") {
@@ -409,7 +399,7 @@ export async function runTradingAgentStep(
       const { tickers, budget } = call.args as any;
       const md: any = {};
       const rs = await Promise.all(
-        tickers.map((t: string) => getHistoricalPrices(t)),
+        tickers.map((t: string) => getHistoricalPrices(t, 30)),
       );
       tickers.forEach((t: string, i: number) => {
         if (rs[i].data) md[t] = rs[i].data!.slice(-7);
@@ -430,37 +420,39 @@ export async function runTradingAgentStep(
           portfolio_string: JSON.stringify(finalPortfolio),
         };
       } catch (e) {
-        apiResponse = { error: "Failed allocation." };
+        apiResponse = { error: "Failed portfolio allocation due to API load." };
       }
     } else if (call.name === "execute_trade") {
       detectedTicker = (call.args as any).ticker.toUpperCase();
       const p = await getStockPrice(detectedTicker!);
-      if (p.error || !p.price) apiResponse = { error: "Price unavailable." };
-      else
+      if (p.error || !p.price) {
+        apiResponse = { error: "Price unavailable." };
+      } else {
+        const orderType = (call.args as any).orderType || "market";
+        const limitPrice = (call.args as any).limitPrice;
         apiResponse = executeTradeCallback
           ? await executeTradeCallback(
               detectedTicker!,
               (call.args as any).action.toUpperCase(),
               (call.args as any).shares,
-              p.price,
+              orderType,
+              limitPrice || p.price,
             )
-          : { error: "No callback." };
+          : { error: "No callback provided." };
+      }
     }
 
-    console.log(`⚙️ [BACKEND] Sending response to agent...`);
-    const finalResult = await chat.sendMessage([
-      {
-        functionResponse: { name: call.name, response: apiResponse },
-      },
-    ]);
+    // Final check to see what the agent has to say after tools execute
+    const finalResult = await executeWithRetry(() =>
+      chat.sendMessage([
+        { functionResponse: { name: call.name, response: apiResponse } },
+      ]),
+    );
 
-    let responseText = finalResult.response.text();
-    if (!responseText.trim()) {
-      responseText = `Here are the results for ${detectedTicker || "your request"}:`;
-    }
-
+    const replyText =
+      finalResult.response.text() || "The task has been completed.";
     return {
-      text: responseText,
+      text: replyText,
       chartData: finalChartData,
       ticker: detectedTicker,
       portfolio: finalPortfolio,

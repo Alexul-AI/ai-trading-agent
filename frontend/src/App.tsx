@@ -70,7 +70,17 @@ interface UserPortfolio {
     }
   >;
 }
+interface PendingOrder {
+  id: string;
+  ticker: string;
+  action: string;
+  qty: number;
+  orderType: string;
+  limitPrice: number | null;
+  status: string;
+}
 
+// --- WIDGETS ---
 function SentimentWidget({ data }: { data?: SentimentData }) {
   if (!data) return null;
   const isBull = data.sentiment === "BULLISH";
@@ -414,12 +424,14 @@ function TradingChart({
   );
 }
 
+// --- MAIN APP ---
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([
     {
       id: "1",
       role: "system",
-      content: "AI Trading Engine initialized. Paper Trading Simulator Active.",
+      content:
+        "AI Trading Engine initialized. Connected to Alpaca Live Market Environment.",
     },
   ]);
   const [inputMessage, setInputMessage] = useState("");
@@ -439,6 +451,7 @@ export default function App() {
   const [userPortfolio, setUserPortfolio] = useState<UserPortfolio | null>(
     null,
   );
+  const [pendingOrders, setPendingOrders] = useState<PendingOrder[]>([]);
   const [isRefreshingWatchlist, setIsRefreshingWatchlist] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -446,12 +459,16 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   useEffect(() => scrollToBottom(), [messages]);
 
-  const fetchPortfolio = async () => {
+  const fetchPortfolioAndOrders = async () => {
     try {
-      const res = await fetch("http://localhost:3000/api/portfolio");
-      if (res.ok) setUserPortfolio(await res.json());
+      const [pRes, oRes] = await Promise.all([
+        fetch("http://localhost:3000/api/portfolio"),
+        fetch("http://localhost:3000/api/orders"),
+      ]);
+      if (pRes.ok) setUserPortfolio(await pRes.json());
+      if (oRes.ok) setPendingOrders(await oRes.json());
     } catch (error) {
-      console.error("Portfolio fetch error:", error);
+      console.error("Fetch error:", error);
     }
   };
 
@@ -460,17 +477,19 @@ export default function App() {
     const fetchInitialData = async () => {
       try {
         const tickers = ["TSLA", "AAPL", "VRNS", "LUMI.TA"];
-        const [wRes, pRes] = await Promise.all([
+        const [wRes, pRes, oRes] = await Promise.all([
           fetch("http://localhost:3000/api/watchlist", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ tickers }),
           }),
           fetch("http://localhost:3000/api/portfolio"),
+          fetch("http://localhost:3000/api/orders"),
         ]);
         if (isMounted) {
           if (wRes.ok) setWatchlist(await wRes.json());
           if (pRes.ok) setUserPortfolio(await pRes.json());
+          if (oRes.ok) setPendingOrders(await oRes.json());
         }
       } catch (error) {
         console.error("Initial data fetch error:", error);
@@ -491,7 +510,7 @@ export default function App() {
         body: JSON.stringify({ tickers: watchlist.map((i) => i.ticker) }),
       });
       if (res.ok) setWatchlist(await res.json());
-      await fetchPortfolio();
+      await fetchPortfolioAndOrders();
     } catch (error) {
       console.error("Watchlist refresh error:", error);
     } finally {
@@ -520,23 +539,7 @@ export default function App() {
           history: messages,
         }),
       });
-
-      if (!response.ok) {
-        if (response.status === 503) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: (Date.now() + 1).toString(),
-              role: "system",
-              content:
-                "The Gemini API is currently overloaded (503). The backend tried multiple times but failed. Please wait 10 seconds and try again.",
-            },
-          ]);
-          return;
-        }
-        throw new Error("Network error");
-      }
-
+      if (!response.ok) throw new Error("Network error");
       const data = await response.json();
 
       setMessages((prev) => [
@@ -544,7 +547,7 @@ export default function App() {
         {
           id: (Date.now() + 1).toString(),
           role: "agent",
-          content: data.reply || "No response generated.",
+          content: data.reply || "No response.",
           chartData: data.chartData,
           ticker: data.ticker,
           portfolio: data.portfolio,
@@ -552,15 +555,16 @@ export default function App() {
           sentimentData: data.sentimentData,
         },
       ]);
-      await fetchPortfolio();
-    } catch {
+      await fetchPortfolioAndOrders();
+    } catch (error) {
+      console.error("Chat Error:", error);
       setMessages((prev) => [
         ...prev,
         {
           id: (Date.now() + 1).toString(),
           role: "system",
           content:
-            "Connection Error: Unable to reach the backend server. Is it running?",
+            "The AI API is currently overloaded or unreachable. Please wait a moment and try again.",
         },
       ]);
     } finally {
@@ -573,7 +577,7 @@ export default function App() {
       <div className="w-full max-w-7xl bg-[#111827] rounded-xl shadow-2xl border border-slate-800 flex flex-col md:flex-row h-[92vh] overflow-hidden relative">
         <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-5 pointer-events-none"></div>
 
-        <aside className="w-full md:w-80 bg-[#161D30] border-b md:border-b-0 md:border-r border-slate-800/80 p-5 flex flex-col shrink-0 z-10 overflow-y-auto custom-scrollbar">
+        <aside className="w-full md:w-80 bg-[#161D30] border-b md:border-b-0 md:border-r border-slate-800/80 p-5 flex flex-col shrink-0 z-10 overflow-y-auto scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
           <div className="flex items-center space-x-3.5 mb-6">
             <div className="w-9 h-9 bg-blue-600/20 rounded-lg flex items-center justify-center border border-blue-500/20">
               <Activity className="w-5 h-5 text-blue-400" />
@@ -605,6 +609,7 @@ export default function App() {
                 ${userPortfolio?.balance.toFixed(2) || "0.00"}
               </div>
             </div>
+
             <div className="space-y-1.5">
               <div className="text-[10px] text-slate-500 mb-1 border-b border-slate-800 pb-1">
                 Open Positions
@@ -616,15 +621,15 @@ export default function App() {
                   return (
                     <div
                       key={tick}
-                      className="flex justify-between items-center p-2 rounded bg-[#101524]/60 border border-slate-800/30"
+                      className="flex justify-between items-center text-xs"
                     >
                       <div>
-                        <span className="font-mono text-blue-400 font-semibold text-xs">
+                        <span className="font-mono text-blue-400 font-semibold">
                           {tick}
                         </span>
-                        <div className="text-[9px] text-slate-500">
+                        <span className="text-slate-500 block text-[9px]">
                           {pos.shares} shares @ ${pos.avgPrice.toFixed(2)}
-                        </div>
+                        </span>
                       </div>
                       <div className="text-right">
                         <span className="text-slate-200 block text-xs font-mono">
@@ -647,6 +652,45 @@ export default function App() {
                 </div>
               )}
             </div>
+
+            <div className="space-y-1.5 mt-4">
+              <div className="text-[10px] text-slate-500 mb-1 border-b border-slate-800 pb-1">
+                Pending Orders
+              </div>
+              {pendingOrders.length > 0 ? (
+                pendingOrders.map((order) => (
+                  <div
+                    key={order.id}
+                    className="flex justify-between items-center text-xs bg-slate-800/30 p-2 rounded border border-slate-700/50"
+                  >
+                    <div>
+                      <span
+                        className={`font-mono font-bold ${order.action === "BUY" ? "text-emerald-400" : "text-rose-400"}`}
+                      >
+                        {order.action}
+                      </span>
+                      <span className="font-mono text-white ml-1.5">
+                        {order.qty}x {order.ticker}
+                      </span>
+                    </div>
+                    <div className="text-right">
+                      <span className="text-[9px] text-slate-400 uppercase">
+                        {order.orderType}
+                      </span>
+                      {order.limitPrice && (
+                        <span className="text-slate-300 block text-[10px] font-mono">
+                          Limit: ${order.limitPrice.toFixed(2)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="text-xs text-slate-500 italic">
+                  No pending orders.
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="space-y-2 mb-6">
@@ -656,13 +700,13 @@ export default function App() {
             <div className="grid grid-cols-1 gap-1.5">
               <button
                 onClick={() => setInputMessage("Buy 2 shares of TSLA")}
-                className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-emerald-300 transition-all font-medium cursor-pointer"
+                className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-emerald-300 transition-all font-medium"
               >
                 🛒 Buy 2 shares of TSLA
               </button>
               <button
                 onClick={() => setInputMessage("Analyze recent news for AAPL")}
-                className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-purple-300 transition-all font-medium cursor-pointer"
+                className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-purple-300 transition-all font-medium"
               >
                 📰 Analyze AAPL News
               </button>
@@ -670,7 +714,7 @@ export default function App() {
                 onClick={() =>
                   setInputMessage("Show me technical indicators for VRNS")
                 }
-                className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-orange-300 transition-all font-medium cursor-pointer"
+                className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-orange-300 transition-all font-medium"
               >
                 📊 VRNS Technicals
               </button>
@@ -685,10 +729,9 @@ export default function App() {
               <button
                 onClick={handleRefreshClick}
                 disabled={isRefreshingWatchlist}
-                className="cursor-pointer"
               >
                 <RefreshCw
-                  className={`w-3 h-3 text-slate-500 hover:text-slate-300 ${isRefreshingWatchlist ? "animate-spin opacity-50" : ""}`}
+                  className={`w-3 h-3 text-slate-500 hover:text-slate-300 cursor-pointer ${isRefreshingWatchlist ? "animate-spin opacity-50" : ""}`}
                 />
               </button>
             </div>
@@ -753,7 +796,7 @@ export default function App() {
             </div>
           </header>
 
-          <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 scroll-smooth custom-scrollbar">
+          <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 scroll-smooth scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
             {messages.map((msg) => (
               <div
                 key={msg.id}
@@ -775,6 +818,7 @@ export default function App() {
                     <p className="text-[13px] sm:text-[14px] leading-relaxed whitespace-pre-wrap">
                       {msg.content}
                     </p>
+
                     <TechnicalWidget data={msg.technicalData} />
                     <SentimentWidget data={msg.sentimentData} />
                     {msg.portfolio && (
@@ -835,7 +879,7 @@ export default function App() {
               <button
                 type="submit"
                 disabled={isLoading || !inputMessage.trim()}
-                className="cursor-pointer bg-blue-600 text-white px-4 py-2.5 rounded-lg hover:bg-blue-500 disabled:opacity-50 disabled:hover:bg-blue-600 transition-colors shadow-sm flex items-center"
+                className="bg-blue-600 text-white px-4 py-2.5 rounded-lg hover:bg-blue-500 disabled:opacity-50 disabled:hover:bg-blue-600 transition-colors shadow-sm flex items-center"
               >
                 <Send className="w-4 h-4 mr-2" />
                 <span className="text-xs sm:text-sm font-medium">Send</span>
@@ -844,11 +888,6 @@ export default function App() {
           </div>
         </section>
       </div>
-      <style
-        dangerouslySetInnerHTML={{
-          __html: `.custom-scrollbar::-webkit-scrollbar { width: 6px; } .custom-scrollbar::-webkit-scrollbar-track { background: transparent; } .custom-scrollbar::-webkit-scrollbar-thumb { background: #1F2937; border-radius: 4px; } .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #374151; }`,
-        }}
-      />
     </div>
   );
 }
