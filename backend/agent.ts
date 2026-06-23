@@ -99,7 +99,8 @@ const SYSTEM_PROMPT = `You are an AI Trading Assistant. STRICT ANTI-HALLUCINATIO
 2. Do NOT output raw numbers that are already displayed in UI widgets (like RSI or Portfolio JSON).
 3. When asked to analyze a portfolio, respond ONLY with a valid JSON array of objects.
 4. You can execute 'market' orders or 'limit' orders. If the user specifies a target price, use a 'limit' order.
-5. RISK MANAGEMENT IS AUTOMATIC: When you issue a BUY order, the backend will automatically attach strict Stop-Loss (-5%) and Take-Profit (+15%) bracket orders. You do not need to calculate them manually unless the user specifically asks you to override the defaults.`;
+5. RISK MANAGEMENT IS AUTOMATIC: When you issue a BUY order, the backend will automatically attach strict Stop-Loss (-5%) and Take-Profit (+15%) bracket orders. You do not need to calculate them manually.
+6. YOU CAN DISPLAY CHARTS! If the user asks for a chart, a trend, or historical prices, ALWAYS invoke the 'get_historical_prices' tool. The frontend has a built-in interactive chart widget that will automatically render the data you fetch. NEVER apologize or say you can't display charts.`;
 
 const tools: any[] = [
   {
@@ -233,7 +234,7 @@ async function getHistoricalPrices(
                 month: "short",
                 day: "numeric",
               }),
-              time: d.toISOString().split("T")[0], // Added strictly formatted time for TradingView
+              time: d.toISOString().split("T")[0], // Formatted time for TradingView
               price: parseFloat(i.close.toFixed(2)),
             };
           }),
@@ -256,7 +257,6 @@ async function getNewsSentiment(ticker: string) {
   }
 }
 
-// CRITICAL: Explicit export for server.ts consumption
 export async function getWatchlistQuotes(tickers: string[]) {
   return Promise.all(
     tickers.map(async (t) => {
@@ -322,141 +322,147 @@ export async function runTradingAgentStep(
   let finalSentiment: SentimentData | undefined;
 
   if (message.tool_calls && message.tool_calls.length > 0) {
-    const toolCall = message.tool_calls[0];
-    if (!toolCall || toolCall.type !== "function")
-      return { text: message.content || "Error processing tool call." };
-    const args = JSON.parse(toolCall.function.arguments);
-    const funcName = toolCall.function.name;
+    messages.push(message);
 
-    console.log(`[AGENT] Requested: ${funcName}`);
-    let apiResponse: any = {};
+    for (const toolCall of message.tool_calls) {
+      if (toolCall.type !== "function") continue;
 
-    if (funcName === "get_stock_price") {
-      detectedTicker = args.ticker.toUpperCase();
-      apiResponse = await getStockPrice(detectedTicker!);
-    } else if (funcName === "get_historical_prices") {
-      detectedTicker = args.ticker.toUpperCase();
-      const hr = await getHistoricalPrices(detectedTicker!, 30);
-      if (hr.data) {
-        apiResponse = { data: "Chart created." };
-        finalChartData = hr.data;
-      } else apiResponse = { error: hr.error };
-    } else if (funcName === "get_technical_indicators") {
-      detectedTicker = args.ticker.toUpperCase();
-      const hr = await getHistoricalPrices(detectedTicker!, 60);
-      if (hr.data && hr.data.length > 0) {
-        const prices = hr.data.map((p) => p.price);
-        const rsi = calculateRSI(prices, 14);
-        const macd = calculateMACD(prices);
-        finalTechData = {
-          rsi,
-          macd: macd.macd,
-          signal: macd.signal,
-          histogram: macd.histogram,
-          state: rsi > 70 ? "OVERBOUGHT" : rsi < 30 ? "OVERSOLD" : "NEUTRAL",
-        };
-        apiResponse = { ticker: detectedTicker, ...finalTechData };
-      } else apiResponse = { error: "Failed to calculate indicators." };
-    } else if (funcName === "analyze_news_sentiment") {
-      detectedTicker = args.ticker.toUpperCase();
-      const nr = await getNewsSentiment(detectedTicker!);
-      if (nr.error) apiResponse = { error: nr.error };
-      else {
-        const prompt = `Analyze these headlines for ${detectedTicker}: ${JSON.stringify(nr.headlines)}. Respond ONLY with a JSON object format: {"sentiment": "BULLISH" | "BEARISH" | "NEUTRAL", "summary": "1-2 sentences."}`;
+      const args = JSON.parse(toolCall.function.arguments);
+      const funcName = toolCall.function.name;
+
+      console.log(`[AGENT] Requested: ${funcName}`);
+      let apiResponse: any = {};
+
+      if (funcName === "get_stock_price") {
+        detectedTicker = args.ticker.toUpperCase();
+        apiResponse = await getStockPrice(detectedTicker!);
+      } else if (funcName === "get_historical_prices") {
+        detectedTicker = args.ticker.toUpperCase();
+        const hr = await getHistoricalPrices(detectedTicker!, 30);
+        if (hr.data) {
+          apiResponse = { data: "Chart created." };
+          finalChartData = hr.data;
+        } else apiResponse = { error: hr.error };
+      } else if (funcName === "get_technical_indicators") {
+        detectedTicker = args.ticker.toUpperCase();
+        const hr = await getHistoricalPrices(detectedTicker!, 60);
+        if (hr.data && hr.data.length > 0) {
+          const prices = hr.data.map((p) => p.price);
+          const rsi = calculateRSI(prices, 14);
+          const macd = calculateMACD(prices);
+          finalTechData = {
+            rsi,
+            macd: macd.macd,
+            signal: macd.signal,
+            histogram: macd.histogram,
+            state: rsi > 70 ? "OVERBOUGHT" : rsi < 30 ? "OVERSOLD" : "NEUTRAL",
+          };
+          apiResponse = { ticker: detectedTicker, ...finalTechData };
+        } else apiResponse = { error: "Failed to calculate indicators." };
+      } else if (funcName === "analyze_news_sentiment") {
+        detectedTicker = args.ticker.toUpperCase();
+        const nr = await getNewsSentiment(detectedTicker!);
+        if (nr.error) apiResponse = { error: nr.error };
+        else {
+          const prompt = `Analyze these headlines for ${detectedTicker}: ${JSON.stringify(nr.headlines)}. Respond ONLY with a JSON object format: {"sentiment": "BULLISH" | "BEARISH" | "NEUTRAL", "summary": "1-2 sentences."}`;
+          try {
+            const jm = await openai.chat.completions.create({
+              model: "gpt-4o-mini",
+              messages: [{ role: "user", content: prompt }],
+              response_format: { type: "json_object" },
+            });
+            finalSentiment = JSON.parse(
+              jm.choices[0]?.message?.content || "{}",
+            );
+            apiResponse = {
+              success: "Analyzed",
+              sentiment_json: JSON.stringify(finalSentiment),
+            };
+          } catch (e) {
+            apiResponse = { error: "Failed sentiment." };
+          }
+        }
+      } else if (funcName === "get_transaction_history") {
+        if (!transactionHistory || transactionHistory.length === 0)
+          apiResponse = { result: "No trades executed." };
+        else
+          apiResponse = {
+            result:
+              "History: " +
+              transactionHistory
+                .map(
+                  (t) => `${t.action} ${t.shares}x ${t.ticker} at $${t.price}`,
+                )
+                .join(" | "),
+          };
+      } else if (funcName === "analyze_portfolio") {
+        const { tickers, budget } = args;
+        const md: any = {};
+        const rs = await Promise.all(
+          tickers.map((t: string) => getHistoricalPrices(t, 30)),
+        );
+        tickers.forEach((t: string, i: number) => {
+          if (rs[i].data) md[t] = rs[i].data!.slice(-7);
+        });
+        const prompt = `Allocate $${budget} across these tickers based on this 7-day data: ${JSON.stringify(md)}. Respond ONLY with a JSON object containing a "portfolio" array: {"portfolio": [{"ticker": "...", "percentage": 40, "amount": 400, "reasoning": "..."}]}`;
         try {
           const jm = await openai.chat.completions.create({
             model: "gpt-4o-mini",
             messages: [{ role: "user", content: prompt }],
             response_format: { type: "json_object" },
           });
-          finalSentiment = JSON.parse(jm.choices[0]?.message?.content || "{}");
+          finalPortfolio = JSON.parse(
+            jm.choices[0]?.message?.content || "{}",
+          ).portfolio;
           apiResponse = {
-            success: "Analyzed",
-            sentiment_json: JSON.stringify(finalSentiment),
+            success: "Allocated",
+            portfolio_string: JSON.stringify(finalPortfolio),
           };
         } catch (e) {
-          apiResponse = { error: "Failed sentiment." };
+          apiResponse = { error: "Failed allocation." };
+        }
+      } else if (funcName === "execute_trade") {
+        detectedTicker = args.ticker.toUpperCase();
+        const p = await getStockPrice(detectedTicker!);
+        if (p.error || !p.price) {
+          apiResponse = { error: "Price unavailable." };
+        } else {
+          const orderType = args.orderType || "market";
+          let limitPrice = args.limitPrice;
+          let finalStopLoss = args.stopLoss;
+          let finalTakeProfit = args.takeProfit;
+
+          if (args.action.toUpperCase() === "BUY") {
+            const basePrice = limitPrice || p.price;
+            if (!finalStopLoss)
+              finalStopLoss = parseFloat((basePrice * 0.95).toFixed(2));
+            if (!finalTakeProfit)
+              finalTakeProfit = parseFloat((basePrice * 1.15).toFixed(2));
+            console.log(
+              `🛡️ [RISK MANAGEMENT] Auto-calculated SL: $${finalStopLoss}, TP: $${finalTakeProfit} for ${detectedTicker}`,
+            );
+          }
+
+          apiResponse = executeTradeCallback
+            ? await executeTradeCallback(
+                detectedTicker!,
+                args.action.toUpperCase(),
+                args.shares,
+                orderType,
+                limitPrice || p.price,
+                finalStopLoss,
+                finalTakeProfit,
+              )
+            : { error: "No callback." };
         }
       }
-    } else if (funcName === "get_transaction_history") {
-      if (!transactionHistory || transactionHistory.length === 0)
-        apiResponse = { result: "No trades executed." };
-      else
-        apiResponse = {
-          result:
-            "History: " +
-            transactionHistory
-              .map((t) => `${t.action} ${t.shares}x ${t.ticker} at $${t.price}`)
-              .join(" | "),
-        };
-    } else if (funcName === "analyze_portfolio") {
-      const { tickers, budget } = args;
-      const md: any = {};
-      const rs = await Promise.all(
-        tickers.map((t: string) => getHistoricalPrices(t, 30)),
-      );
-      tickers.forEach((t: string, i: number) => {
-        if (rs[i].data) md[t] = rs[i].data!.slice(-7);
+
+      messages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: JSON.stringify(apiResponse),
       });
-      const prompt = `Allocate $${budget} across these tickers based on this 7-day data: ${JSON.stringify(md)}. Respond ONLY with a JSON object containing a "portfolio" array: {"portfolio": [{"ticker": "...", "percentage": 40, "amount": 400, "reasoning": "..."}]}`;
-      try {
-        const jm = await openai.chat.completions.create({
-          model: "gpt-4o-mini",
-          messages: [{ role: "user", content: prompt }],
-          response_format: { type: "json_object" },
-        });
-        finalPortfolio = JSON.parse(
-          jm.choices[0]?.message?.content || "{}",
-        ).portfolio;
-        apiResponse = {
-          success: "Allocated",
-          portfolio_string: JSON.stringify(finalPortfolio),
-        };
-      } catch (e) {
-        apiResponse = { error: "Failed allocation." };
-      }
-    } else if (funcName === "execute_trade") {
-      detectedTicker = args.ticker.toUpperCase();
-      const p = await getStockPrice(detectedTicker!);
-      if (p.error || !p.price) {
-        apiResponse = { error: "Price unavailable." };
-      } else {
-        const orderType = args.orderType || "market";
-        let limitPrice = args.limitPrice;
-        let finalStopLoss = args.stopLoss;
-        let finalTakeProfit = args.takeProfit;
-
-        if (args.action.toUpperCase() === "BUY") {
-          const basePrice = limitPrice || p.price;
-          if (!finalStopLoss)
-            finalStopLoss = parseFloat((basePrice * 0.95).toFixed(2));
-          if (!finalTakeProfit)
-            finalTakeProfit = parseFloat((basePrice * 1.15).toFixed(2));
-          console.log(
-            `🛡️ [RISK MANAGEMENT] Auto-calculated SL: $${finalStopLoss}, TP: $${finalTakeProfit} for ${detectedTicker}`,
-          );
-        }
-
-        apiResponse = executeTradeCallback
-          ? await executeTradeCallback(
-              detectedTicker!,
-              args.action.toUpperCase(),
-              args.shares,
-              orderType,
-              limitPrice || p.price,
-              finalStopLoss,
-              finalTakeProfit,
-            )
-          : { error: "No callback." };
-      }
     }
-
-    messages.push(message);
-    messages.push({
-      role: "tool",
-      tool_call_id: toolCall.id,
-      content: JSON.stringify(apiResponse),
-    });
 
     const finalResult = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -464,7 +470,8 @@ export async function runTradingAgentStep(
     });
     const replyText =
       finalResult.choices[0]?.message?.content ||
-      "Here is the requested analysis:";
+      "Here is the requested chart and analysis:";
+
     return {
       text: replyText,
       chartData: finalChartData,

@@ -14,9 +14,13 @@ import {
   Newspaper,
   Gauge,
 } from "lucide-react";
+// FIX: Separated type imports from value imports for verbatimModuleSyntax
+import { createChart, ColorType, AreaSeries } from "lightweight-charts";
+import type { IChartApi, Time } from "lightweight-charts";
 
 interface ChartPoint {
   date: string;
+  time: string;
   price: number;
 }
 interface PortfolioAllocation {
@@ -79,6 +83,7 @@ interface PendingOrder {
   status: string;
 }
 
+// --- WIDGETS ---
 function SentimentWidget({ data }: { data?: SentimentData }) {
   if (!data) return null;
   const isBull = data.sentiment === "BULLISH";
@@ -233,200 +238,90 @@ function TradingChart({
   data: ChartPoint[];
   ticker: string;
 }) {
-  const [hoveredPoint, setHoveredPoint] = useState<ChartPoint | null>(null);
-  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const chartContainerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+
+  useEffect(() => {
+    if (!chartContainerRef.current || !data || data.length === 0) return;
+
+    const handleResize = () => {
+      if (chartRef.current && chartContainerRef.current) {
+        chartRef.current.applyOptions({
+          width: chartContainerRef.current.clientWidth,
+        });
+      }
+    };
+
+    const chart = createChart(chartContainerRef.current, {
+      layout: {
+        background: { type: ColorType.Solid, color: "transparent" },
+        textColor: "#64748B",
+      },
+      grid: {
+        vertLines: { color: "rgba(30, 41, 59, 0.3)" },
+        horzLines: { color: "rgba(30, 41, 59, 0.3)" },
+      },
+      width: chartContainerRef.current.clientWidth,
+      height: 250,
+      timeScale: { timeVisible: false, borderColor: "rgba(30, 41, 59, 0.5)" },
+      rightPriceScale: { borderColor: "rgba(30, 41, 59, 0.5)" },
+      // Interactive mode on
+      handleScroll: { mouseWheel: true, pressedMouseMove: true },
+      handleScale: {
+        axisPressedMouseMove: true,
+        mouseWheel: true,
+        pinch: true,
+      },
+    });
+
+    chartRef.current = chart;
+
+    // FIX: Updated API for lightweight-charts v5
+    const areaSeries = chart.addSeries(AreaSeries, {
+      lineColor: "#3B82F6",
+      topColor: "rgba(59, 130, 246, 0.4)",
+      bottomColor: "rgba(59, 130, 246, 0.0)",
+      lineWidth: 2,
+    });
+
+    const formattedData = data
+      .map((d) => ({
+        time: d.time as Time,
+        value: d.price,
+      }))
+      .sort(
+        (a, b) =>
+          new Date(a.time as string).getTime() -
+          new Date(b.time as string).getTime(),
+      );
+
+    areaSeries.setData(formattedData);
+    chart.timeScale().fitContent();
+
+    window.addEventListener("resize", handleResize);
+
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      chart.remove();
+    };
+  }, [data]);
+
   if (!data || data.length === 0) return null;
 
-  const prices = data.map((d) => d.price);
-  const minPrice = Math.min(...prices) * 0.99;
-  const maxPrice = Math.max(...prices) * 1.01;
-  const priceRange = maxPrice - minPrice;
-  const width = 500;
-  const height = 180;
-  const paddingX = 40;
-  const paddingY = 20;
-
-  const points = data.map((d, index) => {
-    const x =
-      data.length > 1
-        ? paddingX + (index / (data.length - 1)) * (width - paddingX * 2)
-        : paddingX + (width - paddingX * 2) / 2;
-    const y =
-      priceRange > 0
-        ? height -
-          paddingY -
-          ((d.price - minPrice) / priceRange) * (height - paddingY * 2)
-        : height / 2;
-    return { x, y, ...d };
-  });
-
-  const linePath = points.reduce(
-    (path, p, i) => (i === 0 ? `M ${p.x} ${p.y}` : `${path} L ${p.x} ${p.y}`),
-    "",
-  );
-  const fillPath =
-    points.length > 0
-      ? `${linePath} L ${points[points.length - 1].x} ${height - paddingY} L ${points[0].x} ${height - paddingY} Z`
-      : "";
-
-  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement, MouseEvent>) => {
-    const svgRect = e.currentTarget.getBoundingClientRect();
-    const svgX = (e.clientX - svgRect.left) * (width / svgRect.width);
-    let closestIndex = 0;
-    let minDiff = Infinity;
-    points.forEach((p, idx) => {
-      const diff = Math.abs(p.x - svgX);
-      if (diff < minDiff) {
-        minDiff = diff;
-        closestIndex = idx;
-      }
-    });
-    setHoverIndex(closestIndex);
-    setHoveredPoint(data[closestIndex]);
-  };
-  const handleMouseLeave = () => {
-    setHoveredPoint(null);
-    setHoverIndex(null);
-  };
-
   return (
-    <div className="mt-4 bg-[#0B0F19] rounded-lg p-4 border border-slate-800/80 w-full select-none">
-      <div className="flex items-center justify-between mb-3">
+    <div className="mt-4 bg-[#0B0F19] rounded-lg p-4 border border-slate-800/80 w-full">
+      <div className="flex items-center justify-between mb-4">
         <span className="text-xs font-semibold uppercase tracking-wider text-blue-400 flex items-center">
           <Layers className="w-3.5 h-3.5 mr-1.5" />
-          {ticker} 30-Day Trend
+          {ticker} Interactive Chart
         </span>
-        {hoveredPoint ? (
-          <div className="text-right">
-            <span className="text-xs text-slate-500 mr-2">
-              {hoveredPoint.date}:
-            </span>
-            <span className="text-sm font-semibold text-white font-mono">
-              ${hoveredPoint.price}
-            </span>
-          </div>
-        ) : (
-          <span className="text-xs text-slate-500">Hover graph</span>
-        )}
       </div>
-      <div className="relative">
-        <svg
-          viewBox={`0 0 ${width} ${height}`}
-          className="w-full h-auto overflow-visible cursor-crosshair"
-          onMouseMove={handleMouseMove}
-          onMouseLeave={handleMouseLeave}
-        >
-          <defs>
-            <linearGradient id="chart-glow" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#2563EB" stopOpacity="0.4" />
-              <stop offset="100%" stopColor="#2563EB" stopOpacity="0.0" />
-            </linearGradient>
-          </defs>
-          <line
-            x1={paddingX}
-            y1={paddingY}
-            x2={width - paddingX}
-            y2={paddingY}
-            stroke="#1E293B"
-            strokeDasharray="3,3"
-          />
-          <line
-            x1={paddingX}
-            y1={height / 2}
-            x2={width - paddingX}
-            y2={height / 2}
-            stroke="#1E293B"
-            strokeDasharray="3,3"
-          />
-          <line
-            x1={paddingX}
-            y1={height - paddingY}
-            x2={width - paddingX}
-            y2={height - paddingY}
-            stroke="#1E293B"
-            strokeDasharray="3,3"
-          />
-          <path d={fillPath} fill="url(#chart-glow)" />
-          <path
-            d={linePath}
-            fill="none"
-            stroke="#3B82F6"
-            strokeWidth="2.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-          <text
-            x={paddingX - 10}
-            y={paddingY + 4}
-            fill="#64748B"
-            fontSize="9"
-            textAnchor="end"
-            className="font-mono"
-          >
-            ${maxPrice.toFixed(0)}
-          </text>
-          <text
-            x={paddingX - 10}
-            y={height - paddingY + 4}
-            fill="#64748B"
-            fontSize="9"
-            textAnchor="end"
-            className="font-mono"
-          >
-            ${minPrice.toFixed(0)}
-          </text>
-          <text
-            x={paddingX}
-            y={height - 4}
-            fill="#64748B"
-            fontSize="9"
-            textAnchor="start"
-          >
-            {data[0].date}
-          </text>
-          <text
-            x={width - paddingX}
-            y={height - 4}
-            fill="#64748B"
-            fontSize="9"
-            textAnchor="end"
-          >
-            {data[data.length - 1].date}
-          </text>
-          {hoverIndex !== null && (
-            <>
-              <line
-                x1={points[hoverIndex].x}
-                y1={paddingY}
-                x2={points[hoverIndex].x}
-                y2={height - paddingY}
-                stroke="#3B82F6"
-                strokeWidth="1"
-                strokeDasharray="2,2"
-              />
-              <circle
-                cx={points[hoverIndex].x}
-                cy={points[hoverIndex].y}
-                r="6"
-                fill="#3B82F6"
-                opacity="0.3"
-              />
-              <circle
-                cx={points[hoverIndex].x}
-                cy={points[hoverIndex].y}
-                r="3.5"
-                fill="#60A5FA"
-                stroke="#1E293B"
-                strokeWidth="1"
-              />
-            </>
-          )}
-        </svg>
-      </div>
+      <div ref={chartContainerRef} className="w-full relative" />
     </div>
   );
 }
 
+// --- MAIN APP ---
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -462,11 +357,9 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   useEffect(() => scrollToBottom(), [messages]);
 
-  // LIVE STREAM HOOK (Re-added from previous phase)
+  // LIVE STREAM HOOK
   useEffect(() => {
     let isMounted = true;
-
-    // Initial fetch to paint the screen immediately
     const fetchInitialData = async () => {
       try {
         const tickers = ["TSLA", "AAPL", "VRNS", "LUMI.TA"];
@@ -497,9 +390,10 @@ export default function App() {
     eventSource.onerror = () => setIsLive(false);
 
     eventSource.onmessage = (event) => {
+      if (!isMounted) return;
       try {
         const data = JSON.parse(event.data);
-        if (data.type === "update" && isMounted) {
+        if (data.type === "update") {
           setUserPortfolio(data.portfolio);
           setPendingOrders(data.orders);
           setWatchlist(data.watchlist);
