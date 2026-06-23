@@ -8,7 +8,6 @@ import {
   AlertTriangle,
   ArrowUpRight,
   ArrowDownRight,
-  RefreshCw,
   Layers,
   PieChart,
   Wallet,
@@ -80,7 +79,6 @@ interface PendingOrder {
   status: string;
 }
 
-// --- WIDGETS ---
 function SentimentWidget({ data }: { data?: SentimentData }) {
   if (!data) return null;
   const isBull = data.sentiment === "BULLISH";
@@ -249,11 +247,16 @@ function TradingChart({
   const paddingY = 20;
 
   const points = data.map((d, index) => {
-    const x = paddingX + (index / (data.length - 1)) * (width - paddingX * 2);
+    const x =
+      data.length > 1
+        ? paddingX + (index / (data.length - 1)) * (width - paddingX * 2)
+        : paddingX + (width - paddingX * 2) / 2;
     const y =
-      height -
-      paddingY -
-      ((d.price - minPrice) / (priceRange || 1)) * (height - paddingY * 2);
+      priceRange > 0
+        ? height -
+          paddingY -
+          ((d.price - minPrice) / priceRange) * (height - paddingY * 2)
+        : height / 2;
     return { x, y, ...d };
   });
 
@@ -424,7 +427,6 @@ function TradingChart({
   );
 }
 
-// --- MAIN APP ---
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -436,6 +438,8 @@ export default function App() {
   ]);
   const [inputMessage, setInputMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [isLive, setIsLive] = useState(false);
+
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>([
     { ticker: "TSLA", name: "Tesla Inc.", price: 0, change: 0, isUp: true },
     { ticker: "AAPL", name: "Apple Inc.", price: 0, change: 0, isUp: true },
@@ -452,28 +456,17 @@ export default function App() {
     null,
   );
   const [pendingOrders, setPendingOrders] = useState<PendingOrder[]>([]);
-  const [isRefreshingWatchlist, setIsRefreshingWatchlist] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () =>
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   useEffect(() => scrollToBottom(), [messages]);
 
-  const fetchPortfolioAndOrders = async () => {
-    try {
-      const [pRes, oRes] = await Promise.all([
-        fetch("http://localhost:3000/api/portfolio"),
-        fetch("http://localhost:3000/api/orders"),
-      ]);
-      if (pRes.ok) setUserPortfolio(await pRes.json());
-      if (oRes.ok) setPendingOrders(await oRes.json());
-    } catch (error) {
-      console.error("Fetch error:", error);
-    }
-  };
-
+  // LIVE STREAM HOOK (Re-added from previous phase)
   useEffect(() => {
     let isMounted = true;
+
+    // Initial fetch to paint the screen immediately
     const fetchInitialData = async () => {
       try {
         const tickers = ["TSLA", "AAPL", "VRNS", "LUMI.TA"];
@@ -496,27 +489,31 @@ export default function App() {
       }
     };
     fetchInitialData();
+
+    // Setup Server-Sent Events (SSE) for Real-Time Updates
+    const eventSource = new EventSource("http://localhost:3000/api/stream");
+
+    eventSource.onopen = () => setIsLive(true);
+    eventSource.onerror = () => setIsLive(false);
+
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === "update" && isMounted) {
+          setUserPortfolio(data.portfolio);
+          setPendingOrders(data.orders);
+          setWatchlist(data.watchlist);
+        }
+      } catch (e) {
+        console.error("Error parsing stream data:", e);
+      }
+    };
+
     return () => {
       isMounted = false;
+      eventSource.close();
     };
   }, []);
-
-  const handleRefreshClick = async () => {
-    setIsRefreshingWatchlist(true);
-    try {
-      const res = await fetch("http://localhost:3000/api/watchlist", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tickers: watchlist.map((i) => i.ticker) }),
-      });
-      if (res.ok) setWatchlist(await res.json());
-      await fetchPortfolioAndOrders();
-    } catch (error) {
-      console.error("Watchlist refresh error:", error);
-    } finally {
-      setIsRefreshingWatchlist(false);
-    }
-  };
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -555,7 +552,6 @@ export default function App() {
           sentimentData: data.sentimentData,
         },
       ]);
-      await fetchPortfolioAndOrders();
     } catch (error) {
       console.error("Chat Error:", error);
       setMessages((prev) => [
@@ -564,7 +560,7 @@ export default function App() {
           id: (Date.now() + 1).toString(),
           role: "system",
           content:
-            "The AI API is currently overloaded or unreachable. Please wait a moment and try again.",
+            "AI Service connection failed. Please ensure the backend is running.",
         },
       ]);
     } finally {
@@ -722,19 +718,20 @@ export default function App() {
           </div>
 
           <div className="space-y-2">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between mb-2">
               <h3 className="text-[10px] font-bold tracking-wider text-slate-500 uppercase">
                 Local Watchlist
               </h3>
-              <button
-                onClick={handleRefreshClick}
-                disabled={isRefreshingWatchlist}
-              >
-                <RefreshCw
-                  className={`w-3 h-3 text-slate-500 hover:text-slate-300 cursor-pointer ${isRefreshingWatchlist ? "animate-spin opacity-50" : ""}`}
-                />
-              </button>
+              <div className="flex items-center space-x-1.5 px-2 py-0.5 rounded-full bg-slate-800/50 border border-slate-700/50 shadow-inner">
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${isLive ? "bg-emerald-500 animate-pulse shadow-[0_0_5px_#10B981]" : "bg-rose-500"}`}
+                ></span>
+                <span className="text-[9px] font-mono font-bold text-slate-400 tracking-widest">
+                  {isLive ? "LIVE" : "SYNCING"}
+                </span>
+              </div>
             </div>
+
             <div className="space-y-1.5">
               {watchlist.map((stock) => (
                 <div
@@ -785,7 +782,7 @@ export default function App() {
                 Autonomous Engine Terminal
               </h1>
               <p className="text-[10px] text-slate-500 font-mono">
-                PROMPT CONNECTION: GEMINI-2.5-FLASH // LIVE MARKET CONTEXT
+                PROMPT CONNECTION: GPT-4o-MINI // LIVE MARKET CONTEXT
               </p>
             </div>
             <div className="flex items-center space-x-2 text-xs">
