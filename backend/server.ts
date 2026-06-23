@@ -1,6 +1,5 @@
 import express from "express";
 import cors from "cors";
-import Database from "better-sqlite3";
 import Alpaca from "@alpacahq/alpaca-trade-api";
 import * as dotenv from "dotenv";
 import { runTradingAgentStep, getWatchlistQuotes } from "./agent.js";
@@ -13,23 +12,12 @@ const PORT = 3000;
 app.use(express.json());
 app.use(cors({ origin: "http://localhost:5173" }));
 
+// Alpaca API setup (Casting to 'any' resolves TypeScript CommonJS issues)
 const alpaca = new (Alpaca as any)({
   keyId: process.env.APCA_API_KEY_ID,
   secretKey: process.env.APCA_API_SECRET_KEY,
   paper: true,
 });
-
-const db = new Database("trading_bot.db");
-db.exec(`
-  CREATE TABLE IF NOT EXISTS history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker TEXT NOT NULL,
-    action TEXT NOT NULL,
-    shares REAL NOT NULL,
-    price REAL NOT NULL,
-    date TEXT NOT NULL
-  );
-`);
 
 const getAlpacaPortfolio = async () => {
   try {
@@ -76,12 +64,10 @@ const executeAlpacaTrade = async (
   limitPrice?: number,
 ) => {
   ticker = ticker.toUpperCase();
-
   try {
     console.log(
       `[ALPACA] Sending ${action} ${orderType.toUpperCase()} order for ${shares}x ${ticker} to the exchange...`,
     );
-
     const orderPayload: any = {
       symbol: ticker,
       qty: shares,
@@ -90,18 +76,11 @@ const executeAlpacaTrade = async (
       time_in_force: "day",
     };
 
-    if (orderType.toLowerCase() === "limit" && limitPrice) {
+    if (orderType.toLowerCase() === "limit" && limitPrice)
       orderPayload.limit_price = limitPrice;
-    }
-
     const order = await alpaca.createOrder(orderPayload);
 
-    db.prepare(
-      "INSERT INTO history (ticker, action, shares, price, date) VALUES (?, ?, ?, ?, ?)",
-    ).run(ticker, action, shares, limitPrice || 0, new Date().toISOString());
-
     console.log(`[ALPACA] Order acknowledged! Status: ${order.status}`);
-
     return {
       success: `Order placed successfully at broker: ${action} ${shares} shares of ${ticker}. Type: ${orderType}. Current status: ${order.status}.`,
     };
@@ -139,13 +118,24 @@ app.get("/api/orders", async (req, res) => {
   }
 });
 
-app.get("/api/history", (req, res) => {
-  const history = db
-    .prepare(
-      "SELECT ticker, action, shares, price, date FROM history ORDER BY id DESC LIMIT 50",
-    )
-    .all();
-  res.json(history);
+// Using Alpaca's API to fetch actual executed trades (fills) directly from the exchange
+app.get("/api/history", async (req, res) => {
+  try {
+    const activities = await alpaca.getAccountActivities({
+      activityTypes: ["FILL"],
+    });
+    const history = activities.map((a: any) => ({
+      id: a.id,
+      ticker: a.symbol,
+      action: a.side.toUpperCase(),
+      shares: parseFloat(a.qty),
+      price: parseFloat(a.price),
+      date: a.transaction_time,
+    }));
+    res.json(history);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch history" });
+  }
 });
 
 app.post("/api/trade", async (req, res) => {
@@ -155,35 +145,36 @@ app.post("/api/trade", async (req, res) => {
     return;
   }
 
-  const type = orderType || "market";
-
   const result = await executeAlpacaTrade(
     ticker,
     action,
     shares,
-    type,
+    orderType || "market",
     limitPrice,
   );
-  if (result.error) {
-    res.status(400).json(result);
-  } else {
-    res.json({ success: true, portfolio: await getAlpacaPortfolio() });
-  }
+  if (result.error) res.status(400).json(result);
+  else res.json({ success: true, portfolio: await getAlpacaPortfolio() });
 });
 
 app.post("/api/chat", async (req, res) => {
   const { message, history } = req.body;
   try {
-    const transactionHistory = db
-      .prepare(
-        "SELECT ticker, action, shares, price, date FROM history ORDER BY id ASC",
-      )
-      .all();
+    // Fetch real-time executed trades from Alpaca to provide context to the agent
+    const activities = await alpaca.getAccountActivities({
+      activityTypes: ["FILL"],
+    });
+    const transactionHistory = activities.map((a: any) => ({
+      ticker: a.symbol,
+      action: a.side.toUpperCase(),
+      shares: parseFloat(a.qty),
+      price: parseFloat(a.price),
+      date: a.transaction_time,
+    }));
 
     const agentResponse = await runTradingAgentStep(
       message,
       history,
-      transactionHistory as any[],
+      transactionHistory,
       executeAlpacaTrade,
     );
 
@@ -206,7 +197,6 @@ app.post("/api/watchlist", async (req, res) => {
   try {
     res.json(await getWatchlistQuotes(tickers));
   } catch (error) {
-    console.error("Watchlist fetch error:", error);
     res.status(500).json({ error: "Watchlist error" });
   }
 });

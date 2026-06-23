@@ -1,11 +1,16 @@
-import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
+import { OpenAI } from "openai";
 import * as dotenv from "dotenv";
 import YahooFinance from "yahoo-finance2";
 
 dotenv.config();
 
 const yahooFinance = new YahooFinance({ suppressNotices: ["yahooSurvey"] });
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+
+// OpenAI client with built-in exponential backoff (maxRetries: 5)
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  maxRetries: 5,
+});
 
 export interface ChartPoint {
   date: string;
@@ -37,44 +42,6 @@ export interface AgentResponse {
   technicalData?: TechnicalData | undefined;
   sentimentData?: SentimentData | undefined;
 }
-
-// --- UTILITY: EXPONENTIAL BACKOFF WITH JITTER FOR GEMINI API ---
-const executeWithRetry = async (
-  fn: () => Promise<any>,
-  retries = 5,
-  baseDelay = 2000,
-): Promise<any> => {
-  let attempt = 0;
-  while (attempt < retries) {
-    try {
-      return await fn();
-    } catch (error: any) {
-      // Only retry on specific server-side errors or rate limits
-      if (
-        error.status === 503 ||
-        error.status === 429 ||
-        error.status === 500
-      ) {
-        attempt++;
-        // Exponential backoff: 2s, 4s, 8s, etc., plus random jitter (0-500ms) to prevent thundering herd
-        const jitter = Math.floor(Math.random() * 500);
-        const delay = baseDelay * Math.pow(2, attempt - 1) + jitter;
-
-        console.log(
-          `[BACKEND] Gemini API issue (${error.status}). Retrying attempt ${attempt}/${retries} in ${delay}ms...`,
-        );
-        await new Promise((res) => setTimeout(res, delay));
-      } else {
-        // If it's a 400 Bad Request or other client error, don't retry, fail fast.
-        console.error(`[BACKEND] Fatal Gemini API Error:`, error.message);
-        throw error;
-      }
-    }
-  }
-  throw new Error(
-    "Gemini API completely overloaded after multiple retries. Please try again later.",
-  );
-};
 
 // --- TECHNICAL ANALYSIS ---
 function calculateRSI(prices: number[], periods = 14): number {
@@ -126,96 +93,108 @@ function calculateMACD(prices: number[]): {
   };
 }
 
-// --- GEMINI MODEL & TOOLS SETUP ---
-const model = genAI.getGenerativeModel({
-  model: "gemini-2.5-flash",
-  systemInstruction:
-    "You are an AI Trading Assistant. STRICT ANTI-HALLUCINATION RULES:\n1. NEVER pretend to execute trades using plain text. You MUST ALWAYS invoke the 'execute_trade' tool if the user wants to buy or sell.\n2. Do NOT output raw numbers that are already displayed in UI widgets (like RSI or Portfolio JSON).\n3. When asked to analyze a portfolio, respond ONLY with a valid JSON array of objects.\n4. You can execute 'market' orders or 'limit' orders. If the user specifies a target price, use a 'limit' order.",
-  tools: [
-    {
-      functionDeclarations: [
-        {
-          name: "get_stock_price",
-          description: "Retrieves the current market price and state.",
-          parameters: {
-            type: SchemaType.OBJECT,
-            properties: { ticker: { type: SchemaType.STRING } },
-            required: ["ticker"],
-          },
-        },
-        {
-          name: "get_historical_prices",
-          description: "Retrieves 30-day historical prices.",
-          parameters: {
-            type: SchemaType.OBJECT,
-            properties: { ticker: { type: SchemaType.STRING } },
-            required: ["ticker"],
-          },
-        },
-        {
-          name: "get_technical_indicators",
-          description: "Calculates RSI and MACD for a stock.",
-          parameters: {
-            type: SchemaType.OBJECT,
-            properties: { ticker: { type: SchemaType.STRING } },
-            required: ["ticker"],
-          },
-        },
-        {
-          name: "analyze_news_sentiment",
-          description: "Fetches recent news and analyzes sentiment.",
-          parameters: {
-            type: SchemaType.OBJECT,
-            properties: { ticker: { type: SchemaType.STRING } },
-            required: ["ticker"],
-          },
-        },
-        {
-          name: "get_transaction_history",
-          description: "Retrieves user's paper trading logs.",
-          parameters: { type: SchemaType.OBJECT, properties: {} },
-        },
-        {
-          name: "analyze_portfolio",
-          description: "Allocates budget across tickers.",
-          parameters: {
-            type: SchemaType.OBJECT,
-            properties: {
-              tickers: {
-                type: SchemaType.ARRAY,
-                items: { type: SchemaType.STRING },
-              },
-              budget: { type: SchemaType.NUMBER },
-            },
-            required: ["tickers", "budget"],
-          },
-        },
-        {
-          name: "execute_trade",
-          description:
-            "Executes a buy or sell order. Use 'market' for current price, or 'limit' with a specific price.",
-          parameters: {
-            type: SchemaType.OBJECT,
-            properties: {
-              ticker: { type: SchemaType.STRING },
-              action: { type: SchemaType.STRING, description: "BUY or SELL" },
-              shares: { type: SchemaType.NUMBER },
-              orderType: {
-                type: SchemaType.STRING,
-                description: "'market' or 'limit'",
-              },
-              limitPrice: {
-                type: SchemaType.NUMBER,
-                description: "Required only if orderType is 'limit'",
-              },
-            },
-            required: ["ticker", "action", "shares"],
-          },
-        },
-      ],
+// --- OPENAI TOOLS SETUP ---
+const SYSTEM_PROMPT = `You are an AI Trading Assistant. STRICT ANTI-HALLUCINATION RULES:
+1. NEVER pretend to execute trades using plain text. You MUST ALWAYS invoke the 'execute_trade' tool if the user wants to buy or sell.
+2. Do NOT output raw numbers that are already displayed in UI widgets (like RSI or Portfolio JSON).
+3. When asked to analyze a portfolio, respond ONLY with a valid JSON array of objects.
+4. You can execute 'market' orders or 'limit' orders. If the user specifies a target price, use a 'limit' order.`;
+
+const tools: any[] = [
+  {
+    type: "function",
+    function: {
+      name: "get_stock_price",
+      description: "Retrieves the current market price and state.",
+      parameters: {
+        type: "object",
+        properties: { ticker: { type: "string" } },
+        required: ["ticker"],
+      },
     },
-  ],
-});
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_historical_prices",
+      description: "Retrieves 30-day historical prices.",
+      parameters: {
+        type: "object",
+        properties: { ticker: { type: "string" } },
+        required: ["ticker"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_technical_indicators",
+      description: "Calculates RSI and MACD for a stock.",
+      parameters: {
+        type: "object",
+        properties: { ticker: { type: "string" } },
+        required: ["ticker"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "analyze_news_sentiment",
+      description: "Fetches recent news and analyzes sentiment.",
+      parameters: {
+        type: "object",
+        properties: { ticker: { type: "string" } },
+        required: ["ticker"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_transaction_history",
+      description: "Retrieves user's paper trading logs.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "analyze_portfolio",
+      description: "Allocates budget across tickers.",
+      parameters: {
+        type: "object",
+        properties: {
+          tickers: { type: "array", items: { type: "string" } },
+          budget: { type: "number" },
+        },
+        required: ["tickers", "budget"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "execute_trade",
+      description:
+        "Executes a buy or sell order. Use 'market' for current price, or 'limit' with a specific price.",
+      parameters: {
+        type: "object",
+        properties: {
+          ticker: { type: "string" },
+          action: { type: "string", description: "BUY or SELL" },
+          shares: { type: "number" },
+          orderType: { type: "string", description: "'market' or 'limit'" },
+          limitPrice: {
+            type: "number",
+            description: "Required only if orderType is 'limit'",
+          },
+        },
+        required: ["ticker", "action", "shares"],
+      },
+    },
+  },
+];
 
 async function getStockPrice(ticker: string) {
   try {
@@ -311,18 +290,26 @@ export async function runTradingAgentStep(
     limitPrice?: number,
   ) => Promise<any>,
 ): Promise<AgentResponse> {
-  const formattedHistory = history
-    ? history
-        .filter((msg: any) => msg.role === "user" || msg.role === "agent")
-        .map((msg: any) => ({
-          role: msg.role === "user" ? "user" : "model",
-          parts: [{ text: msg.content }],
-        }))
-    : [];
-  const chat = model.startChat({ history: formattedHistory });
+  const messages: any[] = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...history
+      .filter((msg: any) => msg.role === "user" || msg.role === "agent")
+      .map((msg: any) => ({
+        role: msg.role === "agent" ? "assistant" : "user",
+        content: msg.content,
+      })),
+    { role: "user", content: userMessage },
+  ];
 
-  const result = await executeWithRetry(() => chat.sendMessage(userMessage));
-  const calls = result.response.functionCalls();
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: messages,
+    tools: tools,
+  });
+
+  // 1. Безопасное извлечение сообщения (чтобы не было undefined)
+  const message = response.choices[0]?.message;
+  if (!message) return { text: "No response generated." };
 
   let finalChartData: ChartPoint[] | undefined;
   let detectedTicker: string | undefined;
@@ -330,24 +317,32 @@ export async function runTradingAgentStep(
   let finalTechData: TechnicalData | undefined;
   let finalSentiment: SentimentData | undefined;
 
-  if (calls && calls.length > 0) {
-    const call = calls[0];
-    if (!call) return { text: result.response.text() };
-    console.log(`[AGENT] Requested: ${call.name}`);
+  if (message.tool_calls && message.tool_calls.length > 0) {
+    const toolCall = message.tool_calls[0];
+
+    // 2. Строгая проверка для TypeScript (доказываем, что это function call)
+    if (!toolCall || toolCall.type !== "function") {
+      return { text: message.content || "Error processing tool call." };
+    }
+
+    const args = JSON.parse(toolCall.function.arguments);
+    const funcName = toolCall.function.name;
+
+    console.log(`[AGENT] Requested: ${funcName}`);
     let apiResponse: any = {};
 
-    if (call.name === "get_stock_price") {
-      detectedTicker = (call.args as any).ticker.toUpperCase();
+    if (funcName === "get_stock_price") {
+      detectedTicker = args.ticker.toUpperCase();
       apiResponse = await getStockPrice(detectedTicker!);
-    } else if (call.name === "get_historical_prices") {
-      detectedTicker = (call.args as any).ticker.toUpperCase();
+    } else if (funcName === "get_historical_prices") {
+      detectedTicker = args.ticker.toUpperCase();
       const hr = await getHistoricalPrices(detectedTicker!, 30);
       if (hr.data) {
         apiResponse = { data: "Chart created." };
         finalChartData = hr.data;
       } else apiResponse = { error: hr.error };
-    } else if (call.name === "get_technical_indicators") {
-      detectedTicker = (call.args as any).ticker.toUpperCase();
+    } else if (funcName === "get_technical_indicators") {
+      detectedTicker = args.ticker.toUpperCase();
       const hr = await getHistoricalPrices(detectedTicker!, 60);
       if (hr.data && hr.data.length > 0) {
         const prices = hr.data.map((p) => p.price);
@@ -362,29 +357,29 @@ export async function runTradingAgentStep(
         };
         apiResponse = { ticker: detectedTicker, ...finalTechData };
       } else apiResponse = { error: "Failed to calculate indicators." };
-    } else if (call.name === "analyze_news_sentiment") {
-      detectedTicker = (call.args as any).ticker.toUpperCase();
+    } else if (funcName === "analyze_news_sentiment") {
+      detectedTicker = args.ticker.toUpperCase();
       const nr = await getNewsSentiment(detectedTicker!);
       if (nr.error) apiResponse = { error: nr.error };
       else {
-        const prompt = `Analyze these headlines for ${detectedTicker}: ${JSON.stringify(nr.headlines)}. Respond ONLY with a raw JSON object: {"sentiment": "BULLISH" | "BEARISH" | "NEUTRAL", "summary": "1-2 sentences."}`;
+        const prompt = `Analyze these headlines for ${detectedTicker}: ${JSON.stringify(nr.headlines)}. Respond ONLY with a JSON object format: {"sentiment": "BULLISH" | "BEARISH" | "NEUTRAL", "summary": "1-2 sentences."}`;
         try {
-          const jm = genAI.getGenerativeModel({
-            model: "gemini-2.5-flash",
-            generationConfig: { responseMimeType: "application/json" },
+          const jm = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [{ role: "user", content: prompt }],
+            response_format: { type: "json_object" },
           });
-          // We also wrap the nested generation call in the retry logic
-          const r = await executeWithRetry(() => jm.generateContent(prompt));
-          finalSentiment = JSON.parse(r.response.text());
+          // 3. Безопасное извлечение с помощью ?.
+          finalSentiment = JSON.parse(jm.choices[0]?.message?.content || "{}");
           apiResponse = {
             success: "Analyzed",
             sentiment_json: JSON.stringify(finalSentiment),
           };
         } catch (e) {
-          apiResponse = { error: "Failed sentiment analysis due to API load." };
+          apiResponse = { error: "Failed sentiment." };
         }
       }
-    } else if (call.name === "get_transaction_history") {
+    } else if (funcName === "get_transaction_history") {
       if (!transactionHistory || transactionHistory.length === 0)
         apiResponse = { result: "No trades executed." };
       else
@@ -395,8 +390,8 @@ export async function runTradingAgentStep(
               .map((t) => `${t.action} ${t.shares}x ${t.ticker} at $${t.price}`)
               .join(" | "),
         };
-    } else if (call.name === "analyze_portfolio") {
-      const { tickers, budget } = call.args as any;
+    } else if (funcName === "analyze_portfolio") {
+      const { tickers, budget } = args;
       const md: any = {};
       const rs = await Promise.all(
         tickers.map((t: string) => getHistoricalPrices(t, 30)),
@@ -404,53 +399,61 @@ export async function runTradingAgentStep(
       tickers.forEach((t: string, i: number) => {
         if (rs[i].data) md[t] = rs[i].data!.slice(-7);
       });
-      const prompt = `Allocate $${budget} across these tickers based on this 7-day data: ${JSON.stringify(md)}. Respond ONLY with a raw JSON array: [{"ticker": "...", "percentage": 40, "amount": 400, "reasoning": "..."}]`;
+      const prompt = `Allocate $${budget} across these tickers based on this 7-day data: ${JSON.stringify(md)}. Respond ONLY with a JSON object containing a "portfolio" array: {"portfolio": [{"ticker": "...", "percentage": 40, "amount": 400, "reasoning": "..."}]}`;
       try {
-        const jm = genAI.getGenerativeModel({
-          model: "gemini-2.5-flash",
-          generationConfig: { responseMimeType: "application/json" },
+        const jm = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: prompt }],
+          response_format: { type: "json_object" },
         });
+        // 4. Безопасное извлечение с помощью ?.
         finalPortfolio = JSON.parse(
-          (
-            await executeWithRetry(() => jm.generateContent(prompt))
-          ).response.text(),
-        );
+          jm.choices[0]?.message?.content || "{}",
+        ).portfolio;
         apiResponse = {
           success: "Allocated",
           portfolio_string: JSON.stringify(finalPortfolio),
         };
       } catch (e) {
-        apiResponse = { error: "Failed portfolio allocation due to API load." };
+        apiResponse = { error: "Failed allocation." };
       }
-    } else if (call.name === "execute_trade") {
-      detectedTicker = (call.args as any).ticker.toUpperCase();
+    } else if (funcName === "execute_trade") {
+      detectedTicker = args.ticker.toUpperCase();
       const p = await getStockPrice(detectedTicker!);
       if (p.error || !p.price) {
         apiResponse = { error: "Price unavailable." };
       } else {
-        const orderType = (call.args as any).orderType || "market";
-        const limitPrice = (call.args as any).limitPrice;
+        const orderType = args.orderType || "market";
+        const limitPrice = args.limitPrice;
         apiResponse = executeTradeCallback
           ? await executeTradeCallback(
               detectedTicker!,
-              (call.args as any).action.toUpperCase(),
-              (call.args as any).shares,
+              args.action.toUpperCase(),
+              args.shares,
               orderType,
               limitPrice || p.price,
             )
-          : { error: "No callback provided." };
+          : { error: "No callback." };
       }
     }
 
-    // Final check to see what the agent has to say after tools execute
-    const finalResult = await executeWithRetry(() =>
-      chat.sendMessage([
-        { functionResponse: { name: call.name, response: apiResponse } },
-      ]),
-    );
+    // Append the assistant's tool call and the tool's result to the message array
+    messages.push(message);
+    messages.push({
+      role: "tool",
+      tool_call_id: toolCall.id,
+      content: JSON.stringify(apiResponse),
+    });
+
+    // Get the final human-readable response from OpenAI
+    const finalResult = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: messages,
+    });
 
     const replyText =
-      finalResult.response.text() || "The task has been completed.";
+      finalResult.choices[0]?.message?.content ||
+      "Here is the requested analysis:";
     return {
       text: replyText,
       chartData: finalChartData,
@@ -460,6 +463,6 @@ export async function runTradingAgentStep(
       sentimentData: finalSentiment,
     };
   } else {
-    return { text: result.response.text() };
+    return { text: message.content || "No response generated." };
   }
 }
