@@ -14,6 +14,7 @@ import {
   Newspaper,
   Gauge,
   Briefcase,
+  Cpu,
 } from "lucide-react";
 
 interface ISeriesApi {
@@ -126,7 +127,6 @@ interface PendingOrder {
   status: string;
 }
 
-// --- WIDGETS ---
 function FundamentalWidget({ data }: { data?: FundamentalData }) {
   if (!data) return null;
   return (
@@ -446,7 +446,6 @@ function TradingChart({
   );
 }
 
-// --- MAIN APP ---
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -459,6 +458,7 @@ export default function App() {
   const [inputMessage, setInputMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isLive, setIsLive] = useState(false);
+  const [isAutopilot, setIsAutopilot] = useState(false); // Autopilot state
 
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>([
     { ticker: "TSLA", name: "Tesla Inc.", price: 0, change: 0, isUp: true },
@@ -516,6 +516,22 @@ export default function App() {
           setUserPortfolio(data.portfolio);
           setPendingOrders(data.orders);
           setWatchlist(data.watchlist);
+        } else if (data.type === "autopilot_log") {
+          // Listen for autonomous messages from the backend loop
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: Date.now().toString(),
+              role: "agent",
+              content: `[AUTOPILOT LOG]\n${data.message}`,
+              chartData: data.chartData,
+              ticker: data.ticker,
+              portfolio: data.portfolio,
+              technicalData: data.technicalData,
+              sentimentData: data.sentimentData,
+              fundamentalData: data.fundamentalData,
+            },
+          ]);
         }
       } catch (e) {
         console.error("Error parsing stream data:", e);
@@ -526,6 +542,31 @@ export default function App() {
       eventSource.close();
     };
   }, []);
+
+  // Autopilot Toggle Request
+  const toggleAutopilot = async () => {
+    const newState = !isAutopilot;
+    setIsAutopilot(newState);
+    try {
+      await fetch("http://localhost:3000/api/autopilot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: newState }),
+      });
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: Date.now().toString(),
+          role: "system",
+          content: `AUTOPILOT: ${newState ? "ACTIVE. Engine is scanning the market autonomously every 60 seconds." : "DISABLED. Manual override engaged."}`,
+        },
+      ]);
+    } catch (error) {
+      console.error("Autopilot toggle request failed", error);
+      setIsAutopilot(!newState);
+    }
+  };
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -587,21 +628,33 @@ export default function App() {
         <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-5 pointer-events-none"></div>
 
         <aside className="w-full md:w-80 bg-[#161D30] border-b md:border-b-0 md:border-r border-slate-800/80 p-5 flex flex-col shrink-0 z-10 overflow-y-auto scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
-          <div className="flex items-center space-x-3.5 mb-6">
-            <div className="w-9 h-9 bg-blue-600/20 rounded-lg flex items-center justify-center border border-blue-500/20">
-              <Activity className="w-5 h-5 text-blue-400" />
-            </div>
-            <div>
-              <h2 className="text-md font-semibold text-white tracking-wide">
-                Alexul-AI Hub
-              </h2>
-              <div className="flex items-center space-x-1.5">
-                <span className="flex w-2.5 h-2.5 bg-emerald-500 rounded-full animate-pulse"></span>
-                <span className="text-[11px] text-slate-400 font-mono">
-                  NODE ACTIVE
-                </span>
+          <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center space-x-3.5">
+              <div className="w-9 h-9 bg-blue-600/20 rounded-lg flex items-center justify-center border border-blue-500/20">
+                <Activity className="w-5 h-5 text-blue-400" />
+              </div>
+              <div>
+                <h2 className="text-md font-semibold text-white tracking-wide">
+                  Alexul-AI Hub
+                </h2>
+                <div className="flex items-center space-x-1.5">
+                  <span className="flex w-2.5 h-2.5 bg-emerald-500 rounded-full animate-pulse"></span>
+                  <span className="text-[11px] text-slate-400 font-mono">
+                    NODE ACTIVE
+                  </span>
+                </div>
               </div>
             </div>
+
+            <button
+              onClick={toggleAutopilot}
+              className={`p-2 rounded-lg border transition-all shadow-sm group relative ${isAutopilot ? "bg-emerald-500/20 border-emerald-500/50 text-emerald-400" : "bg-[#1F2937] border-slate-700 text-slate-400 hover:border-slate-500"}`}
+              title={isAutopilot ? "Disable Autopilot" : "Enable Autopilot"}
+            >
+              <Cpu
+                className={`w-5 h-5 ${isAutopilot ? "animate-pulse" : ""}`}
+              />
+            </button>
           </div>
 
           <div className="mb-6 bg-[#0B0F19] rounded-xl border border-slate-800/80 p-4">
@@ -799,9 +852,15 @@ export default function App() {
               </p>
             </div>
             <div className="flex items-center space-x-2 text-xs">
-              <span className="flex items-center bg-[#0B0F19] px-3 py-1.5 rounded border border-slate-800 text-[10px] font-mono text-emerald-400">
-                <TrendingUp className="w-3.5 h-3.5 mr-1.5" />
-                Live Feed Connective
+              <span
+                className={`flex items-center px-3 py-1.5 rounded border text-[10px] font-mono transition-colors ${isAutopilot ? "bg-emerald-500/10 border-emerald-500/40 text-emerald-400" : "bg-[#0B0F19] border-slate-800 text-slate-500"}`}
+              >
+                {isAutopilot ? (
+                  <Cpu className="w-3.5 h-3.5 mr-1.5 animate-pulse" />
+                ) : (
+                  <TrendingUp className="w-3.5 h-3.5 mr-1.5" />
+                )}
+                {isAutopilot ? "AUTOPILOT ENGAGED" : "MANUAL OVERRIDE"}
               </span>
             </div>
           </header>
@@ -816,8 +875,14 @@ export default function App() {
                   className={`max-w-[90%] md:max-w-[80%] rounded-xl px-4 py-3 shadow-sm flex items-start space-x-3.5 ${msg.role === "user" ? "bg-blue-600 text-white ml-auto rounded-br-sm" : msg.role === "system" ? "bg-rose-500/10 border border-rose-500/20 text-rose-300 w-full justify-center" : "bg-[#1F2937] border border-slate-800/80 text-slate-200 rounded-bl-sm"}`}
                 >
                   {msg.role === "agent" && (
-                    <div className="w-8 h-8 rounded bg-blue-500/10 border border-blue-500/20 flex items-center justify-center flex-shrink-0 mt-0.5">
-                      <Bot className="w-4.5 h-4.5 text-blue-400" />
+                    <div
+                      className={`w-8 h-8 rounded border flex items-center justify-center flex-shrink-0 mt-0.5 ${msg.content.includes("[AUTOPILOT LOG]") ? "bg-emerald-500/10 border-emerald-500/20" : "bg-blue-500/10 border-blue-500/20"}`}
+                    >
+                      {msg.content.includes("[AUTOPILOT LOG]") ? (
+                        <Cpu className="w-4.5 h-4.5 text-emerald-400" />
+                      ) : (
+                        <Bot className="w-4.5 h-4.5 text-blue-400" />
+                      )}
                     </div>
                   )}
                   {msg.role === "system" && (
@@ -825,7 +890,9 @@ export default function App() {
                   )}
 
                   <div className="flex-1 overflow-hidden">
-                    <p className="text-[13px] sm:text-[14px] leading-relaxed whitespace-pre-wrap">
+                    <p
+                      className={`text-[13px] sm:text-[14px] leading-relaxed whitespace-pre-wrap ${msg.content.includes("[AUTOPILOT LOG]") ? "text-emerald-100 font-mono text-xs" : ""}`}
+                    >
                       {msg.content}
                     </p>
 
@@ -884,12 +951,12 @@ export default function App() {
                 value={inputMessage}
                 onChange={(e) => setInputMessage(e.target.value)}
                 placeholder="Ask e.g., 'What are the fundamentals for MSFT?'..."
-                disabled={isLoading}
-                className="flex-1 bg-transparent border-none focus:outline-none text-[13px] text-white placeholder-slate-500 px-4 py-2"
+                disabled={isLoading || isAutopilot}
+                className={`flex-1 bg-transparent border-none focus:outline-none text-[13px] text-white placeholder-slate-500 px-4 py-2 ${isAutopilot ? "opacity-50 cursor-not-allowed" : ""}`}
               />
               <button
                 type="submit"
-                disabled={isLoading || !inputMessage.trim()}
+                disabled={isLoading || !inputMessage.trim() || isAutopilot}
                 className="bg-blue-600 text-white px-4 py-2.5 rounded-lg hover:bg-blue-500 disabled:opacity-50 disabled:hover:bg-blue-600 transition-colors shadow-sm flex items-center"
               >
                 <Send className="w-4 h-4 mr-2" />

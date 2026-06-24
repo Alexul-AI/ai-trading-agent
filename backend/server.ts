@@ -14,6 +14,7 @@ app.use(express.json());
 app.use(cors({ origin: "http://localhost:5173" }));
 
 // Alpaca API setup
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 const alpaca = new (Alpaca as any)({
   keyId: process.env.APCA_API_KEY_ID,
   secretKey: process.env.APCA_API_SECRET_KEY,
@@ -36,6 +37,7 @@ const getAlpacaPortfolio = async () => {
       }
     > = {};
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     positions.forEach((p: any) => {
       posMap[p.symbol] = {
         shares: parseFloat(p.qty),
@@ -72,6 +74,7 @@ const executeAlpacaTrade = async (
       `[ALPACA] Sending ${action} ${orderType.toUpperCase()} order for ${shares}x ${ticker}...`,
     );
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const orderPayload: any = {
       symbol: ticker,
       qty: shares,
@@ -102,14 +105,25 @@ const executeAlpacaTrade = async (
     return {
       success: `Order placed successfully at broker: ${action} ${shares} shares of ${ticker}. Type: ${orderType}. Current status: ${order.status}.`,
     };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } catch (error: any) {
     console.warn(`[ALPACA] Trade rejected by broker: ${error.message}`);
     return { error: `Broker rejected the trade: ${error.message}` };
   }
 };
 
-// --- LIVE DATA STREAMING (Server-Sent Events) ---
+// --- AUTOPILOT STATE & SSE ---
 let connectedClients: express.Response[] = [];
+let isAutopilotEnabled = false;
+let isProcessingAutopilot = false;
+
+app.post("/api/autopilot", (req, res) => {
+  isAutopilotEnabled = req.body.enabled;
+  console.log(
+    `[AUTOPILOT] Engine status: ${isAutopilotEnabled ? "ENABLED" : "DISABLED"}`,
+  );
+  res.json({ enabled: isAutopilotEnabled });
+});
 
 app.get("/api/stream", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
@@ -118,25 +132,18 @@ app.get("/api/stream", (req, res) => {
   res.flushHeaders();
 
   connectedClients.push(res);
-  console.log(
-    `[STREAM] New client connected. Total clients: ${connectedClients.length}`,
-  );
-
   req.on("close", () => {
     connectedClients = connectedClients.filter((client) => client !== res);
-    console.log(
-      `[STREAM] Client disconnected. Total clients: ${connectedClients.length}`,
-    );
   });
 });
 
-// The Heartbeat: Polls the broker and market data every 3 seconds and pushes to all connected clients
+// The Heartbeat: Polls portfolio/watchlist every 3 seconds
 setInterval(async () => {
   if (connectedClients.length === 0) return;
-
   try {
     const portfolio = await getAlpacaPortfolio();
     const orders = await alpaca.getOrders({ status: "open" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const formattedOrders = orders.map((o: any) => ({
       id: o.id,
       ticker: o.symbol,
@@ -147,6 +154,7 @@ setInterval(async () => {
       status: o.status,
     }));
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const activeTickers = Array.from(
       new Set([
         "TSLA",
@@ -165,25 +173,78 @@ setInterval(async () => {
       orders: formattedOrders,
       watchlist,
     });
+    connectedClients.forEach((client) => client.write(`data: ${payload}\n\n`));
+  } catch (error) {
+    // Silent catch
+  }
+}, 3000);
+
+// AUTOPILOT LOOP: Runs every 60 seconds to scan the market autonomously
+setInterval(async () => {
+  if (
+    !isAutopilotEnabled ||
+    isProcessingAutopilot ||
+    connectedClients.length === 0
+  )
+    return;
+
+  isProcessingAutopilot = true;
+  try {
+    console.log("[AUTOPILOT] Initiating autonomous market scan...");
+
+    const prompt = `[AUTOPILOT MODE] Perform a fast market scan for AAPL, TSLA, and VRNS. Check their technical indicators or news. If you identify a highly profitable trade setup, execute a BUY order immediately. Otherwise, briefly state that you are holding cash and observing. Keep the text extremely concise.`;
+
+    const activities = await alpaca.getAccountActivities({
+      activityTypes: ["FILL"],
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const transactionHistory = activities.map((a: any) => ({
+      ticker: a.symbol,
+      action: a.side.toUpperCase(),
+      shares: parseFloat(a.qty),
+      price: parseFloat(a.price),
+      date: a.transaction_time,
+    }));
+
+    const agentResponse = await runTradingAgentStep(
+      prompt,
+      [],
+      transactionHistory,
+      executeAlpacaTrade,
+    );
+
+    const payload = JSON.stringify({
+      type: "autopilot_log",
+      message: agentResponse.text,
+      chartData: agentResponse.chartData,
+      ticker: agentResponse.ticker,
+      portfolio: agentResponse.portfolio,
+      technicalData: agentResponse.technicalData,
+      sentimentData: agentResponse.sentimentData,
+      fundamentalData: agentResponse.fundamentalData,
+    });
 
     connectedClients.forEach((client) => client.write(`data: ${payload}\n\n`));
   } catch (error) {
-    // Silently catch polling errors to prevent stream crash
+    console.error("[AUTOPILOT] Cycle error:", error);
+  } finally {
+    isProcessingAutopilot = false;
   }
-}, 3000);
+}, 60000);
 
 // --- STANDARD ENDPOINTS ---
 app.get("/api/portfolio", async (req, res) => {
   try {
     res.json(await getAlpacaPortfolio());
   } catch (error) {
-    res.status(500).json({ error: "Failed to fetch portfolio" });
+    res.status(500).json({ error: "Failed to fetch" });
   }
 });
 
 app.get("/api/orders", async (req, res) => {
   try {
     const orders = await alpaca.getOrders({ status: "open" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     res.json(
       orders.map((o: any) => ({
         id: o.id,
@@ -196,27 +257,7 @@ app.get("/api/orders", async (req, res) => {
       })),
     );
   } catch (error) {
-    res.status(500).json({ error: "Failed to fetch orders" });
-  }
-});
-
-app.get("/api/history", async (req, res) => {
-  try {
-    const activities = await alpaca.getAccountActivities({
-      activityTypes: ["FILL"],
-    });
-    res.json(
-      activities.map((a: any) => ({
-        id: a.id,
-        ticker: a.symbol,
-        action: a.side.toUpperCase(),
-        shares: parseFloat(a.qty),
-        price: parseFloat(a.price),
-        date: a.transaction_time,
-      })),
-    );
-  } catch (error) {
-    res.status(500).json({ error: "Failed to fetch history" });
+    res.status(500).json({ error: "Failed to fetch" });
   }
 });
 
@@ -253,6 +294,7 @@ app.post("/api/chat", async (req, res) => {
     const activities = await alpaca.getAccountActivities({
       activityTypes: ["FILL"],
     });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const transactionHistory = activities.map((a: any) => ({
       ticker: a.symbol,
       action: a.side.toUpperCase(),
@@ -273,7 +315,7 @@ app.post("/api/chat", async (req, res) => {
       portfolio: agentResponse.portfolio,
       technicalData: agentResponse.technicalData,
       sentimentData: agentResponse.sentimentData,
-      fundamentalData: agentResponse.fundamentalData, // Passing the fundamental payload to UI
+      fundamentalData: agentResponse.fundamentalData,
     });
   } catch (error) {
     console.error("Chat API error:", error);

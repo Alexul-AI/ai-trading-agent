@@ -111,7 +111,8 @@ const SYSTEM_PROMPT = `You are an AI Trading Assistant. STRICT UI AND BEHAVIOR R
 3. When asked to analyze a portfolio, respond ONLY with a valid JSON array.
 4. RISK MANAGEMENT IS AUTOMATIC: BUY orders automatically attach Stop-Loss (-5%) and Take-Profit (+15%).
 5. CHARTS: ALWAYS invoke 'get_historical_prices' if the user asks for a chart.
-6. FUNDAMENTALS: Invoke 'get_fundamental_data' for valuation, P/E, market cap, dividends.`;
+6. FUNDAMENTALS: Invoke 'get_fundamental_data' for valuation, P/E, market cap, dividends.
+7. AUTOPILOT MODE: If the user prompt starts with "[AUTOPILOT MODE]", you are running autonomously. Make decisions quickly. Keep your text response extremely brief (1-2 sentences max). Do not ask follow-up questions in autopilot mode.`;
 
 const tools: any[] = [
   {
@@ -528,7 +529,7 @@ export async function runTradingAgentStep(
         tool_call_id: toolCall.id,
         content: JSON.stringify(apiResponse),
       });
-    } 
+    }
 
     const finalResult = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -536,7 +537,7 @@ export async function runTradingAgentStep(
     });
     const replyText =
       finalResult.choices[0]?.message?.content ||
-      "Here is the requested analysis:";
+      "Here is the requested analysis.";
 
     return {
       text: replyText,
