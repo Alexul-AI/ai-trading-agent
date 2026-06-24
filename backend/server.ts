@@ -147,7 +147,6 @@ setInterval(async () => {
       status: o.status,
     }));
 
-    // Determine which tickers we need live prices for (Default Watchlist + Anything currently owned/pending)
     const activeTickers = Array.from(
       new Set([
         "TSLA",
@@ -274,6 +273,7 @@ app.post("/api/chat", async (req, res) => {
       portfolio: agentResponse.portfolio,
       technicalData: agentResponse.technicalData,
       sentimentData: agentResponse.sentimentData,
+      fundamentalData: agentResponse.fundamentalData, // Passing the fundamental payload to UI
     });
   } catch (error) {
     console.error("Chat API error:", error);

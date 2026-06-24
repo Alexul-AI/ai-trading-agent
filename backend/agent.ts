@@ -33,6 +33,16 @@ export interface SentimentData {
   sentiment: "BULLISH" | "BEARISH" | "NEUTRAL";
   summary: string;
 }
+export interface FundamentalData {
+  ticker: string;
+  marketCap: string;
+  peRatio: string;
+  forwardPE: string;
+  dividendYield: string;
+  fiftyTwoWeekHigh: string;
+  fiftyTwoWeekLow: string;
+  analystRating: string;
+}
 
 export interface AgentResponse {
   text: string;
@@ -41,6 +51,7 @@ export interface AgentResponse {
   portfolio?: PortfolioAllocation[] | undefined;
   technicalData?: TechnicalData | undefined;
   sentimentData?: SentimentData | undefined;
+  fundamentalData?: FundamentalData | undefined;
 }
 
 // --- TECHNICAL ANALYSIS ---
@@ -94,14 +105,13 @@ function calculateMACD(prices: number[]): {
 }
 
 // --- OPENAI TOOLS SETUP ---
-const SYSTEM_PROMPT = `You are an AI Trading Assistant. STRICT ANTI-HALLUCINATION RULES:
-1. NEVER pretend to execute trades using plain text. You MUST ALWAYS invoke the 'execute_trade' tool if the user wants to buy or sell.
-2. Do NOT output raw numbers that are already displayed in UI widgets (like RSI or Portfolio JSON).
-3. When asked to analyze a portfolio, respond ONLY with a valid JSON array of objects.
-4. You can execute 'market' orders or 'limit' orders. If the user specifies a target price, use a 'limit' order.
-5. RISK MANAGEMENT IS AUTOMATIC: When you issue a BUY order, the backend will automatically attach strict Stop-Loss (-5%) and Take-Profit (+15%) bracket orders. You do not need to calculate them manually.
-6. YOU CAN DISPLAY CHARTS! If the user asks for a chart, a trend, or historical prices, ALWAYS invoke the 'get_historical_prices' tool. The frontend has a built-in interactive chart widget that will automatically render the data you fetch. NEVER apologize or say you can't display charts.
-7. FUNDAMENTAL ANALYSIS: If the user asks if a stock is a good long-term investment, or asks for valuation, P/E ratio, market cap, or dividends, invoke the 'get_fundamental_data' tool to provide deep financial context.`;
+const SYSTEM_PROMPT = `You are an AI Trading Assistant. STRICT UI AND BEHAVIOR RULES:
+1. NEVER pretend to execute trades using plain text. ALWAYS invoke 'execute_trade'.
+2. STRICT RULE AGAINST DATA ECHOING: When you invoke tools like 'get_fundamental_data', 'get_technical_indicators', or 'analyze_portfolio', the user interface will automatically render beautiful widgets with the exact raw numbers (e.g., P/E ratio, Market Cap). DO NOT output bullet points repeating these numbers in your text response. Simply acknowledge the data and provide a high-level analytical conclusion.
+3. When asked to analyze a portfolio, respond ONLY with a valid JSON array.
+4. RISK MANAGEMENT IS AUTOMATIC: BUY orders automatically attach Stop-Loss (-5%) and Take-Profit (+15%).
+5. CHARTS: ALWAYS invoke 'get_historical_prices' if the user asks for a chart.
+6. FUNDAMENTALS: Invoke 'get_fundamental_data' for valuation, P/E, market cap, dividends.`;
 
 const tools: any[] = [
   {
@@ -195,7 +205,6 @@ const tools: any[] = [
       },
     },
   },
-  // NEW TOOL: Fundamental Analysis
   {
     type: "function",
     function: {
@@ -249,7 +258,7 @@ async function getHistoricalPrices(
                 month: "short",
                 day: "numeric",
               }),
-              time: d.toISOString().split("T")[0], // Formatted time for TradingView
+              time: d.toISOString().split("T")[0],
               price: parseFloat(i.close.toFixed(2)),
             };
           }),
@@ -272,12 +281,10 @@ async function getNewsSentiment(ticker: string) {
   }
 }
 
-// NEW FUNCTION: Fetch Fundamental Data
 async function getFundamentalData(ticker: string) {
   try {
     const quote = (await yahooFinance.quote(ticker)) as any;
 
-    // Safely extract and format fundamental metrics
     const formatNumber = (num: number) => {
       if (!num) return "N/A";
       if (num >= 1e12) return (num / 1e12).toFixed(2) + " Trillion";
@@ -294,9 +301,15 @@ async function getFundamentalData(ticker: string) {
       dividendYield: quote.trailingAnnualDividendYield
         ? (quote.trailingAnnualDividendYield * 100).toFixed(2) + "%"
         : "0.00%",
-      fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh || "N/A",
-      fiftyTwoWeekLow: quote.fiftyTwoWeekLow || "N/A",
-      analystRating: quote.averageAnalystRating || "N/A",
+      fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh
+        ? quote.fiftyTwoWeekHigh.toFixed(2)
+        : "N/A",
+      fiftyTwoWeekLow: quote.fiftyTwoWeekLow
+        ? quote.fiftyTwoWeekLow.toFixed(2)
+        : "N/A",
+      analystRating: quote.averageAnalystRating
+        ? quote.averageAnalystRating.toString()
+        : "N/A",
     };
   } catch (e) {
     return { error: `Fundamental data for ${ticker} could not be retrieved.` };
@@ -366,6 +379,7 @@ export async function runTradingAgentStep(
   let finalPortfolio: PortfolioAllocation[] | undefined;
   let finalTechData: TechnicalData | undefined;
   let finalSentiment: SentimentData | undefined;
+  let finalFundamental: FundamentalData | undefined;
 
   if (message.tool_calls && message.tool_calls.length > 0) {
     messages.push(message);
@@ -501,10 +515,12 @@ export async function runTradingAgentStep(
               )
             : { error: "No callback." };
         }
-        // NEW BRANCH: Handle Fundamental Data request
       } else if (funcName === "get_fundamental_data") {
         detectedTicker = args.ticker.toUpperCase();
         apiResponse = await getFundamentalData(detectedTicker!);
+        if (!apiResponse.error) {
+          finalFundamental = apiResponse as FundamentalData;
+        }
       }
 
       messages.push({
@@ -512,7 +528,7 @@ export async function runTradingAgentStep(
         tool_call_id: toolCall.id,
         content: JSON.stringify(apiResponse),
       });
-    }
+    } 
 
     const finalResult = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -520,7 +536,7 @@ export async function runTradingAgentStep(
     });
     const replyText =
       finalResult.choices[0]?.message?.content ||
-      "Here is the requested chart and analysis:";
+      "Here is the requested analysis:";
 
     return {
       text: replyText,
@@ -529,6 +545,7 @@ export async function runTradingAgentStep(
       portfolio: finalPortfolio,
       technicalData: finalTechData,
       sentimentData: finalSentiment,
+      fundamentalData: finalFundamental,
     };
   } else {
     return { text: message.content || "No response generated." };

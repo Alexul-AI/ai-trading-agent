@@ -13,10 +13,42 @@ import {
   Wallet,
   Newspaper,
   Gauge,
+  Briefcase,
 } from "lucide-react";
-// FIX: Separated type imports from value imports for verbatimModuleSyntax
-import { createChart, ColorType, AreaSeries } from "lightweight-charts";
-import type { IChartApi, Time } from "lightweight-charts";
+
+interface ISeriesApi {
+  setData(data: Array<{ time: string; value: number }>): void;
+}
+
+interface ITimeScaleApi {
+  fitContent(): void;
+}
+
+interface IChartApi {
+  addAreaSeries(options: {
+    lineColor: string;
+    topColor: string;
+    bottomColor: string;
+    lineWidth: number;
+  }): ISeriesApi;
+  timeScale(): ITimeScaleApi;
+  applyOptions(options: { width: number }): void;
+  remove(): void;
+}
+
+interface LightweightChartsAPI {
+  createChart(
+    container: HTMLElement,
+    options: Record<string, unknown>,
+  ): IChartApi;
+  ColorType: { Solid: string };
+}
+
+declare global {
+  interface Window {
+    LightweightCharts?: LightweightChartsAPI;
+  }
+}
 
 interface ChartPoint {
   date: string;
@@ -40,6 +72,16 @@ interface SentimentData {
   sentiment: "BULLISH" | "BEARISH" | "NEUTRAL";
   summary: string;
 }
+interface FundamentalData {
+  ticker: string;
+  marketCap: string;
+  peRatio: string;
+  forwardPE: string;
+  dividendYield: string;
+  fiftyTwoWeekHigh: string;
+  fiftyTwoWeekLow: string;
+  analystRating: string;
+}
 
 interface Message {
   id: string;
@@ -50,6 +92,7 @@ interface Message {
   portfolio?: PortfolioAllocation[];
   technicalData?: TechnicalData;
   sentimentData?: SentimentData;
+  fundamentalData?: FundamentalData;
 }
 
 interface WatchlistItem {
@@ -84,6 +127,66 @@ interface PendingOrder {
 }
 
 // --- WIDGETS ---
+function FundamentalWidget({ data }: { data?: FundamentalData }) {
+  if (!data) return null;
+  return (
+    <div className="mt-4 bg-[#0B0F19] rounded-lg p-4 border border-slate-800/80 w-full">
+      <div className="flex items-center mb-4 pb-3 border-b border-slate-800/80">
+        <Briefcase className="w-4 h-4 text-blue-400 mr-2" />
+        <span className="text-xs font-semibold uppercase tracking-wider text-blue-400">
+          Fundamental Analysis
+        </span>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        <div className="bg-[#111827] p-2.5 rounded border border-slate-800/50">
+          <div className="text-[10px] text-slate-500 mb-0.5">Market Cap</div>
+          <div className="font-mono text-xs text-white font-bold">
+            {data.marketCap}
+          </div>
+        </div>
+        <div className="bg-[#111827] p-2.5 rounded border border-slate-800/50">
+          <div className="text-[10px] text-slate-500 mb-0.5">P/E Ratio</div>
+          <div className="font-mono text-xs text-white font-bold">
+            {data.peRatio}
+          </div>
+        </div>
+        <div className="bg-[#111827] p-2.5 rounded border border-slate-800/50">
+          <div className="text-[10px] text-slate-500 mb-0.5">Forward P/E</div>
+          <div className="font-mono text-xs text-white font-bold">
+            {data.forwardPE}
+          </div>
+        </div>
+        <div className="bg-[#111827] p-2.5 rounded border border-slate-800/50">
+          <div className="text-[10px] text-slate-500 mb-0.5">Div Yield</div>
+          <div className="font-mono text-xs text-white font-bold">
+            {data.dividendYield}
+          </div>
+        </div>
+        <div className="bg-[#111827] p-2.5 rounded border border-slate-800/50">
+          <div className="text-[10px] text-slate-500 mb-0.5">52W High</div>
+          <div className="font-mono text-xs text-emerald-400 font-bold">
+            ${data.fiftyTwoWeekHigh}
+          </div>
+        </div>
+        <div className="bg-[#111827] p-2.5 rounded border border-slate-800/50">
+          <div className="text-[10px] text-slate-500 mb-0.5">52W Low</div>
+          <div className="font-mono text-xs text-rose-400 font-bold">
+            ${data.fiftyTwoWeekLow}
+          </div>
+        </div>
+      </div>
+      <div className="mt-3 bg-[#111827] p-2.5 rounded border border-slate-800/50 flex justify-between items-center">
+        <span className="text-[10px] text-slate-500">
+          Analyst Rating (1=Buy, 5=Sell)
+        </span>
+        <span className="font-mono text-xs text-emerald-400 font-bold">
+          {data.analystRating}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function SentimentWidget({ data }: { data?: SentimentData }) {
   if (!data) return null;
   const isBull = data.sentiment === "BULLISH";
@@ -252,57 +355,79 @@ function TradingChart({
       }
     };
 
-    const chart = createChart(chartContainerRef.current, {
-      layout: {
-        background: { type: ColorType.Solid, color: "transparent" },
-        textColor: "#64748B",
-      },
-      grid: {
-        vertLines: { color: "rgba(30, 41, 59, 0.3)" },
-        horzLines: { color: "rgba(30, 41, 59, 0.3)" },
-      },
-      width: chartContainerRef.current.clientWidth,
-      height: 250,
-      timeScale: { timeVisible: false, borderColor: "rgba(30, 41, 59, 0.5)" },
-      rightPriceScale: { borderColor: "rgba(30, 41, 59, 0.5)" },
-      // Interactive mode on
-      handleScroll: { mouseWheel: true, pressedMouseMove: true },
-      handleScale: {
-        axisPressedMouseMove: true,
-        mouseWheel: true,
-        pinch: true,
-      },
-    });
+    const renderChart = () => {
+      if (!chartContainerRef.current) return;
 
-    chartRef.current = chart;
+      chartContainerRef.current.innerHTML = "";
 
-    // FIX: Updated API for lightweight-charts v5
-    const areaSeries = chart.addSeries(AreaSeries, {
-      lineColor: "#3B82F6",
-      topColor: "rgba(59, 130, 246, 0.4)",
-      bottomColor: "rgba(59, 130, 246, 0.0)",
-      lineWidth: 2,
-    });
+      const LightweightCharts = window.LightweightCharts;
+      if (!LightweightCharts) return;
 
-    const formattedData = data
-      .map((d) => ({
-        time: d.time as Time,
-        value: d.price,
-      }))
-      .sort(
-        (a, b) =>
-          new Date(a.time as string).getTime() -
-          new Date(b.time as string).getTime(),
-      );
+      const chart = LightweightCharts.createChart(chartContainerRef.current, {
+        layout: {
+          background: {
+            type: LightweightCharts.ColorType.Solid,
+            color: "transparent",
+          },
+          textColor: "#64748B",
+        },
+        grid: {
+          vertLines: { color: "rgba(30, 41, 59, 0.3)" },
+          horzLines: { color: "rgba(30, 41, 59, 0.3)" },
+        },
+        width: chartContainerRef.current.clientWidth,
+        height: 250,
+        timeScale: { timeVisible: false, borderColor: "rgba(30, 41, 59, 0.5)" },
+        rightPriceScale: { borderColor: "rgba(30, 41, 59, 0.5)" },
+        handleScroll: { mouseWheel: false, pressedMouseMove: false },
+        handleScale: {
+          axisPressedMouseMove: false,
+          mouseWheel: false,
+          pinch: false,
+        },
+      } as Record<string, unknown>);
 
-    areaSeries.setData(formattedData);
-    chart.timeScale().fitContent();
+      chartRef.current = chart;
 
-    window.addEventListener("resize", handleResize);
+      const areaSeries = chart.addAreaSeries({
+        lineColor: "#3B82F6",
+        topColor: "rgba(59, 130, 246, 0.4)",
+        bottomColor: "rgba(59, 130, 246, 0.0)",
+        lineWidth: 2,
+      });
+
+      const formattedData = data
+        .map((d) => ({
+          time: d.time,
+          value: d.price,
+        }))
+        .sort(
+          (a, b) => new Date(a.time).getTime() - new Date(b.time).getTime(),
+        );
+
+      areaSeries.setData(formattedData);
+      chart.timeScale().fitContent();
+
+      window.addEventListener("resize", handleResize);
+    };
+
+    if (!window.LightweightCharts) {
+      const script = document.createElement("script");
+      script.src =
+        "https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js";
+      script.async = true;
+      script.onload = renderChart;
+      document.head.appendChild(script);
+    } else {
+      renderChart();
+    }
 
     return () => {
       window.removeEventListener("resize", handleResize);
-      chart.remove();
+      if (chartRef.current) {
+        chartRef.current.remove();
+        chartRef.current = null;
+      }
     };
   }, [data]);
 
@@ -313,7 +438,7 @@ function TradingChart({
       <div className="flex items-center justify-between mb-4">
         <span className="text-xs font-semibold uppercase tracking-wider text-blue-400 flex items-center">
           <Layers className="w-3.5 h-3.5 mr-1.5" />
-          {ticker} Interactive Chart
+          {ticker} 30-Day Trend
         </span>
       </div>
       <div ref={chartContainerRef} className="w-full relative" />
@@ -357,9 +482,7 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   useEffect(() => scrollToBottom(), [messages]);
 
-  // LIVE STREAM HOOK
   useEffect(() => {
-    let isMounted = true;
     const fetchInitialData = async () => {
       try {
         const tickers = ["TSLA", "AAPL", "VRNS", "LUMI.TA"];
@@ -372,25 +495,21 @@ export default function App() {
           fetch("http://localhost:3000/api/portfolio"),
           fetch("http://localhost:3000/api/orders"),
         ]);
-        if (isMounted) {
-          if (wRes.ok) setWatchlist(await wRes.json());
-          if (pRes.ok) setUserPortfolio(await pRes.json());
-          if (oRes.ok) setPendingOrders(await oRes.json());
-        }
+        if (wRes.ok) setWatchlist(await wRes.json());
+        if (pRes.ok) setUserPortfolio(await pRes.json());
+        if (oRes.ok) setPendingOrders(await oRes.json());
       } catch (error) {
         console.error("Initial data fetch error:", error);
       }
     };
     fetchInitialData();
 
-    // Setup Server-Sent Events (SSE) for Real-Time Updates
     const eventSource = new EventSource("http://localhost:3000/api/stream");
 
     eventSource.onopen = () => setIsLive(true);
     eventSource.onerror = () => setIsLive(false);
 
     eventSource.onmessage = (event) => {
-      if (!isMounted) return;
       try {
         const data = JSON.parse(event.data);
         if (data.type === "update") {
@@ -404,7 +523,6 @@ export default function App() {
     };
 
     return () => {
-      isMounted = false;
       eventSource.close();
     };
   }, []);
@@ -444,6 +562,7 @@ export default function App() {
           portfolio: data.portfolio,
           technicalData: data.technicalData,
           sentimentData: data.sentimentData,
+          fundamentalData: data.fundamentalData,
         },
       ]);
     } catch (error) {
@@ -602,11 +721,11 @@ export default function App() {
               </button>
               <button
                 onClick={() =>
-                  setInputMessage("Show me technical indicators for VRNS")
+                  setInputMessage("What are the fundamentals for MSFT?")
                 }
-                className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-orange-300 transition-all font-medium"
+                className="w-full text-left text-xs bg-[#1F2937]/50 hover:bg-[#1F2937] border border-slate-800/80 px-3 py-2 rounded-md hover:border-slate-700 text-blue-300 transition-all font-medium"
               >
-                📊 VRNS Technicals
+                💼 MSFT Fundamentals
               </button>
             </div>
           </div>
@@ -710,6 +829,7 @@ export default function App() {
                       {msg.content}
                     </p>
 
+                    <FundamentalWidget data={msg.fundamentalData} />
                     <TechnicalWidget data={msg.technicalData} />
                     <SentimentWidget data={msg.sentimentData} />
                     {msg.portfolio && (
@@ -733,7 +853,7 @@ export default function App() {
             ))}
             {isLoading && (
               <div className="flex justify-start">
-                <div className="bg-[#1F2937] border border-slate-800/80 text-slate-200 rounded-xl rounded-bl-sm px-5 py-4 shadow-sm flex items-center space-x-4">
+                <div className="bg-[#111827] border border-slate-800/80 text-slate-200 rounded-xl rounded-bl-sm px-5 py-4 shadow-sm flex items-center space-x-4">
                   <div className="w-8 h-8 rounded bg-blue-500/10 border border-blue-500/20 flex items-center justify-center flex-shrink-0">
                     <Bot className="w-4.5 h-4.5 text-blue-400" />
                   </div>
@@ -763,7 +883,7 @@ export default function App() {
                 type="text"
                 value={inputMessage}
                 onChange={(e) => setInputMessage(e.target.value)}
-                placeholder="Ask e.g., 'Analyze recent news for AAPL'..."
+                placeholder="Ask e.g., 'What are the fundamentals for MSFT?'..."
                 disabled={isLoading}
                 className="flex-1 bg-transparent border-none focus:outline-none text-[13px] text-white placeholder-slate-500 px-4 py-2"
               />
