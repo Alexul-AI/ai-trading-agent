@@ -11,11 +11,61 @@ const openai = new OpenAI({
   maxRetries: 3,
 });
 
+// --- TECHNICAL ANALYSIS HELPERS ---
+function calculateRSI(prices: number[], periods = 14): number {
+  if (prices.length <= periods) return 50;
+  let gains = 0;
+  let losses = 0;
+  for (let i = 1; i <= periods; i++) {
+    const diff = (prices[i] ?? 0) - (prices[i - 1] ?? 0);
+    if (diff > 0) gains += diff;
+    else losses -= diff;
+  }
+  let avgGain = gains / periods;
+  let avgLoss = losses / periods;
+  for (let i = periods + 1; i < prices.length; i++) {
+    const diff = (prices[i] ?? 0) - (prices[i - 1] ?? 0);
+    avgGain = (avgGain * (periods - 1) + (diff > 0 ? diff : 0)) / periods;
+    avgLoss = (avgLoss * (periods - 1) + (diff < 0 ? -diff : 0)) / periods;
+  }
+  if (avgLoss === 0) return 100;
+  return parseFloat((100 - 100 / (1 + avgGain / avgLoss)).toFixed(2));
+}
+
+function calculateEMA(prices: number[], period: number): number[] {
+  const k = 2 / (period + 1);
+  const ema: number[] = [];
+  if (prices.length === 0) return ema;
+  ema.push(prices[0] ?? 0);
+  for (let i = 1; i < prices.length; i++)
+    ema.push((prices[i] ?? 0) * k + (ema[i - 1] ?? 0) * (1 - k));
+  return ema;
+}
+
+function calculateMACD(prices: number[]): {
+  macd: number;
+  signal: number;
+  histogram: number;
+} {
+  if (prices.length < 26) return { macd: 0, signal: 0, histogram: 0 };
+  const ema12 = calculateEMA(prices, 12);
+  const ema26 = calculateEMA(prices, 26);
+  const macdLine = prices.map((_, i) => (ema12[i] ?? 0) - (ema26[i] ?? 0));
+  const signalLine = calculateEMA(macdLine.slice(25), 9);
+  const currentMacd = macdLine[macdLine.length - 1] ?? 0;
+  const currentSignal = signalLine[signalLine.length - 1] ?? 0;
+  return {
+    macd: parseFloat(currentMacd.toFixed(4)),
+    signal: parseFloat(currentSignal.toFixed(4)),
+    histogram: parseFloat((currentMacd - currentSignal).toFixed(4)),
+  };
+}
+
 // --- BACKTEST CONFIGURATION ---
 let virtualBalance = 10000;
 let sharesOwned = 0;
 const TICKER = "TSLA";
-const BACKTEST_DAYS = 30;
+const BACKTEST_DAYS = 60; // Increased to 60 days to allow accurate MACD (26-day EMA) calculation
 
 // Simplified toolset strictly for backtesting execution
 const tools: any[] = [
@@ -38,7 +88,7 @@ const tools: any[] = [
 
 async function runBacktest() {
   console.log(
-    `\n🚀 Starting Backtest: ${TICKER} over the last ${BACKTEST_DAYS} days`,
+    `\n🚀 Starting Advanced Backtest: ${TICKER} over the last ${BACKTEST_DAYS} days`,
   );
   console.log(`💵 Starting Capital: $${virtualBalance}\n`);
 
@@ -63,28 +113,35 @@ async function runBacktest() {
   );
 
   // 2. Simulation: Day-by-Day Loop
-  for (let i = 14; i < dailyQuotes.length; i++) {
-    // Start at day 14 to allow for basic indicator context (like a 14-day RSI)
+  for (let i = 26; i < dailyQuotes.length; i++) {
+    // Start at day 26 to allow for MACD
     const currentDay = dailyQuotes[i];
     const currentPrice = parseFloat(currentDay.close.toFixed(2));
     const dateStr = new Date(currentDay.date).toLocaleDateString("en-US");
 
+    // Calculate Indicators up to this day
+    const historicalPrices = dailyQuotes
+      .slice(0, i + 1)
+      .map((q: any) => parseFloat(q.close.toFixed(2)));
+    const currentRSI = calculateRSI(historicalPrices);
+    const currentMACD = calculateMACD(historicalPrices);
+
     console.log(
-      `\n📅 Day ${i + 1}/${dailyQuotes.length} (${dateStr}) - Price: $${currentPrice}`,
+      `\n📅 Day ${i + 1}/${dailyQuotes.length} (${dateStr}) - Price: $${currentPrice} | RSI: ${currentRSI} | MACD Hist: ${currentMACD.histogram}`,
     );
 
-    // Provide recent context to the AI (acting as its "memory" up to this exact day)
-    const recentPrices = dailyQuotes
-      .slice(i - 14, i + 1)
-      .map((q: any) => parseFloat(q.close.toFixed(2)));
-
     const prompt = `[BACKTEST MODE] The current price of ${TICKER} is $${currentPrice}. 
-      Recent 14-day closing prices: ${JSON.stringify(recentPrices)}.
+      Technical Context:
+      - RSI (14): ${currentRSI} (Under 30 is Oversold/Buy, Over 70 is Overbought/Sell)
+      - MACD Histogram: ${currentMACD.histogram} (Positive implies bullish momentum, Negative implies bearish)
+      
       You have $${virtualBalance.toFixed(2)} in cash and currently own ${sharesOwned} shares.
-      Analyze the immediate trend. 
-      If you see strong upward momentum, BUY 1 share. 
-      If you see a downward trend and you own shares, SELL 1 share to secure profit or cut losses. 
-      If uncertain, do nothing.
+      
+      RULES:
+      1. ONLY BUY if RSI is approaching Oversold (< 40) OR if MACD Histogram turns sharply positive. Buy 1 share.
+      2. ONLY SELL if RSI is Overbought (> 65) AND MACD is weakening, AND you own shares. Sell 1 share to secure profit.
+      3. If conditions are not met, do nothing (HOLD).
+      
       Call 'execute_trade' if you decide to act, or simply reply 'HOLD'.`;
 
     const messages: any[] = [{ role: "user", content: prompt }];
