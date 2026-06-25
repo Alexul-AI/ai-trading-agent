@@ -342,6 +342,22 @@ export async function getWatchlistQuotes(tickers: string[]) {
   );
 }
 
+export async function getTrendingStocks(): Promise<string[]> {
+  try {
+    const query = await yahooFinance.screener({
+      scrIds: "day_gainers",
+      count: 5,
+    });
+    if (query && query.quotes) {
+      return query.quotes.map((q: any) => q.symbol);
+    }
+    return ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"]; // Fallback
+  } catch (error) {
+    console.error("[SCREENER] Error fetching trending stocks:", error);
+    return ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"]; // Fallback
+  }
+}
+
 export async function runTradingAgentStep(
   userMessage: string,
   history: any[] = [],

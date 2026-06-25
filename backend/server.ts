@@ -3,7 +3,11 @@ import cors from "cors";
 import Alpaca from "@alpacahq/alpaca-trade-api";
 import * as dotenv from "dotenv";
 // IMPORTANT: Using .js extension is required when moduleResolution is Node16/NodeNext in tsconfig
-import { runTradingAgentStep, getWatchlistQuotes } from "./agent.js";
+import {
+  runTradingAgentStep,
+  getWatchlistQuotes,
+  getTrendingStocks,
+} from "./agent.js";
 
 dotenv.config();
 
@@ -143,6 +147,26 @@ const executeAlpacaTrade = async (
 let connectedClients: express.Response[] = [];
 let isAutopilotEnabled = false;
 let isProcessingAutopilot = false;
+let dynamicScreenerTickers: string[] = ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"];
+
+// Refresh trending stocks every 15 minutes to avoid rate limits
+setInterval(
+  async () => {
+    dynamicScreenerTickers = await getTrendingStocks();
+    console.log(
+      `[SCREENER] Updated trending tickers: ${dynamicScreenerTickers.join(", ")}`,
+    );
+  },
+  15 * 60 * 1000,
+);
+
+// Fetch immediately on startup
+getTrendingStocks().then((tickers) => {
+  dynamicScreenerTickers = tickers;
+  console.log(
+    `[SCREENER] Initial trending tickers: ${dynamicScreenerTickers.join(", ")}`,
+  );
+});
 
 app.post("/api/autopilot", (req, res) => {
   isAutopilotEnabled = req.body.enabled;
@@ -170,7 +194,6 @@ setInterval(async () => {
   try {
     const portfolio = await getAlpacaPortfolio();
     const orders = await alpaca.getOrders({ status: "open" });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const formattedOrders = orders.map((o: any) => ({
       id: o.id,
       ticker: o.symbol,
@@ -181,13 +204,9 @@ setInterval(async () => {
       status: o.status,
     }));
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const activeTickers = Array.from(
       new Set([
-        "TSLA",
-        "AAPL",
-        "VRNS",
-        "LUMI.TA",
+        ...dynamicScreenerTickers,
         ...Object.keys(portfolio.positions),
         ...formattedOrders.map((o: any) => o.ticker),
       ]),
@@ -207,6 +226,8 @@ setInterval(async () => {
 }, 3000);
 
 // AUTOPILOT LOOP: Runs every 60 seconds to scan the market autonomously
+let lastAutopilotLog = "";
+
 setInterval(async () => {
   if (
     !isAutopilotEnabled ||
@@ -219,7 +240,7 @@ setInterval(async () => {
   try {
     console.log("[AUTOPILOT] Initiating autonomous market scan...");
 
-    const prompt = `[AUTOPILOT MODE] Perform a fast market scan for AAPL, TSLA, and VRNS. Check their technical indicators or news. If you identify a highly profitable trade setup, execute a BUY order immediately. Otherwise, briefly state that you are holding cash and observing. Keep the text extremely concise.`;
+    const prompt = `[AUTOPILOT MODE] Perform a fast market scan for these trending tickers: ${dynamicScreenerTickers.join(", ")}. Check their technical indicators or news. If you identify a highly profitable trade setup, execute a BUY order immediately. Otherwise, briefly state that you are holding cash and observing. Keep the text extremely concise.`;
 
     const activities = await alpaca.getAccountActivities({
       activityTypes: ["FILL"],
@@ -247,18 +268,25 @@ setInterval(async () => {
       await sendTelegramAlert(`🤖 *AUTOPILOT ALERT*\n${agentResponse.text}`);
     }
 
-    const payload = JSON.stringify({
-      type: "autopilot_log",
-      message: agentResponse.text,
-      chartData: agentResponse.chartData,
-      ticker: agentResponse.ticker,
-      portfolio: agentResponse.portfolio,
-      technicalData: agentResponse.technicalData,
-      sentimentData: agentResponse.sentimentData,
-      fundamentalData: agentResponse.fundamentalData,
-    });
+    // Only update UI if the AI's conclusion has changed
+    if (agentResponse.text && agentResponse.text !== lastAutopilotLog) {
+      lastAutopilotLog = agentResponse.text;
 
-    connectedClients.forEach((client) => client.write(`data: ${payload}\n\n`));
+      const payload = JSON.stringify({
+        type: "autopilot_log",
+        message: agentResponse.text,
+        chartData: agentResponse.chartData,
+        ticker: agentResponse.ticker,
+        portfolio: agentResponse.portfolio,
+        technicalData: agentResponse.technicalData,
+        sentimentData: agentResponse.sentimentData,
+        fundamentalData: agentResponse.fundamentalData,
+      });
+
+      connectedClients.forEach((client) =>
+        client.write(`data: ${payload}\n\n`),
+      );
+    }
   } catch (error) {
     console.error("[AUTOPILOT] Cycle error:", error);
   } finally {
@@ -357,10 +385,13 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-app.post("/api/watchlist", async (req, res) => {
-  const { tickers } = req.body;
+app.get("/api/watchlist", async (req, res) => {
   try {
-    res.json(await getWatchlistQuotes(tickers));
+    const portfolio = await getAlpacaPortfolio();
+    const activeTickers = Array.from(
+      new Set([...dynamicScreenerTickers, ...Object.keys(portfolio.positions)]),
+    );
+    res.json(await getWatchlistQuotes(activeTickers));
   } catch (error) {
     res.status(500).json({ error: "Watchlist error" });
   }
