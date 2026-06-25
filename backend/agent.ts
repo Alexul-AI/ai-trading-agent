@@ -367,14 +367,6 @@ export async function runTradingAgentStep(
     { role: "user", content: userMessage },
   ];
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: messages,
-    tools: tools,
-  });
-  const message = response.choices[0]?.message;
-  if (!message) return { text: "No response generated." };
-
   let finalChartData: ChartPoint[] | undefined;
   let detectedTicker: string | undefined;
   let finalPortfolio: PortfolioAllocation[] | undefined;
@@ -382,7 +374,23 @@ export async function runTradingAgentStep(
   let finalSentiment: SentimentData | undefined;
   let finalFundamental: FundamentalData | undefined;
 
-  if (message.tool_calls && message.tool_calls.length > 0) {
+  let response = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: messages,
+    tools: tools,
+  });
+  let message = response.choices[0]?.message;
+
+  // АВТОМАТИЧЕСКАЯ ЦЕПОЧКА ДЕЙСТВИЙ (до 3 шагов)
+  let iterations = 0;
+  const MAX_ITERATIONS = 3;
+
+  while (
+    message &&
+    message.tool_calls &&
+    message.tool_calls.length > 0 &&
+    iterations < MAX_ITERATIONS
+  ) {
     messages.push(message);
 
     for (const toolCall of message.tool_calls) {
@@ -531,24 +539,25 @@ export async function runTradingAgentStep(
       });
     }
 
-    const finalResult = await openai.chat.completions.create({
+    // ПЕРЕЗАПРАШИВАЕМ ИИ С НОВЫМИ ДАННЫМИ
+    response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: messages,
+      tools: tools,
     });
-    const replyText =
-      finalResult.choices[0]?.message?.content ||
-      "Here is the requested analysis.";
-
-    return {
-      text: replyText,
-      chartData: finalChartData,
-      ticker: detectedTicker,
-      portfolio: finalPortfolio,
-      technicalData: finalTechData,
-      sentimentData: finalSentiment,
-      fundamentalData: finalFundamental,
-    };
-  } else {
-    return { text: message.content || "No response generated." };
+    message = response.choices[0]?.message;
+    iterations++;
   }
+
+  const replyText = message?.content || "No response generated.";
+
+  return {
+    text: replyText,
+    chartData: finalChartData,
+    ticker: detectedTicker,
+    portfolio: finalPortfolio,
+    technicalData: finalTechData,
+    sentimentData: finalSentiment,
+    fundamentalData: finalFundamental,
+  };
 }

@@ -7,6 +7,28 @@ import { runTradingAgentStep, getWatchlistQuotes } from "./agent.js";
 
 dotenv.config();
 
+// --- TELEGRAM NOTIFICATIONS ---
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+
+async function sendTelegramAlert(message: string) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: message,
+        parse_mode: "Markdown",
+      }),
+    });
+  } catch (error) {
+    console.error("[TELEGRAM] Failed to send alert", error);
+  }
+}
+
 const app = express();
 const PORT = 3000;
 
@@ -102,10 +124,15 @@ const executeAlpacaTrade = async (
 
     const order = await alpaca.createOrder(orderPayload);
     console.log(`[ALPACA] Order acknowledged! Status: ${order.status}`);
+
+    // SEND TELEGRAM ALERT
+    await sendTelegramAlert(
+      `🚨 *TRADE EXECUTED* 🚨\nAction: *${action.toUpperCase()}*\nAsset: *${shares}x ${ticker}*\nType: ${orderType.toUpperCase()}\nStatus: ${order.status}`,
+    );
+
     return {
       success: `Order placed successfully at broker: ${action} ${shares} shares of ${ticker}. Type: ${orderType}. Current status: ${order.status}.`,
     };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } catch (error: any) {
     console.warn(`[ALPACA] Trade rejected by broker: ${error.message}`);
     return { error: `Broker rejected the trade: ${error.message}` };
@@ -197,7 +224,6 @@ setInterval(async () => {
     const activities = await alpaca.getAccountActivities({
       activityTypes: ["FILL"],
     });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const transactionHistory = activities.map((a: any) => ({
       ticker: a.symbol,
       action: a.side.toUpperCase(),
@@ -212,6 +238,14 @@ setInterval(async () => {
       transactionHistory,
       executeAlpacaTrade,
     );
+
+    // Send Telegram alert ONLY if autopilot decided to do something significant (not just holding cash)
+    if (
+      agentResponse.text &&
+      !agentResponse.text.toLowerCase().includes("holding cash")
+    ) {
+      await sendTelegramAlert(`🤖 *AUTOPILOT ALERT*\n${agentResponse.text}`);
+    }
 
     const payload = JSON.stringify({
       type: "autopilot_log",
