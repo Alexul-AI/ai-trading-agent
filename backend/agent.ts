@@ -4,7 +4,18 @@ import YahooFinance from "yahoo-finance2";
 
 dotenv.config();
 
-const yahooFinance = new YahooFinance({ suppressNotices: ["yahooSurvey"] });
+// 1. Initialize Yahoo Finance with standard constructor options
+const yahooFinance = new YahooFinance({
+  suppressNotices: ["yahooSurvey"],
+});
+
+// 2. Disable validation globally using the correct API method (Typescript safe bypass!)
+(yahooFinance as any).setGlobalConfig({
+  validation: {
+    logErrors: false,
+    throwErrors: false,
+  },
+});
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -397,7 +408,6 @@ export async function runTradingAgentStep(
   });
   let message = response.choices[0]?.message;
 
-  // АВТОМАТИЧЕСКАЯ ЦЕПОЧКА ДЕЙСТВИЙ (до 3 шагов)
   let iterations = 0;
   const MAX_ITERATIONS = 3;
 
@@ -555,7 +565,6 @@ export async function runTradingAgentStep(
       });
     }
 
-    // ПЕРЕЗАПРАШИВАЕМ ИИ С НОВЫМИ ДАННЫМИ
     response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: messages,

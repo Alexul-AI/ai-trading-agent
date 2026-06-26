@@ -8,6 +8,7 @@ import {
   getWatchlistQuotes,
   getTrendingStocks,
 } from "./agent.js";
+import { logTrade } from "./db.js";
 
 dotenv.config();
 
@@ -37,7 +38,9 @@ const app = express();
 const PORT = 3000;
 
 app.use(express.json());
-app.use(cors({ origin: "http://localhost:5173" }));
+app.use(
+  cors({ origin: process.env.FRONTEND_ORIGIN || "http://localhost:5173" }),
+);
 
 // Alpaca API setup
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -129,9 +132,13 @@ const executeAlpacaTrade = async (
     const order = await alpaca.createOrder(orderPayload);
     console.log(`[ALPACA] Order acknowledged! Status: ${order.status}`);
 
-    // SEND TELEGRAM ALERT
-    await sendTelegramAlert(
-      `🚨 *TRADE EXECUTED* 🚨\nAction: *${action.toUpperCase()}*\nAsset: *${shares}x ${ticker}*\nType: ${orderType.toUpperCase()}\nStatus: ${order.status}`,
+    // RECORD TO DATABASE JOURNAL
+    logTrade(
+      ticker,
+      action.toUpperCase(),
+      shares,
+      limitPrice || 0,
+      `Order Type: ${orderType.toUpperCase()}`,
     );
 
     return {
@@ -143,13 +150,13 @@ const executeAlpacaTrade = async (
   }
 };
 
-// --- AUTOPILOT STATE & SSE ---
+// --- LIVE DATA STREAMING & SCREENER ---
 let connectedClients: express.Response[] = [];
 let isAutopilotEnabled = false;
 let isProcessingAutopilot = false;
 let dynamicScreenerTickers: string[] = ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"];
 
-// Refresh trending stocks every 15 minutes to avoid rate limits
+// Refresh trending stocks every 15 minutes
 setInterval(
   async () => {
     dynamicScreenerTickers = await getTrendingStocks();
@@ -188,9 +195,10 @@ app.get("/api/stream", (req, res) => {
   });
 });
 
-// The Heartbeat: Polls portfolio/watchlist every 3 seconds
+// The Heartbeat: Polls the broker and market data every 3 seconds and pushes to all connected clients
 setInterval(async () => {
   if (connectedClients.length === 0) return;
+
   try {
     const portfolio = await getAlpacaPortfolio();
     const orders = await alpaca.getOrders({ status: "open" });
@@ -219,9 +227,10 @@ setInterval(async () => {
       orders: formattedOrders,
       watchlist,
     });
+
     connectedClients.forEach((client) => client.write(`data: ${payload}\n\n`));
   } catch (error) {
-    // Silent catch
+    // Silently catch polling errors to prevent stream crash
   }
 }, 3000);
 
@@ -356,7 +365,6 @@ app.post("/api/chat", async (req, res) => {
     const activities = await alpaca.getAccountActivities({
       activityTypes: ["FILL"],
     });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const transactionHistory = activities.map((a: any) => ({
       ticker: a.symbol,
       action: a.side.toUpperCase(),
