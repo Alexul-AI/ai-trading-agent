@@ -2,7 +2,6 @@ import express from "express";
 import cors from "cors";
 import Alpaca from "@alpacahq/alpaca-trade-api";
 import * as dotenv from "dotenv";
-// IMPORTANT: Using .js extension is required when moduleResolution is Node16/NodeNext in tsconfig
 import {
   runTradingAgentStep,
   getWatchlistQuotes,
@@ -35,20 +34,53 @@ async function sendTelegramAlert(message: string) {
 }
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 app.use(
   cors({ origin: process.env.FRONTEND_ORIGIN || "http://localhost:5173" }),
 );
 
-// Alpaca API setup
+// --- ALPACA API SETUP (PAPER VS LIVE ENVIRONMENT SAFEGUARD) ---
+const isLiveMode = process.env.TRADE_MODE === "live";
+const alpacaKey = isLiveMode
+  ? process.env.APCA_API_KEY_ID_LIVE
+  : process.env.APCA_API_KEY_ID;
+const alpacaSecret = isLiveMode
+  ? process.env.APCA_API_SECRET_KEY_LIVE
+  : process.env.APCA_API_SECRET_KEY;
+
+if (!alpacaKey || !alpacaSecret) {
+  console.error(
+    `\n====================================================================`,
+  );
+  console.error(
+    `[FATAL ERROR] Missing Alpaca API keys for ${isLiveMode ? "LIVE" : "PAPER"} mode!`,
+  );
+  console.error(`Please configure your .env file accordingly.`);
+  console.error(
+    `====================================================================\n`,
+  );
+  process.exit(1);
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const alpaca = new (Alpaca as any)({
-  keyId: process.env.APCA_API_KEY_ID,
-  secretKey: process.env.APCA_API_SECRET_KEY,
-  paper: true,
+  keyId: alpacaKey,
+  secretKey: alpacaSecret,
+  paper: !isLiveMode,
 });
+
+console.log(
+  `\n====================================================================`,
+);
+console.log(`[SYSTEM] Trading Engine Initialized!`);
+console.log(
+  `[SYSTEM] Mode: ${isLiveMode ? "🔴 LIVE (REAL ASSETS)" : "🟢 PAPER (SIMULATION)"}`,
+);
+console.log(
+  `====================================================================\n`,
+);
 
 const getAlpacaPortfolio = async () => {
   try {
@@ -100,7 +132,7 @@ const executeAlpacaTrade = async (
   ticker = ticker.toUpperCase();
   try {
     console.log(
-      `[ALPACA] Sending ${action} ${orderType.toUpperCase()} order for ${shares}x ${ticker}...`,
+      `[ALPACA] Submitting ${action} ${orderType.toUpperCase()} order for ${shares}x ${ticker}...`,
     );
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -125,62 +157,67 @@ const executeAlpacaTrade = async (
           limit_price: parseFloat((stopLoss * 0.99).toFixed(2)),
         };
       console.log(
-        `[ALPACA] Attached risk management brackets -> SL: $${stopLoss || "None"}, TP: $${takeProfit || "None"}`,
+        `[ALPACA] Protection Attached -> SL: $${stopLoss || "None"}, TP: $${takeProfit || "None"}`,
       );
     }
 
     const order = await alpaca.createOrder(orderPayload);
-    console.log(`[ALPACA] Order acknowledged! Status: ${order.status}`);
+    console.log(`[ALPACA] Order success! Status: ${order.status}`);
 
-    // RECORD TO DATABASE JOURNAL
+    // Audit Log to SQL database
     logTrade(
       ticker,
       action.toUpperCase(),
       shares,
       limitPrice || 0,
-      `Order Type: ${orderType.toUpperCase()}`,
+      `Order Type: ${orderType.toUpperCase()} | Env: ${isLiveMode ? "LIVE" : "PAPER"}`,
     );
 
     return {
-      success: `Order placed successfully at broker: ${action} ${shares} shares of ${ticker}. Type: ${orderType}. Current status: ${order.status}.`,
+      success: `Order placed successfully: ${action} ${shares} shares of ${ticker}. Type: ${orderType}. Status: ${order.status}.`,
     };
   } catch (error: any) {
     console.warn(`[ALPACA] Trade rejected by broker: ${error.message}`);
-    return { error: `Broker rejected the trade: ${error.message}` };
+    return { error: `Broker rejected: ${error.message}` };
   }
 };
 
-// --- LIVE DATA STREAMING & SCREENER ---
+// --- SCREENER & ACTIVE TICKERS ---
 let connectedClients: express.Response[] = [];
 let isAutopilotEnabled = false;
 let isProcessingAutopilot = false;
 let dynamicScreenerTickers: string[] = ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"];
 
-// Refresh trending stocks every 15 minutes
+// Update screener list every 15 minutes
 setInterval(
   async () => {
     dynamicScreenerTickers = await getTrendingStocks();
     console.log(
-      `[SCREENER] Updated trending tickers: ${dynamicScreenerTickers.join(", ")}`,
+      `[SCREENER] Refreshed trending tickers: ${dynamicScreenerTickers.join(", ")}`,
     );
   },
   15 * 60 * 1000,
 );
 
-// Fetch immediately on startup
+// Run immediately on boot
 getTrendingStocks().then((tickers) => {
   dynamicScreenerTickers = tickers;
   console.log(
-    `[SCREENER] Initial trending tickers: ${dynamicScreenerTickers.join(", ")}`,
+    `[SCREENER] Initial dynamic tickers loaded: ${dynamicScreenerTickers.join(", ")}`,
   );
 });
 
 app.post("/api/autopilot", (req, res) => {
   isAutopilotEnabled = req.body.enabled;
   console.log(
-    `[AUTOPILOT] Engine status: ${isAutopilotEnabled ? "ENABLED" : "DISABLED"}`,
+    `[AUTOPILOT] Status switched: ${isAutopilotEnabled ? "ENABLED" : "DISABLED"}`,
   );
   res.json({ enabled: isAutopilotEnabled });
+});
+
+// Stream Mode Endpoint
+app.get("/api/mode", (req, res) => {
+  res.json({ mode: isLiveMode ? "live" : "paper" });
 });
 
 app.get("/api/stream", (req, res) => {
@@ -195,7 +232,7 @@ app.get("/api/stream", (req, res) => {
   });
 });
 
-// The Heartbeat: Polls the broker and market data every 3 seconds and pushes to all connected clients
+// Pushes live updates to connected users every 3 seconds
 setInterval(async () => {
   if (connectedClients.length === 0) return;
 
@@ -226,15 +263,16 @@ setInterval(async () => {
       portfolio,
       orders: formattedOrders,
       watchlist,
+      tradeMode: isLiveMode ? "live" : "paper",
     });
 
     connectedClients.forEach((client) => client.write(`data: ${payload}\n\n`));
   } catch (error) {
-    // Silently catch polling errors to prevent stream crash
+    // Suppress active stream poll logs to avoid terminal flooding
   }
 }, 3000);
 
-// AUTOPILOT LOOP: Runs every 60 seconds to scan the market autonomously
+// Autopilot Strategy Scanning Loop
 let lastAutopilotLog = "";
 
 setInterval(async () => {
@@ -269,15 +307,15 @@ setInterval(async () => {
       executeAlpacaTrade,
     );
 
-    // Send Telegram alert ONLY if autopilot decided to do something significant (not just holding cash)
     if (
       agentResponse.text &&
       !agentResponse.text.toLowerCase().includes("holding cash")
     ) {
-      await sendTelegramAlert(`🤖 *AUTOPILOT ALERT*\n${agentResponse.text}`);
+      await sendTelegramAlert(
+        `🤖 *AUTOPILOT ALERT (${isLiveMode ? "LIVE" : "PAPER"})*\n${agentResponse.text}`,
+      );
     }
 
-    // Only update UI if the AI's conclusion has changed
     if (agentResponse.text && agentResponse.text !== lastAutopilotLog) {
       lastAutopilotLog = agentResponse.text;
 
@@ -297,18 +335,18 @@ setInterval(async () => {
       );
     }
   } catch (error) {
-    console.error("[AUTOPILOT] Cycle error:", error);
+    console.error("[AUTOPILOT] Strategy cycle execution failure:", error);
   } finally {
     isProcessingAutopilot = false;
   }
 }, 60000);
 
-// --- STANDARD ENDPOINTS ---
+// --- ENDPOINTS ---
 app.get("/api/portfolio", async (req, res) => {
   try {
     res.json(await getAlpacaPortfolio());
   } catch (error) {
-    res.status(500).json({ error: "Failed to fetch" });
+    res.status(500).json({ error: "Failed to fetch portfolio" });
   }
 });
 
@@ -328,7 +366,7 @@ app.get("/api/orders", async (req, res) => {
       })),
     );
   } catch (error) {
-    res.status(500).json({ error: "Failed to fetch" });
+    res.status(500).json({ error: "Failed to fetch orders" });
   }
 });
 
@@ -388,8 +426,8 @@ app.post("/api/chat", async (req, res) => {
       fundamentalData: agentResponse.fundamentalData,
     });
   } catch (error) {
-    console.error("Chat API error:", error);
-    res.status(500).json({ error: "AI engine error" });
+    console.error("Chat API Error:", error);
+    res.status(500).json({ error: "AI engine failure." });
   }
 });
 
@@ -403,6 +441,10 @@ app.get("/api/watchlist", async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: "Watchlist error" });
   }
+});
+
+app.get("/api/mode", (req, res) => {
+  res.json({ mode: isLiveMode ? "live" : "paper" });
 });
 
 app.listen(PORT, () =>
