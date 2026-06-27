@@ -4,17 +4,10 @@ import YahooFinance from "yahoo-finance2";
 
 dotenv.config();
 
-// 1. Initialize Yahoo Finance with standard constructor options
-const yahooFinance = new YahooFinance({
+// Instantiate YahooFinance correctly to avoid TS deprecation warnings
+// Cast to any to cleanly pass initialization options
+const yf = new (YahooFinance as any)({
   suppressNotices: ["yahooSurvey"],
-});
-
-// 2. Disable validation globally using the correct API method (Typescript safe bypass!)
-(yahooFinance as any).setGlobalConfig({
-  validation: {
-    logErrors: false,
-    throwErrors: false,
-  },
 });
 
 const openai = new OpenAI({
@@ -234,7 +227,8 @@ const tools: any[] = [
 
 async function getStockPrice(ticker: string) {
   try {
-    const q = (await yahooFinance.quote(ticker)) as any;
+    // Passing { validateResult: false } safely bypasses Yahoo's schema errors per-call
+    const q = await yf.quote(ticker, {}, { validateResult: false });
     return {
       price: q.regularMarketPrice,
       currency: q.currency || "USD",
@@ -254,11 +248,11 @@ async function getHistoricalPrices(
     const today = new Date();
     const pastDate = new Date();
     pastDate.setDate(today.getDate() - days);
-    const res = (await yahooFinance.chart(ticker, {
-      period1: pastDate,
-      period2: today,
-      interval: "1d",
-    })) as any;
+    const res = await yf.chart(
+      ticker,
+      { period1: pastDate, period2: today, interval: "1d" },
+      { validateResult: false },
+    );
     if (res && res.quotes && res.quotes.length > 0) {
       return {
         data: res.quotes
@@ -284,7 +278,7 @@ async function getHistoricalPrices(
 
 async function getNewsSentiment(ticker: string) {
   try {
-    const res = await yahooFinance.search(ticker);
+    const res = await yf.search(ticker, {}, { validateResult: false });
     if (!res.news || res.news.length === 0)
       return { error: `No news found for ${ticker}.` };
     return { headlines: res.news.slice(0, 5).map((n: any) => n.title) };
@@ -295,7 +289,7 @@ async function getNewsSentiment(ticker: string) {
 
 async function getFundamentalData(ticker: string) {
   try {
-    const quote = (await yahooFinance.quote(ticker)) as any;
+    const quote = await yf.quote(ticker, {}, { validateResult: false });
 
     const formatNumber = (num: number) => {
       if (!num) return "N/A";
@@ -332,7 +326,7 @@ export async function getWatchlistQuotes(tickers: string[]) {
   return Promise.all(
     tickers.map(async (t) => {
       try {
-        const q = (await yahooFinance.quote(t)) as any;
+        const q = await yf.quote(t, {}, { validateResult: false });
         return {
           ticker: t,
           name: q.shortName || t,
@@ -355,16 +349,18 @@ export async function getWatchlistQuotes(tickers: string[]) {
 
 export async function getTrendingStocks(): Promise<string[]> {
   try {
-    const query = await yahooFinance.screener({
-      scrIds: "day_gainers",
-      count: 5,
-    });
+    const query = await yf.screener(
+      { scrIds: "day_gainers", count: 5 },
+      { validateResult: false },
+    );
     if (query && query.quotes) {
       return query.quotes.map((q: any) => q.symbol);
     }
     return ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"]; // Fallback
-  } catch (error) {
-    console.error("[SCREENER] Error fetching trending stocks:", error);
+  } catch (error: any) {
+    console.warn(
+      `[SCREENER] Yahoo API failed. Using fallback trending tickers. Reason: ${error.message || error}`,
+    );
     return ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"]; // Fallback
   }
 }
