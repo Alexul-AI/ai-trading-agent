@@ -71,7 +71,7 @@ console.log(
 
 // --- RISK MANAGER (KILL SWITCH) ---
 let RISK_MANAGER_TRIPWIRE = false;
-const MAX_DAILY_DRAWDOWN_PERCENT = 0.0001; // Stop trading if account loses > 0.01% in a day
+const MAX_DAILY_DRAWDOWN_PERCENT = 5.0; // Stop trading if account loses > 5% in a day
 
 async function checkRiskLimits() {
   if (RISK_MANAGER_TRIPWIRE) return; // Already tripped, skip checking
@@ -235,9 +235,11 @@ getTrendingStocks().then((tickers) => {
 
 app.post("/api/autopilot", (req, res) => {
   if (RISK_MANAGER_TRIPWIRE && req.body.enabled) {
-    return res.status(403).json({
-      error: "Cannot enable Autopilot. Risk Manager Kill Switch is active.",
-    });
+    return res
+      .status(403)
+      .json({
+        error: "Cannot enable Autopilot. Risk Manager Kill Switch is active.",
+      });
   }
   isAutopilotEnabled = req.body.enabled;
   console.log(
@@ -316,7 +318,16 @@ setInterval(async () => {
   try {
     console.log("[AUTOPILOT] Initiating autonomous market scan...");
 
-    const prompt = `[AUTOPILOT MODE] Perform a fast market scan for these trending tickers: ${dynamicScreenerTickers.join(", ")}. Check their technical indicators or news. If you identify a highly profitable trade setup, execute a BUY order immediately. Otherwise, briefly state that you are holding cash and observing. Keep the text extremely concise.`;
+    // FETCH BALANCE FOR STRICT RISK MANAGEMENT
+    const portfolio = await getAlpacaPortfolio();
+    const availableCash = portfolio.balance;
+    const maxTradeValue = availableCash * 0.2; // STRICT 20% LIMIT PER TRADE
+
+    const prompt = `[AUTOPILOT MODE] Your available cash is $${availableCash.toFixed(2)}. 
+    Perform a fast market scan for these trending tickers: ${dynamicScreenerTickers.join(", ")}. 
+    Check their technical indicators (RSI, MACD, Bollinger Bands) or news. 
+    RULE: NEVER buy more than 20% of your total cash in a single trade (Max trade value: $${maxTradeValue.toFixed(2)}). Calculate shares carefully.
+    If you identify a highly profitable trade setup, execute a BUY order immediately. Otherwise, briefly state that you are holding cash and observing. Keep the text extremely concise.`;
 
     const activities = await alpaca.getAccountActivities({
       activityTypes: ["FILL"],

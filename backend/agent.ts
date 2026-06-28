@@ -31,6 +31,7 @@ export interface TechnicalData {
   macd: number;
   signal: number;
   histogram: number;
+  bb: { lower: number; sma: number; upper: number };
   state: string;
 }
 export interface SentimentData {
@@ -105,6 +106,23 @@ function calculateMACD(prices: number[]): {
     macd: parseFloat(currentMacd.toFixed(4)),
     signal: parseFloat(currentSignal.toFixed(4)),
     histogram: parseFloat((currentMacd - currentSignal).toFixed(4)),
+  };
+}
+
+function calculateBollingerBands(
+  prices: number[],
+  period = 20,
+  multiplier = 2,
+) {
+  if (prices.length < period) return { upper: 0, lower: 0, sma: 0 };
+  const slice = prices.slice(-period);
+  const sma = slice.reduce((a, b) => a + b, 0) / period;
+  const variance = slice.reduce((a, b) => a + Math.pow(b - sma, 2), 0) / period;
+  const stdDev = Math.sqrt(variance);
+  return {
+    sma: parseFloat(sma.toFixed(2)),
+    upper: parseFloat((sma + stdDev * multiplier).toFixed(2)),
+    lower: parseFloat((sma - stdDev * multiplier).toFixed(2)),
   };
 }
 
@@ -441,11 +459,13 @@ export async function runTradingAgentStep(
           const prices = hr.data.map((p) => p.price);
           const rsi = calculateRSI(prices, 14);
           const macd = calculateMACD(prices);
+          const bb = calculateBollingerBands(prices, 20, 2);
           finalTechData = {
             rsi,
             macd: macd.macd,
             signal: macd.signal,
             histogram: macd.histogram,
+            bb,
             state: rsi > 70 ? "OVERBOUGHT" : rsi < 30 ? "OVERSOLD" : "NEUTRAL",
           };
           apiResponse = { ticker: detectedTicker, ...finalTechData };

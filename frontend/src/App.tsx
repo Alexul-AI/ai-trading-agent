@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
 
-// Hardcoding the URL temporarily to bypass the environment compilation warning
 const API_BASE_URL = "http://localhost:3000";
 
 interface Position {
@@ -49,6 +48,7 @@ interface WidgetData {
     macd: number;
     signal: number;
     histogram: number;
+    bb?: { lower: number; sma: number; upper: number };
     state: string;
   };
   sentiment?: { sentiment: "BULLISH" | "BEARISH" | "NEUTRAL"; summary: string };
@@ -170,7 +170,7 @@ export default function App() {
     }
   };
 
-  const handleSendMessage = async (e: React.FormEvent) => {
+  const handleSendMessage = async (e: React.SyntheticEvent) => {
     e.preventDefault();
     if (!chatInput.trim() || isWaitingOnAI) return;
 
@@ -235,7 +235,7 @@ export default function App() {
     }
   };
 
-  const executeManualTrade = async (e: React.FormEvent) => {
+  const executeManualTrade = async (e: React.SyntheticEvent) => {
     e.preventDefault();
     if (!tradeTicker.trim()) return;
 
@@ -898,6 +898,22 @@ export default function App() {
                         {activeWidget.technical.histogram}
                       </span>
                     </div>
+
+                    {/* NEW: Bollinger Bands Display */}
+                    {activeWidget.technical.bb && (
+                      <div className="col-span-2 pt-2 border-t border-slate-800/50 mt-1">
+                        <div className="text-[10px] text-slate-500 mb-1">
+                          BOLLINGER BANDS (20,2)
+                        </div>
+                        <div className="flex justify-between text-slate-300 font-bold">
+                          <span>L: ${activeWidget.technical.bb.lower}</span>
+                          <span className="text-slate-500">
+                            SMA: ${activeWidget.technical.bb.sma}
+                          </span>
+                          <span>U: ${activeWidget.technical.bb.upper}</span>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
