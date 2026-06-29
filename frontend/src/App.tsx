@@ -4,7 +4,7 @@ import React, { useState, useEffect, useRef } from "react";
 const API_BASE_URL =
   window.location.hostname === "localhost"
     ? "http://localhost:3000"
-    : "https://alexul-trading-backend.onrender.com";
+    : "https://ai-trading-agent-i4nr.onrender.com";
 
 interface Position {
   shares: number;
