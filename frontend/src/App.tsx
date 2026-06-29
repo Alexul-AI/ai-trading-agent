@@ -16,6 +16,7 @@ interface Position {
 
 interface Portfolio {
   balance: number;
+  equity?: number;
   currency: string;
   positions: Record<string, Position>;
 }
@@ -576,15 +577,23 @@ export default function App() {
           <div className="grid grid-cols-2 gap-4">
             <div className="bg-slate-900/60 rounded-2xl border border-slate-800 p-4">
               <span className="text-[10px] font-bold tracking-wider text-slate-500 block">
-                TOTAL AVAILABLE CASH
+                TOTAL PORTFOLIO VALUE (EQUITY)
               </span>
               <span className="text-2xl font-black font-mono tracking-tight text-white block mt-1">
                 $
-                {portfolio.balance.toLocaleString(undefined, {
-                  minimumFractionDigits: 2,
-                  maximumFractionDigits: 2,
-                })}
+                {(portfolio.equity || portfolio.balance).toLocaleString(
+                  undefined,
+                  { minimumFractionDigits: 2, maximumFractionDigits: 2 },
+                )}
               </span>
+              {portfolio.balance < 0 && (
+                <span className="text-[10px] text-rose-500 font-bold mt-1 block">
+                  MARGIN DEBT: $
+                  {Math.abs(portfolio.balance).toLocaleString(undefined, {
+                    minimumFractionDigits: 2,
+                  })}
+                </span>
+              )}
             </div>
 
             <div className="bg-slate-900/60 rounded-2xl border border-slate-800 p-4">

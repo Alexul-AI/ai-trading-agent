@@ -128,6 +128,7 @@ const getAlpacaPortfolio = async () => {
 
     return {
       balance: parseFloat(account.cash),
+      equity: parseFloat(account.equity),
       currency: account.currency || "USD",
       positions: posMap,
       tripwireTripped: RISK_MANAGER_TRIPWIRE,
@@ -235,11 +236,9 @@ getTrendingStocks().then((tickers) => {
 
 app.post("/api/autopilot", (req, res) => {
   if (RISK_MANAGER_TRIPWIRE && req.body.enabled) {
-    return res
-      .status(403)
-      .json({
-        error: "Cannot enable Autopilot. Risk Manager Kill Switch is active.",
-      });
+    return res.status(403).json({
+      error: "Cannot enable Autopilot. Risk Manager Kill Switch is active.",
+    });
   }
   isAutopilotEnabled = req.body.enabled;
   console.log(
