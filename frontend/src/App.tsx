@@ -1,6 +1,10 @@
 import React, { useState, useEffect, useRef } from "react";
 
-const API_BASE_URL = "http://localhost:3000";
+// Умное определение URL бэкенда (работает и локально, и на Vercel)
+const API_BASE_URL =
+  window.location.hostname === "localhost"
+    ? "http://localhost:3000"
+    : "https://alexul-trading-backend.onrender.com";
 
 interface Position {
   shares: number;
