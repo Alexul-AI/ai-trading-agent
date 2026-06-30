@@ -1,18 +1,18 @@
 import { OpenAI } from "openai";
 import * as dotenv from "dotenv";
-import YahooFinance from "yahoo-finance2";
+import yahooFinance from "yahoo-finance2";
 
 dotenv.config();
 
-// Instantiate YahooFinance correctly to avoid TS deprecation warnings
-// Cast to any to cleanly pass initialization options
-const yf = new (YahooFinance as any)({
-  suppressNotices: ["yahooSurvey"],
-});
+// FIX: Bypass TypeScript strict type checking for the runtime default wrapper created by Node 22
+const yf = (yahooFinance as any).default || yahooFinance;
+if (yf && typeof yf.suppressNotices === "function") {
+  yf.suppressNotices(["yahooSurvey"]);
+}
 
+// Initialize OpenAI client
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
-  maxRetries: 5,
 });
 
 export interface ChartPoint {
@@ -165,7 +165,7 @@ const tools: any[] = [
     type: "function",
     function: {
       name: "get_technical_indicators",
-      description: "Calculates RSI and MACD for a stock.",
+      description: "Calculates RSI, MACD, and Bollinger Bands for a stock.",
       parameters: {
         type: "object",
         properties: { ticker: { type: "string" } },
@@ -245,7 +245,6 @@ const tools: any[] = [
 
 async function getStockPrice(ticker: string) {
   try {
-    // Passing { validateResult: false } safely bypasses Yahoo's schema errors per-call
     const q = await yf.quote(ticker, {}, { validateResult: false });
     return {
       price: q.regularMarketPrice,
@@ -377,7 +376,7 @@ export async function getTrendingStocks(): Promise<string[]> {
     return ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"]; // Fallback
   } catch (error: any) {
     console.warn(
-      `[SCREENER] Yahoo API failed. Using fallback trending tickers. Reason: ${error.message || error}`,
+      `[SCREENER] Yahoo API failed. Using fallback trending tickers.`,
     );
     return ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"]; // Fallback
   }
@@ -490,7 +489,7 @@ export async function runTradingAgentStep(
               sentiment_json: JSON.stringify(finalSentiment),
             };
           } catch (e) {
-            apiResponse = { error: "Failed sentiment." };
+            apiResponse = { error: "Failed sentiment analysis." };
           }
         }
       } else if (funcName === "get_transaction_history") {
@@ -550,7 +549,7 @@ export async function runTradingAgentStep(
             if (!finalTakeProfit)
               finalTakeProfit = parseFloat((basePrice * 1.15).toFixed(2));
             console.log(
-              `🛡️ [RISK MANAGEMENT] Auto-calculated SL: $${finalStopLoss}, TP: $${finalTakeProfit} for ${detectedTicker}`,
+              `[RISK MANAGEMENT] Auto-calculated SL: $${finalStopLoss}, TP: $${finalTakeProfit} for ${detectedTicker}`,
             );
           }
 
@@ -564,7 +563,7 @@ export async function runTradingAgentStep(
                 finalStopLoss,
                 finalTakeProfit,
               )
-            : { error: "No callback." };
+            : { error: "No callback provided." };
         }
       } else if (funcName === "get_fundamental_data") {
         detectedTicker = args.ticker.toUpperCase();

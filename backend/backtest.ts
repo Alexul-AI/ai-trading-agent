@@ -1,14 +1,18 @@
 import { OpenAI } from "openai";
 import * as dotenv from "dotenv";
-import YahooFinance from "yahoo-finance2";
+import yahooFinance from "yahoo-finance2";
 
 dotenv.config();
 
-const yahooFinance = new YahooFinance({ suppressNotices: ["yahooSurvey"] });
+// FIX: Bypass TypeScript strict type checking for the runtime default wrapper created by Node 22
+const yf = (yahooFinance as any).default || yahooFinance;
+if (yf && typeof yf.suppressNotices === "function") {
+  yf.suppressNotices(["yahooSurvey"]);
+}
 
+// Initialize OpenAI client
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
-  maxRetries: 3,
 });
 
 // --- BACKTEST CONFIGURATION ---
@@ -109,11 +113,15 @@ async function runBacktest() {
   const pastDate = new Date();
   pastDate.setDate(today.getDate() - BACKTEST_DAYS);
 
-  const chartData = (await yahooFinance.chart(TICKER, {
-    period1: pastDate,
-    period2: today,
-    interval: "1d",
-  })) as any;
+  const chartData = (await yf.chart(
+    TICKER,
+    {
+      period1: pastDate,
+      period2: today,
+      interval: "1d",
+    },
+    { validateResult: false },
+  )) as any;
   if (!chartData || !chartData.quotes || chartData.quotes.length === 0) return;
 
   const dailyQuotes = chartData.quotes.filter(
@@ -133,7 +141,6 @@ async function runBacktest() {
     const macdData = calculateMACD(priceHistoryForTA);
     const bbData = calculateBollingerBands(priceHistoryForTA, 20, 2);
 
-    // PRE-CALCULATE RISK LIMITS IN CODE (Not trusting LLM math)
     const maxSharesBuy = Math.floor((virtualBalance * 0.2) / currentPrice);
 
     console.log(
@@ -143,7 +150,6 @@ async function runBacktest() {
       `   📉 RSI: ${rsi} | MACD: ${macdData.histogram} | BB: [Lower: $${bbData.lower}, SMA: $${bbData.sma}, Upper: $${bbData.upper}]`,
     );
 
-    // ENHANCED PROMPT WITH PRE-CALCULATED LIMITS
     const prompt = `[BACKTEST MODE] TICKER: ${TICKER} | Price: $${currentPrice}. 
       Cash: $${virtualBalance.toFixed(2)} | Shares Owned: ${sharesOwned}.
       
@@ -175,12 +181,10 @@ async function runBacktest() {
         if (toolCall && toolCall.type === "function") {
           const args = JSON.parse(toolCall.function.arguments);
 
-          // Code-level enforcement to prevent hallucinated trades
           const action = args.action.toUpperCase();
           const requestedShares = Math.abs(args.shares || 0);
 
           if (action === "BUY") {
-            // Cap the shares to maxSharesBuy regardless of what AI said
             const actualSharesToBuy = Math.min(requestedShares, maxSharesBuy);
             const cost = currentPrice * actualSharesToBuy;
 
@@ -196,7 +200,6 @@ async function runBacktest() {
               );
             }
           } else if (action === "SELL") {
-            // Cap the shares to what we actually own
             const actualSharesToSell = Math.min(requestedShares, sharesOwned);
             const revenue = currentPrice * actualSharesToSell;
 
