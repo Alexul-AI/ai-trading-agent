@@ -1,5 +1,16 @@
 import dotenv from "dotenv";
 
+import {
+  calculateBollingerBands,
+  calculateMACD,
+  calculateRSI,
+} from "./indicators.js";
+import {
+  DEFAULT_STRATEGY_CONFIG,
+  decideTradeSignal,
+  type StrategyConfig,
+} from "./strategyEngine.js";
+
 dotenv.config();
 
 interface AlpacaBar {
@@ -21,11 +32,7 @@ interface BacktestConfig {
   days: number;
   startingCapital: number;
   feed: string;
-  maxBuyCashFraction: number;
-  maxPositionEquityFraction: number;
-  cooldownBars: number;
-  stopLossPercent: number;
-  takeProfitPercent: number;
+  strategy: StrategyConfig;
   slippagePercent: number;
   commissionPerTrade: number;
 }
@@ -58,9 +65,12 @@ interface BacktestResult {
   finalPrice: number;
   finalCash: number;
   finalShares: number;
+  averageEntryPrice: number;
   finalPortfolioValue: number;
-  pnl: number;
-  pnlPercent: number;
+  realizedPnl: number;
+  openUnrealizedPnl: number;
+  totalPnl: number;
+  totalPnlPercent: number;
   buyAndHoldValue: number;
   buyAndHoldPnl: number;
   buyAndHoldPnlPercent: number;
@@ -75,6 +85,14 @@ interface BacktestResult {
   totalEstimatedSlippageCost: number;
 }
 
+const APCA_API_KEY_ID = process.env.APCA_API_KEY_ID ?? "";
+const APCA_API_SECRET_KEY = process.env.APCA_API_SECRET_KEY ?? "";
+
+if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY) {
+  console.error("Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY in backend/.env");
+  process.exit(1);
+}
+
 const config: BacktestConfig = {
   tickers: (process.env.BACKTEST_TICKERS || process.env.BACKTEST_TICKER || "TSLA")
     .split(",")
@@ -85,19 +103,30 @@ const config: BacktestConfig = {
     process.env.BACKTEST_STARTING_CAPITAL || "10000",
   ),
   feed: process.env.ALPACA_DATA_FEED || "iex",
-  maxBuyCashFraction: Number.parseFloat(
-    process.env.BACKTEST_MAX_BUY_CASH_FRACTION || "0.20",
-  ),
-  maxPositionEquityFraction: Number.parseFloat(
-    process.env.BACKTEST_MAX_POSITION_EQUITY_FRACTION || "0.20",
-  ),
-  cooldownBars: Number.parseInt(process.env.BACKTEST_COOLDOWN_BARS || "3", 10),
-  stopLossPercent: Number.parseFloat(
-    process.env.BACKTEST_STOP_LOSS_PERCENT || "0.08",
-  ),
-  takeProfitPercent: Number.parseFloat(
-    process.env.BACKTEST_TAKE_PROFIT_PERCENT || "0.15",
-  ),
+  strategy: {
+    ...DEFAULT_STRATEGY_CONFIG,
+    maxBuyCashFraction: Number.parseFloat(
+      process.env.BACKTEST_MAX_BUY_CASH_FRACTION ||
+        String(DEFAULT_STRATEGY_CONFIG.maxBuyCashFraction),
+    ),
+    maxPositionEquityFraction: Number.parseFloat(
+      process.env.BACKTEST_MAX_POSITION_EQUITY_FRACTION ||
+        String(DEFAULT_STRATEGY_CONFIG.maxPositionEquityFraction),
+    ),
+    cooldownBars: Number.parseInt(
+      process.env.BACKTEST_COOLDOWN_BARS ||
+        String(DEFAULT_STRATEGY_CONFIG.cooldownBars),
+      10,
+    ),
+    stopLossPercent: Number.parseFloat(
+      process.env.BACKTEST_STOP_LOSS_PERCENT ||
+        String(DEFAULT_STRATEGY_CONFIG.stopLossPercent),
+    ),
+    takeProfitPercent: Number.parseFloat(
+      process.env.BACKTEST_TAKE_PROFIT_PERCENT ||
+        String(DEFAULT_STRATEGY_CONFIG.takeProfitPercent),
+    ),
+  },
   slippagePercent: Number.parseFloat(
     process.env.BACKTEST_SLIPPAGE_PERCENT || "0.0005",
   ),
@@ -105,14 +134,6 @@ const config: BacktestConfig = {
     process.env.BACKTEST_COMMISSION_PER_TRADE || "0",
   ),
 };
-
-const APCA_API_KEY_ID = process.env.APCA_API_KEY_ID;
-const APCA_API_SECRET_KEY = process.env.APCA_API_SECRET_KEY;
-
-if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY) {
-  console.error("Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY in backend/.env");
-  process.exit(1);
-}
 
 function toIsoDate(date: Date): string {
   return date.toISOString().split("T")[0] ?? date.toISOString();
@@ -124,85 +145,6 @@ function formatMoney(value: number): string {
 
 function formatPercent(value: number): string {
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
-}
-
-function calculateRSI(prices: number[], periods = 14): number {
-  if (prices.length <= periods) return 50;
-
-  let gains = 0;
-  let losses = 0;
-
-  for (let i = 1; i <= periods; i += 1) {
-    const diff = (prices[i] ?? 0) - (prices[i - 1] ?? 0);
-    if (diff > 0) gains += diff;
-    else losses -= diff;
-  }
-
-  let avgGain = gains / periods;
-  let avgLoss = losses / periods;
-
-  for (let i = periods + 1; i < prices.length; i += 1) {
-    const diff = (prices[i] ?? 0) - (prices[i - 1] ?? 0);
-
-    avgGain = (avgGain * (periods - 1) + (diff > 0 ? diff : 0)) / periods;
-    avgLoss = (avgLoss * (periods - 1) + (diff < 0 ? -diff : 0)) / periods;
-  }
-
-  if (avgLoss === 0) return 100;
-
-  return Number((100 - 100 / (1 + avgGain / avgLoss)).toFixed(2));
-}
-
-function calculateEMA(prices: number[], period: number): number[] {
-  const k = 2 / (period + 1);
-  const ema: number[] = [];
-
-  if (prices.length === 0) return ema;
-
-  ema.push(prices[0] ?? 0);
-
-  for (let i = 1; i < prices.length; i += 1) {
-    ema.push((prices[i] ?? 0) * k + (ema[i - 1] ?? 0) * (1 - k));
-  }
-
-  return ema;
-}
-
-function calculateMACD(prices: number[]) {
-  if (prices.length < 26) return { macd: 0, signal: 0, histogram: 0 };
-
-  const ema12 = calculateEMA(prices, 12);
-  const ema26 = calculateEMA(prices, 26);
-  const macdLine = prices.map((_, i) => (ema12[i] ?? 0) - (ema26[i] ?? 0));
-  const signalLine = calculateEMA(macdLine.slice(25), 9);
-
-  const currentMacd = macdLine[macdLine.length - 1] ?? 0;
-  const currentSignal = signalLine[signalLine.length - 1] ?? 0;
-
-  return {
-    macd: Number(currentMacd.toFixed(4)),
-    signal: Number(currentSignal.toFixed(4)),
-    histogram: Number((currentMacd - currentSignal).toFixed(4)),
-  };
-}
-
-function calculateBollingerBands(
-  prices: number[],
-  period = 20,
-  multiplier = 2,
-) {
-  if (prices.length < period) return { upper: 0, lower: 0, sma: 0 };
-
-  const slice = prices.slice(-period);
-  const sma = slice.reduce((a, b) => a + b, 0) / period;
-  const variance = slice.reduce((a, b) => a + Math.pow(b - sma, 2), 0) / period;
-  const stdDev = Math.sqrt(variance);
-
-  return {
-    sma: Number(sma.toFixed(2)),
-    upper: Number((sma + stdDev * multiplier).toFixed(2)),
-    lower: Number((sma - stdDev * multiplier).toFixed(2)),
-  };
 }
 
 async function fetchAlpacaBars(
@@ -233,8 +175,8 @@ async function fetchAlpacaBars(
 
     const response = await fetch(url.toString(), {
       headers: {
-        "APCA-API-KEY-ID": APCA_API_KEY_ID!,
-        "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY!,
+        "APCA-API-KEY-ID": APCA_API_KEY_ID,
+        "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
       },
     });
 
@@ -280,86 +222,6 @@ function calculateMaxDrawdownPercent(equityCurve: EquityPoint[]): number {
   return maxDrawdown * 100;
 }
 
-function decideTrade(input: {
-  price: number;
-  rsi: number;
-  macdHistogram: number;
-  previousMacdHistogram: number;
-  bbLower: number;
-  bbUpper: number;
-  sharesOwned: number;
-  averageEntryPrice: number;
-  maxSharesToBuy: number;
-  barsSinceLastBuy: number;
-  stopLossPercent: number;
-  takeProfitPercent: number;
-}) {
-  const {
-    price,
-    rsi,
-    macdHistogram,
-    previousMacdHistogram,
-    bbLower,
-    bbUpper,
-    sharesOwned,
-    averageEntryPrice,
-    maxSharesToBuy,
-    barsSinceLastBuy,
-    stopLossPercent,
-    takeProfitPercent,
-  } = input;
-
-  const macdRising = macdHistogram > previousMacdHistogram;
-  const nearLowerBand = bbLower > 0 && price <= bbLower * 1.01;
-  const nearUpperBand = bbUpper > 0 && price >= bbUpper * 0.99;
-
-  if (sharesOwned > 0 && averageEntryPrice > 0) {
-    const positionReturn = (price - averageEntryPrice) / averageEntryPrice;
-
-    if (positionReturn <= -stopLossPercent) {
-      return {
-        action: "SELL" as const,
-        shares: sharesOwned,
-        reason: `Stop-loss triggered: positionReturn=${formatPercent(positionReturn * 100)}`,
-      };
-    }
-
-    if (positionReturn >= takeProfitPercent) {
-      return {
-        action: "SELL" as const,
-        shares: sharesOwned,
-        reason: `Take-profit triggered: positionReturn=${formatPercent(positionReturn * 100)}`,
-      };
-    }
-  }
-
-  if (sharesOwned > 0 && (rsi > 65 || nearUpperBand || (rsi > 55 && !macdRising))) {
-    return {
-      action: "SELL" as const,
-      shares: sharesOwned,
-      reason: `Sell signal: RSI=${rsi}, nearUpperBand=${nearUpperBand}, macdRising=${macdRising}`,
-    };
-  }
-
-  if (
-    maxSharesToBuy > 0 &&
-    barsSinceLastBuy >= config.cooldownBars &&
-    (rsi < 38 || nearLowerBand || (rsi < 46 && macdRising))
-  ) {
-    return {
-      action: "BUY" as const,
-      shares: maxSharesToBuy,
-      reason: `Buy signal: RSI=${rsi}, nearLowerBand=${nearLowerBand}, macdRising=${macdRising}`,
-    };
-  }
-
-  return {
-    action: "HOLD" as const,
-    shares: 0,
-    reason: `No clear signal: RSI=${rsi}, nearLowerBand=${nearLowerBand}, nearUpperBand=${nearUpperBand}, macdRising=${macdRising}`,
-  };
-}
-
 function calculateTradeStats(closedTrades: Trade[]) {
   const pnlValues = closedTrades
     .map((trade) => trade.realizedPnl)
@@ -383,15 +245,19 @@ function calculateTradeStats(closedTrades: Trade[]) {
 async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
   console.log("");
   console.log("=========================================");
-  console.log(`BACKTEST ${ticker} — Alpaca only`);
+  console.log(`BACKTEST ${ticker} — Alpaca + shared strategyEngine`);
   console.log("=========================================");
   console.log(`Days: ${config.days}`);
   console.log(`Feed: ${config.feed}`);
   console.log(`Starting Capital: ${formatMoney(config.startingCapital)}`);
-  console.log(`Max position: ${(config.maxPositionEquityFraction * 100).toFixed(0)}% equity`);
-  console.log(`Cooldown: ${config.cooldownBars} bars`);
-  console.log(`Stop-loss: ${(config.stopLossPercent * 100).toFixed(0)}%`);
-  console.log(`Take-profit: ${(config.takeProfitPercent * 100).toFixed(0)}%`);
+  console.log(
+    `Max position: ${(config.strategy.maxPositionEquityFraction * 100).toFixed(0)}% equity`,
+  );
+  console.log(`Cooldown: ${config.strategy.cooldownBars} bars`);
+  console.log(`Stop-loss: ${(config.strategy.stopLossPercent * 100).toFixed(0)}%`);
+  console.log(
+    `Take-profit: ${(config.strategy.takeProfitPercent * 100).toFixed(0)}%`,
+  );
   console.log(`Slippage: ${(config.slippagePercent * 100).toFixed(3)}%`);
   console.log("");
 
@@ -407,6 +273,7 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
   let sharesOwned = 0;
   let averageEntryPrice = 0;
   let lastBuyIndex = -999;
+  let realizedPnlTotal = 0;
   let totalEstimatedSlippageCost = 0;
 
   const trades: Trade[] = [];
@@ -414,9 +281,8 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
   const equityCurve: EquityPoint[] = [];
 
   const firstPrice = bars[0]?.c ?? 0;
-  const buyAndHoldShares = firstPrice > 0
-    ? Math.floor(config.startingCapital / firstPrice)
-    : 0;
+  const buyAndHoldShares =
+    firstPrice > 0 ? Math.floor(config.startingCapital / firstPrice) : 0;
   const buyAndHoldCash = config.startingCapital - buyAndHoldShares * firstPrice;
 
   for (let i = 30; i < bars.length; i += 1) {
@@ -435,51 +301,42 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
     const bb = calculateBollingerBands(prices, 20, 2);
 
     const portfolioValueBeforeDecision = cash + sharesOwned * currentPrice;
-    const currentPositionValue = sharesOwned * currentPrice;
-    const remainingPositionCapacity = Math.max(
-      0,
-      portfolioValueBeforeDecision * config.maxPositionEquityFraction -
-        currentPositionValue,
-    );
-
-    const cashAllowedForBuy = Math.min(
-      cash * config.maxBuyCashFraction,
-      remainingPositionCapacity,
-    );
-
-    const maxSharesToBuy = Math.floor(cashAllowedForBuy / currentPrice);
     const barsSinceLastBuy = i - lastBuyIndex;
 
-    const decision = decideTrade({
+    const decision = decideTradeSignal({
+      ticker,
       price: currentPrice,
+      cash,
+      portfolioValue: portfolioValueBeforeDecision,
+      sharesOwned,
+      averageEntryPrice,
       rsi,
       macdHistogram: macd.histogram,
       previousMacdHistogram: previousMacd.histogram,
-      bbLower: bb.lower,
-      bbUpper: bb.upper,
-      sharesOwned,
-      averageEntryPrice,
-      maxSharesToBuy,
+      bollingerLower: bb.lower,
+      bollingerUpper: bb.upper,
       barsSinceLastBuy,
-      stopLossPercent: config.stopLossPercent,
-      takeProfitPercent: config.takeProfitPercent,
+      config: config.strategy,
     });
 
-    if (decision.action === "BUY" && decision.shares > 0) {
+    if (decision.action === "BUY" && decision.suggestedShares > 0) {
       const executionPrice = Number(
         (currentPrice * (1 + config.slippagePercent)).toFixed(4),
       );
-      const slippageCost = (executionPrice - currentPrice) * decision.shares;
-      const cost = executionPrice * decision.shares + config.commissionPerTrade;
+      const slippageCost =
+        (executionPrice - currentPrice) * decision.suggestedShares;
+      const cost =
+        executionPrice * decision.suggestedShares + config.commissionPerTrade;
 
       if (cash >= cost) {
         const previousPositionCost = averageEntryPrice * sharesOwned;
 
         cash -= cost;
-        sharesOwned += decision.shares;
+        sharesOwned += decision.suggestedShares;
         averageEntryPrice =
           sharesOwned > 0
-            ? (previousPositionCost + executionPrice * decision.shares) /
+            ? (previousPositionCost +
+                executionPrice * decision.suggestedShares) /
               sharesOwned
             : 0;
 
@@ -492,7 +349,7 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
           ticker,
           date: dateStr,
           action: "BUY",
-          shares: decision.shares,
+          shares: decision.suggestedShares,
           marketPrice: currentPrice,
           executionPrice,
           cashAfter: cash,
@@ -502,11 +359,15 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
         });
 
         console.log(
-          `${dateStr} | BUY ${decision.shares} @ ${formatMoney(executionPrice)} | cash=${formatMoney(cash)} | ${decision.reason}`,
+          `${dateStr} | BUY ${decision.suggestedShares} @ ${formatMoney(
+            executionPrice,
+          )} | confidence=${decision.confidence} | cash=${formatMoney(
+            cash,
+          )} | ${decision.reason}`,
         );
       }
-    } else if (decision.action === "SELL" && decision.shares > 0) {
-      const sharesToSell = Math.min(decision.shares, sharesOwned);
+    } else if (decision.action === "SELL" && decision.suggestedShares > 0) {
+      const sharesToSell = Math.min(decision.suggestedShares, sharesOwned);
       const executionPrice = Number(
         (currentPrice * (1 - config.slippagePercent)).toFixed(4),
       );
@@ -520,6 +381,7 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
 
         cash += revenue;
         sharesOwned -= sharesToSell;
+        realizedPnlTotal += realizedPnl;
 
         if (sharesOwned === 0) {
           averageEntryPrice = 0;
@@ -547,7 +409,11 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
         closedTrades.push(trade);
 
         console.log(
-          `${dateStr} | SELL ${sharesToSell} @ ${formatMoney(executionPrice)} | realized=${formatMoney(realizedPnl)} | cash=${formatMoney(cash)} | ${decision.reason}`,
+          `${dateStr} | SELL ${sharesToSell} @ ${formatMoney(
+            executionPrice,
+          )} | confidence=${decision.confidence} | realized=${formatMoney(
+            realizedPnl,
+          )} | cash=${formatMoney(cash)} | ${decision.reason}`,
         );
       }
     }
@@ -563,8 +429,10 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
 
   const finalPrice = bars[bars.length - 1]?.c ?? 0;
   const finalPortfolioValue = cash + sharesOwned * finalPrice;
-  const pnl = finalPortfolioValue - config.startingCapital;
-  const pnlPercent = (pnl / config.startingCapital) * 100;
+  const totalPnl = finalPortfolioValue - config.startingCapital;
+  const totalPnlPercent = (totalPnl / config.startingCapital) * 100;
+  const openUnrealizedPnl =
+    sharesOwned > 0 ? (finalPrice - averageEntryPrice) * sharesOwned : 0;
 
   const buyAndHoldValue = buyAndHoldCash + buyAndHoldShares * finalPrice;
   const buyAndHoldPnl = buyAndHoldValue - config.startingCapital;
@@ -584,9 +452,12 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
     finalPrice,
     finalCash: cash,
     finalShares: sharesOwned,
+    averageEntryPrice,
     finalPortfolioValue,
-    pnl,
-    pnlPercent,
+    realizedPnl: realizedPnlTotal,
+    openUnrealizedPnl,
+    totalPnl,
+    totalPnlPercent,
     buyAndHoldValue,
     buyAndHoldPnl,
     buyAndHoldPnlPercent,
@@ -610,9 +481,14 @@ function printResult(result: BacktestResult) {
   console.log(`Final price: ${formatMoney(result.finalPrice)}`);
   console.log(`Remaining cash: ${formatMoney(result.finalCash)}`);
   console.log(`Shares owned: ${result.finalShares}`);
+  console.log(`Average entry price: ${formatMoney(result.averageEntryPrice)}`);
   console.log(`Final portfolio value: ${formatMoney(result.finalPortfolioValue)}`);
+  console.log(`Realized PnL: ${formatMoney(result.realizedPnl)}`);
+  console.log(`Open unrealized PnL: ${formatMoney(result.openUnrealizedPnl)}`);
   console.log(
-    `Strategy PnL: ${formatMoney(result.pnl)} (${formatPercent(result.pnlPercent)})`,
+    `Total Strategy PnL: ${formatMoney(result.totalPnl)} (${formatPercent(
+      result.totalPnlPercent,
+    )})`,
   );
   console.log(
     `Buy & Hold PnL: ${formatMoney(result.buyAndHoldPnl)} (${formatPercent(
@@ -624,7 +500,9 @@ function printResult(result: BacktestResult) {
   console.log(`Trades executed: ${result.trades.length}`);
   console.log(`Closed trades: ${result.closedTrades.length}`);
   console.log(`Win rate: ${result.winRatePercent.toFixed(2)}%`);
-  console.log(`Average closed trade PnL: ${formatMoney(result.averageClosedTradePnl)}`);
+  console.log(
+    `Average closed trade PnL: ${formatMoney(result.averageClosedTradePnl)}`,
+  );
   console.log(`Best trade PnL: ${formatMoney(result.bestTradePnl)}`);
   console.log(`Worst trade PnL: ${formatMoney(result.worstTradePnl)}`);
   console.log(
@@ -635,6 +513,7 @@ function printResult(result: BacktestResult) {
   if (result.trades.length > 0) {
     console.log("");
     console.log("Trades:");
+
     for (const trade of result.trades) {
       const realized =
         typeof trade.realizedPnl === "number"
@@ -655,7 +534,7 @@ function printResult(result: BacktestResult) {
 async function main() {
   console.log("");
   console.log("=========================================");
-  console.log("AI Trading Agent Backtest v2 — Alpaca only");
+  console.log("AI Trading Agent Backtest v3 — shared strategyEngine");
   console.log("=========================================");
   console.log(`Tickers: ${config.tickers.join(", ")}`);
   console.log(`Days: ${config.days}`);
@@ -679,7 +558,7 @@ async function main() {
     for (const result of results) {
       console.log(
         `${result.ticker} | Strategy ${formatPercent(
-          result.pnlPercent,
+          result.totalPnlPercent,
         )} | Buy&Hold ${formatPercent(
           result.buyAndHoldPnlPercent,
         )} | MaxDD ${formatPercent(result.maxDrawdownPercent)} | Trades ${
