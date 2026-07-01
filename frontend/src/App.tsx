@@ -1,171 +1,39 @@
 import React, { useEffect, useRef, useState } from "react";
+import { AutopilotControlCenter } from "./components/AutopilotControlCenter";
+import { AutopilotLogs } from "./components/AutopilotLogs";
+import { ChatTerminal } from "./components/ChatTerminal";
+import { DecisionJournalPanel } from "./components/DecisionJournalPanel";
+import { LastAutopilotDecisions } from "./components/LastAutopilotDecisions";
+import type {
+  AutopilotRunResponse,
+  AutopilotStatus,
+  AutopilotToggleResponse,
+  ChatMessage,
+  ChatResponse,
+  DashboardResponse,
+  JournalResponse,
+  JournalRun,
+  JournalSummary,
+  Order,
+  Portfolio,
+  SseEvent,
+  TradeMode,
+  TradeResponse,
+  WatchlistItem,
+} from "./types";
+import {
+  actionPillClass,
+  confidenceClass,
+  formatMoney,
+  formatPercent,
+  getDecisionForTicker,
+  getErrorMessage,
+} from "./utils";
 
 const API_BASE_URL =
   window.location.hostname === "localhost"
     ? "http://localhost:3000"
     : "https://ai-trading-agent-i4nr.onrender.com";
-
-type TradeMode = "paper" | "live";
-type SignalAction = "BUY" | "SELL" | "HOLD";
-type ReasonType =
-  | "BUY_SIGNAL"
-  | "SELL_SIGNAL"
-  | "STOP_LOSS"
-  | "TAKE_PROFIT"
-  | "NO_SIGNAL"
-  | "RISK_LIMIT";
-
-interface Position {
-  shares: number;
-  avgPrice: number;
-  currentPrice?: number;
-  pnl?: number;
-  pnlPercent?: number;
-}
-
-interface Portfolio {
-  balance: number;
-  equity?: number;
-  currency: string;
-  positions: Record<string, Position>;
-}
-
-interface Order {
-  id: string;
-  ticker: string;
-  action: string;
-  qty: number;
-  orderType: string;
-  limitPrice: number | null;
-  status: string;
-}
-
-interface WatchlistItem {
-  ticker: string;
-  name: string;
-  price: number;
-  change: number;
-  isUp: boolean;
-}
-
-interface ChatMessage {
-  id: string;
-  role: "user" | "agent";
-  content: string;
-  timestamp: string;
-}
-
-interface AutopilotDecision {
-  ticker: string;
-  timestamp: string;
-  price: number;
-  rsi: number;
-  macdHistogram: number;
-  previousMacdHistogram: number;
-  bollingerLower: number;
-  bollingerUpper: number;
-  action: SignalAction;
-  confidence: number;
-  suggestedShares: number;
-  originalSuggestedShares?: number;
-  reasonType: ReasonType;
-  reason: string;
-  safetyNote?: string;
-  executed: boolean;
-  skippedReason?: string;
-}
-
-interface AutopilotStatus {
-  enabled: boolean;
-  executeTrades: boolean;
-  allowBuy: boolean;
-  allowSell: boolean;
-  tradeMode: TradeMode;
-  running: boolean;
-  intervalMs: number;
-  tickers: string[];
-  minConfidence: number;
-  maxSellFraction: number;
-  telegramCooldownMinutes: number;
-  lastJournalRunId?: string | null;
-  lastRunAt: string | null;
-  lastError: string | null;
-  lastDecisions: AutopilotDecision[];
-}
-
-interface JournalRun {
-  id: string;
-  timestamp: string;
-  trigger: "manual" | "scheduled";
-  executeTrades: boolean;
-  tradeMode: TradeMode;
-  enabled: boolean;
-  tickers: string[];
-  actionableCount: number;
-  decisions: AutopilotDecision[];
-}
-
-interface JournalResponse {
-  file: string;
-  runs: JournalRun[];
-}
-
-interface JournalSummary {
-  totalRuns: number;
-  totalDecisions: number;
-  actionableSignals: number;
-  executedSignals: number;
-  byAction: Record<string, number>;
-  byTicker: Record<string, number>;
-  byReasonType: Record<string, number>;
-  lastRunAt: string | null;
-}
-
-interface DashboardResponse {
-  tradeMode?: TradeMode;
-  autopilotEnabled?: boolean;
-  autopilot?: AutopilotStatus;
-  portfolio?: Portfolio;
-  orders?: Order[];
-  watchlist?: WatchlistItem[];
-}
-
-interface AutopilotRunResponse {
-  skipped: boolean;
-  reason?: string;
-  decisions?: AutopilotDecision[];
-  status: AutopilotStatus;
-  error?: string;
-}
-
-interface AutopilotToggleResponse {
-  success: boolean;
-  enabled: boolean;
-  autopilot: AutopilotStatus;
-}
-
-interface ChatResponse {
-  reply?: string;
-}
-
-interface TradeResponse {
-  success?: boolean;
-  error?: string;
-  result?: unknown;
-}
-
-interface SseEvent {
-  type?: string;
-  tradeMode?: TradeMode;
-  autopilot?: AutopilotStatus;
-  enabled?: boolean;
-  executeTrades?: boolean;
-  message?: string;
-  data?: AutopilotDecision;
-  decisions?: AutopilotDecision[];
-  actionableCount?: number;
-  timestamp?: string;
-}
 
 const EMPTY_PORTFOLIO: Portfolio = {
   balance: 0,
@@ -190,73 +58,6 @@ const EMPTY_AUTOPILOT_STATUS: AutopilotStatus = {
   lastError: null,
   lastDecisions: [],
 };
-
-function formatMoney(value: number | undefined): string {
-  const safeValue = Number.isFinite(value) ? (value ?? 0) : 0;
-  return safeValue.toLocaleString(undefined, {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
-
-function formatPercent(value: number | undefined): string {
-  const safeValue = Number.isFinite(value) ? (value ?? 0) : 0;
-  return `${safeValue >= 0 ? "+" : ""}${safeValue.toFixed(2)}%`;
-}
-
-function formatTimestamp(value: string | null): string {
-  if (!value) return "Never";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleTimeString();
-}
-
-function getErrorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "string") return error;
-  try {
-    return JSON.stringify(error);
-  } catch {
-    return "Unknown error";
-  }
-}
-
-function actionPillClass(action: SignalAction): string {
-  if (action === "BUY")
-    return "bg-emerald-500/10 text-emerald-300 border-emerald-500/30";
-  if (action === "SELL")
-    return "bg-rose-500/10 text-rose-300 border-rose-500/30";
-  return "bg-slate-800 text-slate-400 border-slate-700";
-}
-
-function confidenceClass(confidence: number): string {
-  if (confidence >= 0.75) return "text-emerald-300";
-  if (confidence >= 0.55) return "text-amber-300";
-  return "text-slate-400";
-}
-
-function getDecisionForTicker(
-  decisions: AutopilotDecision[],
-  ticker: string,
-): AutopilotDecision | undefined {
-  return decisions.find((decision) => decision.ticker === ticker);
-}
-
-function getActionCount(
-  summary: JournalSummary | null,
-  action: SignalAction,
-): number {
-  return summary?.byAction?.[action] ?? 0;
-}
-
-function getTopTicker(summary: JournalSummary | null): string {
-  if (!summary || Object.keys(summary.byTicker).length === 0) return "—";
-  return (
-    Object.entries(summary.byTicker).sort((a, b) => b[1] - a[1])[0]?.[0] ?? "—"
-  );
-}
 
 export default function App() {
   const [tradeMode, setTradeMode] = useState<TradeMode>("paper");
@@ -1079,441 +880,37 @@ export default function App() {
         </section>
 
         <section className="xl:col-span-4 flex flex-col gap-6">
-          <div className="bg-slate-900/60 rounded-2xl border border-slate-800 p-4">
-            <div className="flex items-start justify-between gap-4 mb-4">
-              <div>
-                <h2 className="text-sm font-bold tracking-wider text-slate-300">
-                  AUTOPILOT CONTROL CENTER
-                </h2>
-                <p className="text-[10px] text-slate-500">
-                  Shared strategyEngine, Alpaca bars, safety layer active
-                </p>
-              </div>
-              <span
-                className={`px-2 py-1 rounded-full border text-[10px] font-black ${autopilotStatus.running ? "bg-amber-500/10 text-amber-300 border-amber-500/30" : "bg-slate-950 text-slate-400 border-slate-800"}`}
-              >
-                {autopilotStatus.running ? "RUNNING" : "IDLE"}
-              </span>
-            </div>
+          <AutopilotControlCenter
+            autopilotStatus={autopilotStatus}
+            autopilotEnabled={autopilotEnabled}
+            isRunningAutopilot={isRunningAutopilot}
+            onRunOnce={handleRunAutopilotOnce}
+            onToggleScheduled={handleAutopilotToggle}
+          />
 
-            <div className="grid grid-cols-2 gap-2 mb-4 text-[10px]">
-              <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-3">
-                <div className="text-slate-500 font-black uppercase">
-                  Execution
-                </div>
-                <div
-                  className={
-                    autopilotStatus.executeTrades
-                      ? "text-rose-300 font-bold"
-                      : "text-blue-300 font-bold"
-                  }
-                >
-                  {autopilotStatus.executeTrades
-                    ? "CAN EXECUTE"
-                    : "DRY-RUN ONLY"}
-                </div>
-              </div>
-              <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-3">
-                <div className="text-slate-500 font-black uppercase">
-                  Buy / Sell
-                </div>
-                <div className="text-slate-300 font-bold">
-                  BUY {autopilotStatus.allowBuy ? "ON" : "OFF"} · SELL{" "}
-                  {autopilotStatus.allowSell ? "ON" : "OFF"}
-                </div>
-              </div>
-              <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-3">
-                <div className="text-slate-500 font-black uppercase">
-                  Min Confidence
-                </div>
-                <div className="text-emerald-300 font-bold">
-                  {autopilotStatus.minConfidence}
-                </div>
-              </div>
-              <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-3">
-                <div className="text-slate-500 font-black uppercase">
-                  Max Sell
-                </div>
-                <div className="text-amber-300 font-bold">
-                  {Math.round(autopilotStatus.maxSellFraction * 100)}% per
-                  signal
-                </div>
-              </div>
-            </div>
+          <DecisionJournalPanel
+            journalFile={journalFile}
+            journalRuns={journalRuns}
+            journalSummary={journalSummary}
+            isLoadingJournal={isLoadingJournal}
+            onRefresh={refreshAutopilotJournal}
+          />
 
-            <div className="flex gap-2 mb-4">
-              <button
-                onClick={handleRunAutopilotOnce}
-                disabled={isRunningAutopilot}
-                className="flex-1 px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-bold text-xs transition-colors"
-              >
-                {isRunningAutopilot ? "RUNNING..." : "RUN ONCE"}
-              </button>
-              <button
-                onClick={handleAutopilotToggle}
-                className={`flex-1 px-3 py-2 rounded-xl font-bold text-xs transition-colors ${autopilotEnabled ? "bg-emerald-600 hover:bg-emerald-500 text-white" : "bg-slate-800 hover:bg-slate-700 text-slate-300"}`}
-              >
-                {autopilotEnabled ? "SCHEDULED ON" : "SCHEDULED OFF"}
-              </button>
-            </div>
+          <LastAutopilotDecisions
+            latestDecisions={latestDecisions}
+            actionableCount={actionableDecisions.length}
+          />
 
-            <div className="flex items-center justify-between text-[10px] text-slate-500 border-t border-slate-800 pt-3">
-              <span>
-                Last run: {formatTimestamp(autopilotStatus.lastRunAt)}
-              </span>
-              <span>
-                Telegram cooldown: {autopilotStatus.telegramCooldownMinutes}m
-              </span>
-            </div>
+          <ChatTerminal
+            chatHistory={chatHistory}
+            chatInput={chatInput}
+            isWaitingOnAI={isWaitingOnAI}
+            chatEndRef={chatEndRef}
+            onInputChange={setChatInput}
+            onSendMessage={handleSendMessage}
+          />
 
-            {autopilotStatus.lastError && (
-              <div className="mt-3 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-200">
-                {autopilotStatus.lastError}
-              </div>
-            )}
-          </div>
-
-          <div className="bg-slate-900/60 rounded-2xl border border-slate-800 p-4">
-            <div className="flex items-start justify-between gap-4 mb-4">
-              <div>
-                <h2 className="text-sm font-bold tracking-wider text-slate-300">
-                  DECISION JOURNAL
-                </h2>
-                <p className="text-[10px] text-slate-500 truncate max-w-[300px]">
-                  {journalFile || "backend/data/autopilot-decisions.jsonl"}
-                </p>
-              </div>
-              <button
-                onClick={refreshAutopilotJournal}
-                disabled={isLoadingJournal}
-                className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:text-slate-600 text-[10px] font-black text-slate-300"
-              >
-                {isLoadingJournal ? "LOADING" : "REFRESH"}
-              </button>
-            </div>
-
-            <div className="grid grid-cols-4 gap-2 mb-4">
-              <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-2">
-                <div className="text-[9px] text-slate-500 font-black uppercase">
-                  Runs
-                </div>
-                <div className="text-lg font-black text-white">
-                  {journalSummary?.totalRuns ?? 0}
-                </div>
-              </div>
-              <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-2">
-                <div className="text-[9px] text-slate-500 font-black uppercase">
-                  Signals
-                </div>
-                <div className="text-lg font-black text-amber-300">
-                  {journalSummary?.actionableSignals ?? 0}
-                </div>
-              </div>
-              <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-2">
-                <div className="text-[9px] text-slate-500 font-black uppercase">
-                  Executed
-                </div>
-                <div className="text-lg font-black text-emerald-300">
-                  {journalSummary?.executedSignals ?? 0}
-                </div>
-              </div>
-              <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-2">
-                <div className="text-[9px] text-slate-500 font-black uppercase">
-                  Top
-                </div>
-                <div className="text-lg font-black text-blue-300">
-                  {getTopTicker(journalSummary)}
-                </div>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-3 gap-2 mb-4 text-[10px]">
-              <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-2">
-                <span className="text-emerald-300 font-black">BUY</span>
-                <span className="float-right font-mono">
-                  {getActionCount(journalSummary, "BUY")}
-                </span>
-              </div>
-              <div className="rounded-lg bg-rose-500/10 border border-rose-500/20 p-2">
-                <span className="text-rose-300 font-black">SELL</span>
-                <span className="float-right font-mono">
-                  {getActionCount(journalSummary, "SELL")}
-                </span>
-              </div>
-              <div className="rounded-lg bg-slate-950/60 border border-slate-800 p-2">
-                <span className="text-slate-400 font-black">HOLD</span>
-                <span className="float-right font-mono">
-                  {getActionCount(journalSummary, "HOLD")}
-                </span>
-              </div>
-            </div>
-
-            <div className="space-y-2 max-h-[240px] overflow-y-auto pr-1">
-              {journalRuns.length === 0 ? (
-                <div className="text-center text-slate-600 py-8 text-xs">
-                  No journal runs yet. Press RUN ONCE.
-                </div>
-              ) : (
-                journalRuns.map((run) => {
-                  const buyCount = run.decisions.filter(
-                    (decision) => decision.action === "BUY",
-                  ).length;
-                  const sellCount = run.decisions.filter(
-                    (decision) => decision.action === "SELL",
-                  ).length;
-                  const holdCount = run.decisions.filter(
-                    (decision) => decision.action === "HOLD",
-                  ).length;
-                  const strongestDecision = [...run.decisions].sort(
-                    (a, b) => b.confidence - a.confidence,
-                  )[0];
-
-                  return (
-                    <div
-                      key={run.id}
-                      className="rounded-xl border border-slate-800 bg-slate-950/50 p-3"
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <span className="text-xs font-black text-white">
-                              {formatTimestamp(run.timestamp)}
-                            </span>
-                            <span className="px-1.5 py-0.5 rounded bg-slate-800 text-[9px] font-black text-slate-400 uppercase">
-                              {run.trigger}
-                            </span>
-                            <span className="px-1.5 py-0.5 rounded bg-blue-500/10 text-[9px] font-black text-blue-300 uppercase">
-                              {run.executeTrades ? "execution" : "dry-run"}
-                            </span>
-                          </div>
-                          <div className="mt-1 text-[10px] text-slate-500">
-                            BUY {buyCount} · SELL {sellCount} · HOLD {holdCount}
-                          </div>
-                        </div>
-
-                        <div className="text-right">
-                          <div className="text-xs font-black text-amber-300">
-                            {run.actionableCount}
-                          </div>
-                          <div className="text-[9px] text-slate-500 uppercase">
-                            actionable
-                          </div>
-                        </div>
-                      </div>
-
-                      {strongestDecision && (
-                        <div className="mt-2 rounded-lg bg-slate-900/60 border border-slate-800 p-2 text-[10px]">
-                          <span
-                            className={`px-1.5 py-0.5 rounded-full border font-black mr-2 ${actionPillClass(strongestDecision.action)}`}
-                          >
-                            {strongestDecision.ticker}{" "}
-                            {strongestDecision.action}
-                          </span>
-                          <span
-                            className={confidenceClass(
-                              strongestDecision.confidence,
-                            )}
-                          >
-                            conf {strongestDecision.confidence}
-                          </span>
-                          {strongestDecision.originalSuggestedShares && (
-                            <span className="text-amber-300 ml-2">
-                              {strongestDecision.suggestedShares}/
-                              {strongestDecision.originalSuggestedShares}
-                            </span>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          </div>
-
-          <div className="bg-slate-900/60 rounded-2xl border border-slate-800 p-4 flex flex-col min-h-[360px]">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-sm font-bold tracking-wider text-slate-300">
-                LAST AUTOPILOT DECISIONS
-              </h2>
-              <span className="text-[10px] text-slate-500">
-                actionable {actionableDecisions.length}
-              </span>
-            </div>
-
-            <div className="space-y-2 overflow-y-auto pr-1">
-              {latestDecisions.length === 0 ? (
-                <div className="text-center text-slate-600 py-16 text-xs">
-                  Run dry-run to see signals.
-                </div>
-              ) : (
-                latestDecisions.map((decision) => (
-                  <div
-                    key={`${decision.ticker}-${decision.timestamp}`}
-                    className="rounded-xl border border-slate-800 bg-slate-950/50 p-3"
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="font-black text-sm">
-                            {decision.ticker}
-                          </span>
-                          <span
-                            className={`px-2 py-0.5 rounded-full border text-[10px] font-black ${actionPillClass(decision.action)}`}
-                          >
-                            {decision.action}
-                          </span>
-                        </div>
-                        <div className="text-[10px] text-slate-500 mt-1">
-                          RSI {decision.rsi} · MACD {decision.macdHistogram} ·
-                          price {formatMoney(decision.price)}
-                        </div>
-                      </div>
-
-                      <div className="text-right">
-                        <div
-                          className={`font-mono text-xs font-black ${confidenceClass(decision.confidence)}`}
-                        >
-                          {decision.confidence}
-                        </div>
-                        <div className="text-[10px] text-slate-500">
-                          confidence
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="mt-2 text-xs text-slate-300 leading-relaxed">
-                      {decision.reason}
-                    </div>
-
-                    {decision.action !== "HOLD" && (
-                      <div className="mt-2 grid grid-cols-2 gap-2 text-[10px]">
-                        <div className="rounded-lg bg-slate-900/70 border border-slate-800 p-2">
-                          <span className="text-slate-500">Suggested</span>
-                          <div className="font-bold text-white">
-                            {decision.suggestedShares} shares
-                            {decision.originalSuggestedShares
-                              ? ` / original ${decision.originalSuggestedShares}`
-                              : ""}
-                          </div>
-                        </div>
-                        <div className="rounded-lg bg-slate-900/70 border border-slate-800 p-2">
-                          <span className="text-slate-500">Executed</span>
-                          <div
-                            className={
-                              decision.executed
-                                ? "font-bold text-emerald-300"
-                                : "font-bold text-blue-300"
-                            }
-                          >
-                            {decision.executed ? "YES" : "NO"}
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {decision.safetyNote && (
-                      <div className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2 text-[10px] text-amber-200">
-                        {decision.safetyNote}
-                      </div>
-                    )}
-
-                    {decision.skippedReason && (
-                      <div className="mt-2 text-[10px] text-slate-500">
-                        Skipped: {decision.skippedReason}
-                      </div>
-                    )}
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-
-          <div className="bg-slate-900/60 rounded-2xl border border-slate-800 flex flex-col min-h-[420px] overflow-hidden">
-            <div className="px-4 py-3 border-b border-slate-800/80 flex items-center justify-between bg-slate-900/40">
-              <span className="text-xs font-black tracking-widest text-slate-400">
-                CHAT TERMINAL
-              </span>
-              <span className="text-[10px] text-slate-500">
-                OpenAI via backend
-              </span>
-            </div>
-
-            <div className="flex-1 overflow-y-auto p-4 space-y-4">
-              {chatHistory.map((msg) => (
-                <div
-                  key={msg.id}
-                  className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}
-                >
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="text-[10px] text-slate-500 font-bold">
-                      {msg.timestamp}
-                    </span>
-                    <span
-                      className={`text-[9px] font-black tracking-wider uppercase px-1.5 rounded ${msg.role === "user" ? "bg-slate-800 text-slate-300" : "bg-blue-900/50 text-blue-300"}`}
-                    >
-                      {msg.role === "user" ? "Operator" : "AI Agent"}
-                    </span>
-                  </div>
-                  <div
-                    className={`p-3 rounded-2xl text-xs max-w-[90%] leading-relaxed ${msg.role === "user" ? "bg-slate-800 text-white rounded-tr-none" : "bg-slate-950/60 text-slate-200 rounded-tl-none border border-slate-800/60"}`}
-                  >
-                    {msg.content}
-                  </div>
-                </div>
-              ))}
-
-              {isWaitingOnAI && (
-                <div className="p-3 bg-slate-950/60 text-slate-500 rounded-2xl border border-slate-800/60 text-xs animate-pulse">
-                  AI analyzing current Alpaca snapshot...
-                </div>
-              )}
-
-              <div ref={chatEndRef} />
-            </div>
-
-            <form
-              onSubmit={handleSendMessage}
-              className="p-3 bg-slate-950 border-t border-slate-800/80 flex gap-2"
-            >
-              <input
-                type="text"
-                value={chatInput}
-                onChange={(event) => setChatInput(event.target.value)}
-                placeholder="Ask about positions, signals, or risk..."
-                className="flex-1 bg-slate-900 border border-slate-800 rounded-xl px-4 py-2.5 text-xs text-slate-200 focus:outline-none focus:border-slate-700"
-              />
-              <button
-                type="submit"
-                disabled={isWaitingOnAI}
-                className="p-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-500 text-white transition-all"
-              >
-                →
-              </button>
-            </form>
-          </div>
-
-          <div className="bg-slate-900/60 rounded-2xl border border-slate-800 p-4 h-[180px] flex flex-col">
-            <h2 className="text-sm font-bold tracking-wider text-slate-400 mb-2">
-              AUTOPILOT LOGS
-            </h2>
-            <div className="flex-1 overflow-y-auto pr-1 font-mono text-[10px] space-y-1.5 text-slate-400">
-              {autopilotLogs.length === 0 ? (
-                <div className="text-slate-600 text-center py-10">
-                  Logs idle.
-                </div>
-              ) : (
-                autopilotLogs.map((log, index) => (
-                  <div
-                    key={`${log}-${index}`}
-                    className="p-1.5 rounded bg-slate-950/40 border border-slate-800/40 leading-normal"
-                  >
-                    {log}
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
+          <AutopilotLogs logs={autopilotLogs} />
         </section>
       </main>
     </div>
