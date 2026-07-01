@@ -74,8 +74,10 @@ export interface AutopilotDecisionLog {
   action: StrategyDecision["action"];
   confidence: number;
   suggestedShares: number;
+  originalSuggestedShares?: number;
   reasonType: StrategyDecision["reasonType"];
   reason: string;
+  safetyNote?: string;
   executed: boolean;
   skippedReason?: string;
   result?: ExecuteSafeTradeResult;
@@ -84,11 +86,15 @@ export interface AutopilotDecisionLog {
 export interface AutopilotStatus {
   enabled: boolean;
   executeTrades: boolean;
+  allowBuy: boolean;
+  allowSell: boolean;
   tradeMode: "paper" | "live";
   running: boolean;
   intervalMs: number;
   tickers: string[];
   minConfidence: number;
+  maxSellFraction: number;
+  telegramCooldownMinutes: number;
   lastRunAt: string | null;
   lastError: string | null;
   lastDecisions: AutopilotDecisionLog[];
@@ -116,6 +122,15 @@ const AUTOPILOT_COOLDOWN_MINUTES = Number.parseInt(
   10,
 );
 
+const AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES = Number.parseInt(
+  process.env.AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES || "30",
+  10,
+);
+
+const AUTOPILOT_MAX_SELL_FRACTION = Number.parseFloat(
+  process.env.AUTOPILOT_MAX_SELL_FRACTION || "0.25",
+);
+
 const ALPACA_DATA_FEED = process.env.ALPACA_DATA_FEED || "iex";
 
 const AUTOPILOT_TICKERS = (
@@ -127,6 +142,9 @@ const AUTOPILOT_TICKERS = (
 
 const AUTOPILOT_EXECUTE_TRADES =
   process.env.AUTOPILOT_EXECUTE_TRADES === "true";
+
+const AUTOPILOT_ALLOW_BUY = process.env.AUTOPILOT_ALLOW_BUY === "true";
+const AUTOPILOT_ALLOW_SELL = process.env.AUTOPILOT_ALLOW_SELL === "true";
 
 const AUTOPILOT_ENABLED_DEFAULT =
   process.env.AUTOPILOT_ENABLED_DEFAULT === "true";
@@ -144,6 +162,43 @@ function getErrorMessage(error: unknown): string {
   } catch {
     return "Unknown error";
   }
+}
+
+function clampFraction(value: number): number {
+  if (!Number.isFinite(value)) return 0.25;
+  return Math.max(0.01, Math.min(1, value));
+}
+
+function getSafeSellShares(
+  reasonType: StrategyDecision["reasonType"],
+  suggestedShares: number,
+  sharesOwned: number,
+): { shares: number; safetyNote?: string } {
+  if (suggestedShares <= 0 || sharesOwned <= 0) {
+    return { shares: 0 };
+  }
+
+  if (reasonType === "STOP_LOSS") {
+    return {
+      shares: Math.min(suggestedShares, sharesOwned),
+      safetyNote: "STOP_LOSS can sell the full position.",
+    };
+  }
+
+  const maxFraction = clampFraction(AUTOPILOT_MAX_SELL_FRACTION);
+  const cappedShares = Math.max(1, Math.floor(sharesOwned * maxFraction));
+  const safeShares = Math.min(suggestedShares, cappedShares, sharesOwned);
+
+  if (safeShares < suggestedShares) {
+    return {
+      shares: safeShares,
+      safetyNote: `Safety cap: reduced SELL from ${suggestedShares} to ${safeShares} shares (${Math.round(
+        maxFraction * 100,
+      )}% max sell fraction).`,
+    };
+  }
+
+  return { shares: safeShares };
 }
 
 async function fetchAlpacaBars(ticker: string): Promise<AlpacaBar[]> {
@@ -216,6 +271,16 @@ function calculateBarsSinceLastBuy(
   return elapsedMs >= cooldownMs ? DEFAULT_STRATEGY_CONFIG.cooldownBars : 0;
 }
 
+function buildSignalKey(decision: AutopilotDecisionLog): string {
+  return [
+    decision.ticker,
+    decision.action,
+    decision.reasonType,
+    decision.suggestedShares,
+    decision.reason,
+  ].join("|");
+}
+
 export function createAutopilotWorker(options: AutopilotWorkerOptions) {
   let enabled = AUTOPILOT_ENABLED_DEFAULT;
   let running = false;
@@ -224,6 +289,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
   let lastError: string | null = null;
   let lastDecisions: AutopilotDecisionLog[] = [];
   const lastBuyAtByTicker = new Map<string, number>();
+  const lastTelegramSentAtBySignal = new Map<string, number>();
 
   async function analyzeTicker(
     ticker: string,
@@ -274,6 +340,20 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       barsSinceLastBuy,
     });
 
+    let safeSuggestedShares = decision.suggestedShares;
+    let safetyNote: string | undefined;
+
+    if (decision.action === "SELL") {
+      const safeSell = getSafeSellShares(
+        decision.reasonType,
+        decision.suggestedShares,
+        sharesOwned,
+      );
+
+      safeSuggestedShares = safeSell.shares;
+      safetyNote = safeSell.safetyNote;
+    }
+
     const log: AutopilotDecisionLog = {
       ticker,
       timestamp: new Date().toISOString(),
@@ -285,9 +365,14 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       bollingerUpper: bb.upper,
       action: decision.action,
       confidence: decision.confidence,
-      suggestedShares: decision.suggestedShares,
+      suggestedShares: safeSuggestedShares,
+      originalSuggestedShares:
+        safeSuggestedShares !== decision.suggestedShares
+          ? decision.suggestedShares
+          : undefined,
       reasonType: decision.reasonType,
       reason: decision.reason,
+      safetyNote,
       executed: false,
     };
 
@@ -308,13 +393,24 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     }
 
     if (options.tradeMode !== "paper") {
-      log.skippedReason =
-        "Autopilot execution is blocked outside paper mode.";
+      log.skippedReason = "Autopilot execution is blocked outside paper mode.";
       return log;
     }
 
-    if (decision.suggestedShares <= 0) {
-      log.skippedReason = "No positive share quantity suggested.";
+    if (decision.action === "BUY" && !AUTOPILOT_ALLOW_BUY) {
+      log.skippedReason =
+        "BUY execution blocked. Set AUTOPILOT_ALLOW_BUY=true to allow autopilot buys.";
+      return log;
+    }
+
+    if (decision.action === "SELL" && !AUTOPILOT_ALLOW_SELL) {
+      log.skippedReason =
+        "SELL execution blocked. Set AUTOPILOT_ALLOW_SELL=true to allow autopilot sells.";
+      return log;
+    }
+
+    if (safeSuggestedShares <= 0) {
+      log.skippedReason = "No positive safe share quantity suggested.";
       return log;
     }
 
@@ -331,7 +427,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     const result = await options.executeSafeTrade(
       ticker,
       decision.action,
-      decision.suggestedShares,
+      safeSuggestedShares,
       "market",
       undefined,
       stopLoss,
@@ -353,6 +449,44 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     return log;
   }
 
+  async function sendTelegramForNewActionableSignals(
+    actionable: AutopilotDecisionLog[],
+  ) {
+    if (!options.sendTelegramAlert || actionable.length === 0) return;
+
+    const now = Date.now();
+    const cooldownMs = AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES * 60 * 1000;
+
+    const newSignals = actionable.filter((decision) => {
+      const key = buildSignalKey(decision);
+      const lastSentAt = lastTelegramSentAtBySignal.get(key);
+
+      if (lastSentAt && now - lastSentAt < cooldownMs) {
+        return false;
+      }
+
+      lastTelegramSentAtBySignal.set(key, now);
+      return true;
+    });
+
+    if (newSignals.length === 0) return;
+
+    const lines = newSignals.map((decision) => {
+      const original = decision.originalSuggestedShares
+        ? ` original=${decision.originalSuggestedShares}`
+        : "";
+      const safety = decision.safetyNote ? ` | ${decision.safetyNote}` : "";
+
+      return `${decision.ticker}: ${decision.action} ${decision.suggestedShares}${original}, confidence=${decision.confidence}, executed=${decision.executed}, reason=${decision.reason}${safety}`;
+    });
+
+    await options.sendTelegramAlert(
+      `Autopilot ${AUTOPILOT_EXECUTE_TRADES ? "EXECUTION" : "DRY-RUN"} signals:\n${lines.join(
+        "\n",
+      )}`,
+    );
+  }
+
   async function runOnce(trigger: "manual" | "scheduled" = "manual") {
     if (running) {
       return {
@@ -372,6 +506,9 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       executeTrades: AUTOPILOT_EXECUTE_TRADES,
     });
 
+    let decisions: AutopilotDecisionLog[] = [];
+    let topLevelError: string | null = null;
+
     try {
       const portfolio = await options.getPortfolioSnapshot();
       const tickers = Array.from(
@@ -382,8 +519,6 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           ),
         ]),
       );
-
-      const decisions: AutopilotDecisionLog[] = [];
 
       for (const ticker of tickers) {
         try {
@@ -441,41 +576,33 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         actionableCount: actionable.length,
       });
 
-      if (options.sendTelegramAlert && actionable.length > 0) {
-        const lines = actionable.map(
-          (decision) =>
-            `${decision.ticker}: ${decision.action} ${decision.suggestedShares}, confidence=${decision.confidence}, executed=${decision.executed}, reason=${decision.reason}`,
-        );
-
-        await options.sendTelegramAlert(
-          `Autopilot ${AUTOPILOT_EXECUTE_TRADES ? "EXECUTION" : "DRY-RUN"} signals:\n${lines.join(
-            "\n",
-          )}`,
-        );
-      }
-
-      return {
-        skipped: false,
-        decisions,
-        status: getStatus(),
-      };
+      await sendTelegramForNewActionableSignals(actionable);
     } catch (error) {
-      lastError = getErrorMessage(error);
+      topLevelError = getErrorMessage(error);
+      lastError = topLevelError;
 
       options.broadcastSSE({
         type: "autopilot_worker_error",
-        message: lastError,
+        message: topLevelError,
         timestamp: new Date().toISOString(),
       });
-
-      return {
-        skipped: false,
-        error: lastError,
-        status: getStatus(),
-      };
     } finally {
       running = false;
     }
+
+    if (topLevelError) {
+      return {
+        skipped: false,
+        error: topLevelError,
+        status: getStatus(),
+      };
+    }
+
+    return {
+      skipped: false,
+      decisions,
+      status: getStatus(),
+    };
   }
 
   function start() {
@@ -502,6 +629,8 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       type: "autopilot_status",
       enabled,
       executeTrades: AUTOPILOT_EXECUTE_TRADES,
+      allowBuy: AUTOPILOT_ALLOW_BUY,
+      allowSell: AUTOPILOT_ALLOW_SELL,
       timestamp: new Date().toISOString(),
     });
   }
@@ -510,11 +639,15 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     return {
       enabled,
       executeTrades: AUTOPILOT_EXECUTE_TRADES,
+      allowBuy: AUTOPILOT_ALLOW_BUY,
+      allowSell: AUTOPILOT_ALLOW_SELL,
       tradeMode: options.tradeMode,
       running,
       intervalMs: AUTOPILOT_INTERVAL_MS,
       tickers: AUTOPILOT_TICKERS,
       minConfidence: AUTOPILOT_MIN_CONFIDENCE,
+      maxSellFraction: clampFraction(AUTOPILOT_MAX_SELL_FRACTION),
+      telegramCooldownMinutes: AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES,
       lastRunAt,
       lastError,
       lastDecisions,
