@@ -36,6 +36,20 @@ interface WatchlistItem {
   isUp: boolean;
 }
 
+interface AlpacaBar {
+  t: string;
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;
+}
+
+interface AlpacaBarsResponse {
+  bars?: AlpacaBar[];
+  next_page_token?: string | null;
+}
+
 type AlpacaConstructor = new (config: {
   keyId: string;
   secretKey: string;
@@ -43,6 +57,11 @@ type AlpacaConstructor = new (config: {
 }) => AlpacaLike;
 
 const defaultWatchlist = ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"];
+const ALPACA_DATA_FEED = process.env.ALPACA_DATA_FEED || "iex";
+
+function toIsoDate(date: Date): string {
+  return date.toISOString().split("T")[0] ?? date.toISOString();
+}
 
 function asRecord(value: unknown): UnknownRecord {
   return typeof value === "object" && value !== null
@@ -263,6 +282,68 @@ async function getOrdersSnapshot() {
   });
 }
 
+async function getPreviousCloseFromAlpaca(ticker: string): Promise<number> {
+  const endDate = new Date();
+  const startDate = new Date();
+
+  // Wider window handles weekends and market holidays.
+  startDate.setDate(endDate.getDate() - 14);
+
+  const url = new URL(`https://data.alpaca.markets/v2/stocks/${ticker}/bars`);
+
+  url.searchParams.set("timeframe", "1Day");
+  url.searchParams.set("start", toIsoDate(startDate));
+  url.searchParams.set("end", toIsoDate(endDate));
+  url.searchParams.set("adjustment", "raw");
+  url.searchParams.set("feed", ALPACA_DATA_FEED);
+  url.searchParams.set("limit", "10");
+
+  const keyId = isLiveMode ? ENV.APCA_API_KEY_ID_LIVE! : ENV.APCA_API_KEY_ID;
+  const secretKey = isLiveMode
+    ? ENV.APCA_API_SECRET_KEY_LIVE!
+    : ENV.APCA_API_SECRET_KEY;
+
+  const response = await fetch(url.toString(), {
+    headers: {
+      "APCA-API-KEY-ID": keyId,
+      "APCA-API-SECRET-KEY": secretKey,
+    },
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+
+    throw new Error(
+      `Alpaca previous close request failed for ${ticker}: HTTP ${response.status} ${body}`,
+    );
+  }
+
+  const data = (await response.json()) as AlpacaBarsResponse;
+  const bars = data.bars ?? [];
+
+  if (bars.length === 0) return 0;
+
+  const sortedBars = bars.sort(
+    (a, b) => new Date(a.t).getTime() - new Date(b.t).getTime(),
+  );
+
+  // Prefer previous completed daily bar. Fallback to latest available bar.
+  const previousBar =
+    sortedBars.length >= 2
+      ? sortedBars[sortedBars.length - 2]
+      : sortedBars[sortedBars.length - 1];
+
+  return previousBar?.c ?? 0;
+}
+
+function calculateDailyChangePercent(
+  price: number,
+  previousClose: number,
+): number {
+  if (price <= 0 || previousClose <= 0) return 0;
+  return Number((((price - previousClose) / previousClose) * 100).toFixed(2));
+}
+
 async function getWatchlistQuotesFromAlpaca(
   tickers: string[],
   positions: Record<string, PositionSnapshot>,
@@ -277,24 +358,29 @@ async function getWatchlistQuotesFromAlpaca(
     uniqueTickers.map(async (ticker): Promise<WatchlistItem> => {
       const position = positions[ticker];
 
-      if (position && position.currentPrice > 0) {
-        return {
-          ticker,
-          name: ticker,
-          price: position.currentPrice,
-          change: position.pnlPercent,
-          isUp: position.pnlPercent >= 0,
-        };
-      }
-
       try {
-        const latestTrade = await alpaca.getLatestTrade(ticker);
-        const price = extractAlpacaPrice(latestTrade);
+        let price = 0;
+
+        if (position && position.currentPrice > 0) {
+          price = position.currentPrice;
+        } else {
+          const latestTrade = await alpaca.getLatestTrade(ticker);
+          price = extractAlpacaPrice(latestTrade);
+        }
 
         if (price <= 0) {
+          console.warn(`[WATCHLIST] Alpaca returned no price for ${ticker}`);
+        }
+
+        let change = 0;
+
+        try {
+          const previousClose = await getPreviousCloseFromAlpaca(ticker);
+          change = calculateDailyChangePercent(price, previousClose);
+        } catch (error) {
           console.warn(
-            `[WATCHLIST] Alpaca returned no price for ${ticker}`,
-            latestTrade,
+            `[WATCHLIST] Failed to fetch previous close for ${ticker}:`,
+            error,
           );
         }
 
@@ -302,8 +388,8 @@ async function getWatchlistQuotesFromAlpaca(
           ticker,
           name: ticker,
           price,
-          change: 0,
-          isUp: true,
+          change,
+          isUp: change >= 0,
         };
       } catch (error) {
         console.warn(
