@@ -8,6 +8,7 @@ import {
   decideTradeSignal,
   type StrategyDecision,
 } from "./strategyEngine.js";
+import { appendAutopilotRun } from "./decisionJournal.js";
 
 interface AlpacaBar {
   t: string;
@@ -95,6 +96,7 @@ export interface AutopilotStatus {
   minConfidence: number;
   maxSellFraction: number;
   telegramCooldownMinutes: number;
+  lastJournalRunId: string | null;
   lastRunAt: string | null;
   lastError: string | null;
   lastDecisions: AutopilotDecisionLog[];
@@ -286,6 +288,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
   let running = false;
   let timer: NodeJS.Timeout | null = null;
   let lastRunAt: string | null = null;
+  let lastJournalRunId: string | null = null;
   let lastError: string | null = null;
   let lastDecisions: AutopilotDecisionLog[] = [];
   const lastBuyAtByTicker = new Map<string, number>();
@@ -568,10 +571,35 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           decision.confidence >= AUTOPILOT_MIN_CONFIDENCE,
       );
 
+      try {
+        const journalRun = await appendAutopilotRun({
+          timestamp: lastRunAt,
+          trigger,
+          executeTrades: AUTOPILOT_EXECUTE_TRADES,
+          tradeMode: options.tradeMode,
+          enabled,
+          tickers,
+          actionableCount: actionable.length,
+          decisions,
+        });
+
+        lastJournalRunId = journalRun.id;
+      } catch (error) {
+        const journalError = getErrorMessage(error);
+        lastError = `Journal write failed: ${journalError}`;
+
+        options.broadcastSSE({
+          type: "autopilot_journal_error",
+          message: journalError,
+          timestamp: new Date().toISOString(),
+        });
+      }
+
       options.broadcastSSE({
         type: "autopilot_worker_finished",
         trigger,
         timestamp: lastRunAt,
+        journalRunId: lastJournalRunId,
         decisions,
         actionableCount: actionable.length,
       });
@@ -648,6 +676,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       minConfidence: AUTOPILOT_MIN_CONFIDENCE,
       maxSellFraction: clampFraction(AUTOPILOT_MAX_SELL_FRACTION),
       telegramCooldownMinutes: AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES,
+      lastJournalRunId,
       lastRunAt,
       lastError,
       lastDecisions,

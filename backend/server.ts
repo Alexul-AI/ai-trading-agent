@@ -7,6 +7,11 @@ import { z } from "zod";
 import { runTradingAgentStep } from "./agent.js";
 import { evaluateTrade, type AccountState } from "./riskManager.js";
 import { createAutopilotWorker } from "./autopilotWorker.js";
+import {
+  getAutopilotJournalPath,
+  readAutopilotRuns,
+  summarizeAutopilotRuns,
+} from "./decisionJournal.js";
 
 dotenv.config();
 
@@ -108,10 +113,11 @@ function extractAlpacaPrice(value: unknown): number {
   return 0;
 }
 
-const AlpacaClient = ((AlpacaModule as { default?: unknown; Alpaca?: unknown })
-  .default ??
+const AlpacaClient = (
+  (AlpacaModule as { default?: unknown; Alpaca?: unknown }).default ??
   (AlpacaModule as { default?: unknown; Alpaca?: unknown }).Alpaca ??
-  AlpacaModule) as AlpacaConstructor;
+  AlpacaModule
+) as AlpacaConstructor;
 
 const envSchema = z.object({
   PORT: z.coerce.number().default(3000),
@@ -336,10 +342,7 @@ async function getPreviousCloseFromAlpaca(ticker: string): Promise<number> {
   return previousBar?.c ?? 0;
 }
 
-function calculateDailyChangePercent(
-  price: number,
-  previousClose: number,
-): number {
+function calculateDailyChangePercent(price: number, previousClose: number): number {
   if (price <= 0 || previousClose <= 0) return 0;
   return Number((((price - previousClose) / previousClose) * 100).toFixed(2));
 }
@@ -349,9 +352,7 @@ async function getWatchlistQuotesFromAlpaca(
   positions: Record<string, PositionSnapshot>,
 ): Promise<WatchlistItem[]> {
   const uniqueTickers = Array.from(
-    new Set(
-      tickers.map((ticker) => ticker.trim().toUpperCase()).filter(Boolean),
-    ),
+    new Set(tickers.map((ticker) => ticker.trim().toUpperCase()).filter(Boolean)),
   );
 
   const items = await Promise.all(
@@ -392,10 +393,7 @@ async function getWatchlistQuotesFromAlpaca(
           isUp: change >= 0,
         };
       } catch (error) {
-        console.warn(
-          `[WATCHLIST] Failed to fetch ${ticker} from Alpaca:`,
-          error,
-        );
+        console.warn(`[WATCHLIST] Failed to fetch ${ticker} from Alpaca:`, error);
 
         return {
           ticker,
@@ -463,10 +461,7 @@ async function executeSafeTrade(
     const orderType = rawOrderType.toLowerCase();
 
     if (!ticker || !Number.isFinite(requestedShares) || requestedShares <= 0) {
-      return {
-        status: "rejected",
-        reason: "Invalid ticker or share quantity.",
-      };
+      return { status: "rejected", reason: "Invalid ticker or share quantity." };
     }
 
     const accountRecord = asRecord(await alpaca.getAccount());
@@ -478,9 +473,7 @@ async function executeSafeTrade(
     const currentEquity = toNumber(accountRecord.equity);
 
     const dailyDrawdown =
-      previousEquity > 0
-        ? (currentEquity - previousEquity) / previousEquity
-        : 0;
+      previousEquity > 0 ? (currentEquity - previousEquity) / previousEquity : 0;
 
     const accountState: AccountState = {
       equity: currentEquity,
@@ -514,9 +507,7 @@ async function executeSafeTrade(
         message: riskResult.reason,
       });
 
-      await sendTelegramAlert(
-        `REJECTED ${action} ${ticker}: ${riskResult.reason}`,
-      );
+      await sendTelegramAlert(`REJECTED ${action} ${ticker}: ${riskResult.reason}`);
 
       return {
         status: "rejected",
@@ -590,8 +581,7 @@ async function executeSafeTrade(
       adjustedShares: finalShares,
     };
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Unknown trade error";
+    const message = error instanceof Error ? error.message : "Unknown trade error";
     console.error("[TRADE] Failed:", error);
 
     return {
@@ -609,9 +599,7 @@ const autopilotWorker = createAutopilotWorker({
   sendTelegramAlert,
 });
 
-function createMarketContext(
-  snapshot: Awaited<ReturnType<typeof getDashboardSnapshot>>,
-) {
+function createMarketContext(snapshot: Awaited<ReturnType<typeof getDashboardSnapshot>>) {
   return [
     "CURRENT ALPACA SNAPSHOT:",
     JSON.stringify({
@@ -740,7 +728,12 @@ app.get("/api/watchlist", async (_req, res) => {
       new Set([...defaultWatchlist, ...Object.keys(portfolio.positions)]),
     ).filter(Boolean);
 
-    res.json(await getWatchlistQuotesFromAlpaca(tickers, portfolio.positions));
+    res.json(
+      await getWatchlistQuotesFromAlpaca(
+        tickers,
+        portfolio.positions,
+      ),
+    );
   } catch (error) {
     console.error("[API] /api/watchlist failed:", error);
     res.status(500).json({ error: "Failed to fetch watchlist" });
@@ -750,6 +743,39 @@ app.get("/api/watchlist", async (_req, res) => {
 app.get("/api/autopilot/status", (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
   res.json(autopilotWorker.getStatus());
+});
+
+app.get("/api/autopilot/journal", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  try {
+    const limit = Number.parseInt(String(req.query.limit ?? "50"), 10);
+    const runs = await readAutopilotRuns(Number.isFinite(limit) ? limit : 50);
+
+    res.json({
+      file: getAutopilotJournalPath(),
+      runs,
+    });
+  } catch (error) {
+    console.error("[API] /api/autopilot/journal failed:", error);
+    res.status(500).json({ error: "Failed to read autopilot journal" });
+  }
+});
+
+app.get("/api/autopilot/journal/summary", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  try {
+    const limit = Number.parseInt(String(req.query.limit ?? "200"), 10);
+    const summary = await summarizeAutopilotRuns(
+      Number.isFinite(limit) ? limit : 200,
+    );
+
+    res.json(summary);
+  } catch (error) {
+    console.error("[API] /api/autopilot/journal/summary failed:", error);
+    res.status(500).json({ error: "Failed to summarize autopilot journal" });
+  }
 });
 
 app.post("/api/autopilot/run-once", async (_req, res) => {
