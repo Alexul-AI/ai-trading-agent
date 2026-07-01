@@ -4,11 +4,9 @@ import dotenv from "dotenv";
 import * as AlpacaModule from "@alpacahq/alpaca-trade-api";
 import { z } from "zod";
 
-import {
-  runTradingAgentStep,
-  getTrendingStocks,
-} from "./agent.js";
+import { runTradingAgentStep } from "./agent.js";
 import { evaluateTrade, type AccountState } from "./riskManager.js";
+import { createAutopilotWorker } from "./autopilotWorker.js";
 
 dotenv.config();
 
@@ -44,6 +42,8 @@ type AlpacaConstructor = new (config: {
   paper: boolean;
 }) => AlpacaLike;
 
+const defaultWatchlist = ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"];
+
 function asRecord(value: unknown): UnknownRecord {
   return typeof value === "object" && value !== null
     ? (value as UnknownRecord)
@@ -56,10 +56,12 @@ function asArray(value: unknown): unknown[] {
 
 function toNumber(value: unknown, fallback = 0): number {
   if (typeof value === "number" && Number.isFinite(value)) return value;
+
   if (typeof value === "string") {
     const parsed = Number.parseFloat(value);
     return Number.isFinite(parsed) ? parsed : fallback;
   }
+
   return fallback;
 }
 
@@ -87,15 +89,10 @@ function extractAlpacaPrice(value: unknown): number {
   return 0;
 }
 
-/**
- * Node 22 + NodeNext fix:
- * Alpaca package works at runtime, but its ESM typings are not constructable.
- */
-const AlpacaClient = (
-  (AlpacaModule as { default?: unknown; Alpaca?: unknown }).default ??
+const AlpacaClient = ((AlpacaModule as { default?: unknown; Alpaca?: unknown })
+  .default ??
   (AlpacaModule as { default?: unknown; Alpaca?: unknown }).Alpaca ??
-  AlpacaModule
-) as AlpacaConstructor;
+  AlpacaModule) as AlpacaConstructor;
 
 const envSchema = z.object({
   PORT: z.coerce.number().default(3000),
@@ -168,9 +165,6 @@ const alpaca = new AlpacaClient({
     : ENV.APCA_API_SECRET_KEY,
   paper: !isLiveMode,
 });
-
-let isAutopilotEnabled = false;
-let dynamicScreenerTickers: string[] = ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"];
 
 let transactionHistory: Array<{
   timestamp: string;
@@ -274,7 +268,9 @@ async function getWatchlistQuotesFromAlpaca(
   positions: Record<string, PositionSnapshot>,
 ): Promise<WatchlistItem[]> {
   const uniqueTickers = Array.from(
-    new Set(tickers.map((ticker) => ticker.trim().toUpperCase()).filter(Boolean)),
+    new Set(
+      tickers.map((ticker) => ticker.trim().toUpperCase()).filter(Boolean),
+    ),
   );
 
   const items = await Promise.all(
@@ -296,7 +292,10 @@ async function getWatchlistQuotesFromAlpaca(
         const price = extractAlpacaPrice(latestTrade);
 
         if (price <= 0) {
-          console.warn(`[WATCHLIST] Alpaca returned no price for ${ticker}`, latestTrade);
+          console.warn(
+            `[WATCHLIST] Alpaca returned no price for ${ticker}`,
+            latestTrade,
+          );
         }
 
         return {
@@ -307,7 +306,10 @@ async function getWatchlistQuotesFromAlpaca(
           isUp: true,
         };
       } catch (error) {
-        console.warn(`[WATCHLIST] Failed to fetch ${ticker} from Alpaca:`, error);
+        console.warn(
+          `[WATCHLIST] Failed to fetch ${ticker} from Alpaca:`,
+          error,
+        );
 
         return {
           ticker,
@@ -329,7 +331,7 @@ async function getDashboardSnapshot() {
 
   const tickers = Array.from(
     new Set([
-      ...dynamicScreenerTickers,
+      ...defaultWatchlist,
       ...Object.keys(portfolio.positions),
       ...orders.map((order) => order.ticker),
     ]),
@@ -342,7 +344,8 @@ async function getDashboardSnapshot() {
 
   return {
     tradeMode: ENV.TRADE_MODE,
-    autopilotEnabled: isAutopilotEnabled,
+    autopilotEnabled: autopilotWorker.getStatus().enabled,
+    autopilot: autopilotWorker.getStatus(),
     portfolio,
     orders,
     watchlist,
@@ -374,7 +377,10 @@ async function executeSafeTrade(
     const orderType = rawOrderType.toLowerCase();
 
     if (!ticker || !Number.isFinite(requestedShares) || requestedShares <= 0) {
-      return { status: "rejected", reason: "Invalid ticker or share quantity." };
+      return {
+        status: "rejected",
+        reason: "Invalid ticker or share quantity.",
+      };
     }
 
     const accountRecord = asRecord(await alpaca.getAccount());
@@ -386,7 +392,9 @@ async function executeSafeTrade(
     const currentEquity = toNumber(accountRecord.equity);
 
     const dailyDrawdown =
-      previousEquity > 0 ? (currentEquity - previousEquity) / previousEquity : 0;
+      previousEquity > 0
+        ? (currentEquity - previousEquity) / previousEquity
+        : 0;
 
     const accountState: AccountState = {
       equity: currentEquity,
@@ -420,7 +428,9 @@ async function executeSafeTrade(
         message: riskResult.reason,
       });
 
-      await sendTelegramAlert(`REJECTED ${action} ${ticker}: ${riskResult.reason}`);
+      await sendTelegramAlert(
+        `REJECTED ${action} ${ticker}: ${riskResult.reason}`,
+      );
 
       return {
         status: "rejected",
@@ -494,7 +504,8 @@ async function executeSafeTrade(
       adjustedShares: finalShares,
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown trade error";
+    const message =
+      error instanceof Error ? error.message : "Unknown trade error";
     console.error("[TRADE] Failed:", error);
 
     return {
@@ -502,6 +513,35 @@ async function executeSafeTrade(
       reason: message,
     };
   }
+}
+
+const autopilotWorker = createAutopilotWorker({
+  tradeMode: ENV.TRADE_MODE,
+  getPortfolioSnapshot,
+  executeSafeTrade,
+  broadcastSSE,
+  sendTelegramAlert,
+});
+
+function createMarketContext(
+  snapshot: Awaited<ReturnType<typeof getDashboardSnapshot>>,
+) {
+  return [
+    "CURRENT ALPACA SNAPSHOT:",
+    JSON.stringify({
+      tradeMode: snapshot.tradeMode,
+      autopilotEnabled: snapshot.autopilotEnabled,
+      equity: snapshot.portfolio.equity,
+      cash: snapshot.portfolio.balance,
+      currency: snapshot.portfolio.currency,
+      positions: snapshot.portfolio.positions,
+      openOrders: snapshot.orders,
+      watchlist: snapshot.watchlist,
+      autopilot: snapshot.autopilot,
+    }),
+    "",
+    "USER MESSAGE:",
+  ].join("\n");
 }
 
 // -----------------------------------------------------------------------------
@@ -514,6 +554,8 @@ app.get("/health", (_req, res) => {
     ok: true,
     service: "ai-trading-agent-backend",
     mode: ENV.TRADE_MODE,
+    yahooFinance: "removed",
+    autopilot: autopilotWorker.getStatus(),
     timestamp: new Date().toISOString(),
   });
 });
@@ -547,7 +589,7 @@ app.get("/api/stream", (req, res) => {
   writeSSE(res, {
     type: "connected",
     tradeMode: ENV.TRADE_MODE,
-    autopilotEnabled: isAutopilotEnabled,
+    autopilot: autopilotWorker.getStatus(),
     timestamp: new Date().toISOString(),
   });
 
@@ -609,19 +651,24 @@ app.get("/api/watchlist", async (_req, res) => {
     const portfolio = await getPortfolioSnapshot();
 
     const tickers = Array.from(
-      new Set([...dynamicScreenerTickers, ...Object.keys(portfolio.positions)]),
+      new Set([...defaultWatchlist, ...Object.keys(portfolio.positions)]),
     ).filter(Boolean);
 
-    res.json(
-      await getWatchlistQuotesFromAlpaca(
-        tickers,
-        portfolio.positions,
-      ),
-    );
+    res.json(await getWatchlistQuotesFromAlpaca(tickers, portfolio.positions));
   } catch (error) {
     console.error("[API] /api/watchlist failed:", error);
     res.status(500).json({ error: "Failed to fetch watchlist" });
   }
+});
+
+app.get("/api/autopilot/status", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json(autopilotWorker.getStatus());
+});
+
+app.post("/api/autopilot/run-once", async (_req, res) => {
+  const result = await autopilotWorker.runOnce("manual");
+  res.json(result);
 });
 
 app.post("/api/trade", async (req, res) => {
@@ -687,8 +734,11 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
+    const snapshot = await getDashboardSnapshot();
+    const enrichedMessage = `${createMarketContext(snapshot)}\n${parsed.data.message}`;
+
     const response = await runTradingAgentStep(
-      parsed.data.message,
+      enrichedMessage,
       parsed.data.history,
       transactionHistory,
       executeSafeTrade,
@@ -719,45 +769,16 @@ app.post("/api/autopilot", (req, res) => {
     });
   }
 
-  isAutopilotEnabled = parsed.data.enabled;
-
-  broadcastSSE({
-    type: "autopilot_status",
-    enabled: isAutopilotEnabled,
-  });
+  autopilotWorker.setEnabled(parsed.data.enabled);
 
   res.json({
     success: true,
-    enabled: isAutopilotEnabled,
+    enabled: autopilotWorker.getStatus().enabled,
+    autopilot: autopilotWorker.getStatus(),
   });
 });
 
-setInterval(async () => {
-  try {
-    dynamicScreenerTickers = await getTrendingStocks();
-    console.log(`[SCREENER] ${dynamicScreenerTickers.join(", ")}`);
-  } catch {
-    console.warn("[SCREENER] Failed to refresh trending tickers.");
-  }
-}, 15 * 60_000);
-
-getTrendingStocks()
-  .then((tickers) => {
-    dynamicScreenerTickers = tickers;
-    console.log(`[SCREENER] initial: ${dynamicScreenerTickers.join(", ")}`);
-  })
-  .catch(() => {
-    console.warn("[SCREENER] Initial load failed. Using fallback tickers.");
-  });
-
-setInterval(async () => {
-  if (!isAutopilotEnabled) return;
-
-  broadcastSSE({
-    type: "autopilot_log",
-    message: "[Autopilot] Worker heartbeat. Strategy execution is currently paused/safe.",
-  });
-}, 60_000);
+autopilotWorker.start();
 
 app.listen(ENV.PORT, () => {
   console.log("");
@@ -765,5 +786,11 @@ app.listen(ENV.PORT, () => {
   console.log(`[SERVER] URL: http://localhost:${ENV.PORT}`);
   console.log(`[SERVER] Mode: ${ENV.TRADE_MODE}`);
   console.log(`[SERVER] Frontend origin: ${ENV.FRONTEND_ORIGIN}`);
+  console.log("[SERVER] Yahoo Finance: removed");
+  console.log(
+    `[SERVER] Autopilot: ${autopilotWorker.getStatus().enabled ? "enabled" : "disabled"} / ${
+      autopilotWorker.getStatus().executeTrades ? "execution" : "dry-run"
+    }`,
+  );
   console.log("");
 });
