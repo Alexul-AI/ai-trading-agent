@@ -1,497 +1,769 @@
-import express from "express";
+import express, { type Response } from "express";
 import cors from "cors";
-import Alpaca from "@alpacahq/alpaca-trade-api";
-import * as dotenv from "dotenv";
-// IMPORTANT: Using .js extension is required when moduleResolution is Node16/NodeNext in tsconfig
+import dotenv from "dotenv";
+import * as AlpacaModule from "@alpacahq/alpaca-trade-api";
+import { z } from "zod";
+
 import {
   runTradingAgentStep,
-  getWatchlistQuotes,
   getTrendingStocks,
 } from "./agent.js";
-import { logTrade } from "./db.js";
+import { evaluateTrade, type AccountState } from "./riskManager.js";
 
 dotenv.config();
 
-// --- TELEGRAM NOTIFICATIONS ---
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+type UnknownRecord = Record<string, unknown>;
 
-async function sendTelegramAlert(message: string) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-  try {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message,
-        parse_mode: "Markdown",
-      }),
-    });
-  } catch (error) {
-    console.error("[TELEGRAM] Failed to send alert", error);
+interface AlpacaLike {
+  getAccount(): Promise<unknown>;
+  getPositions(): Promise<unknown>;
+  getOrders(params?: unknown): Promise<unknown>;
+  getLatestTrade(symbol: string): Promise<unknown>;
+  createOrder(payload: unknown): Promise<unknown>;
+}
+
+interface PositionSnapshot {
+  shares: number;
+  avgPrice: number;
+  currentPrice: number;
+  pnl: number;
+  pnlPercent: number;
+}
+
+interface WatchlistItem {
+  ticker: string;
+  name: string;
+  price: number;
+  change: number;
+  isUp: boolean;
+}
+
+type AlpacaConstructor = new (config: {
+  keyId: string;
+  secretKey: string;
+  paper: boolean;
+}) => AlpacaLike;
+
+function asRecord(value: unknown): UnknownRecord {
+  return typeof value === "object" && value !== null
+    ? (value as UnknownRecord)
+    : {};
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function toNumber(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+}
+
+function toStringValue(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function extractAlpacaPrice(value: unknown): number {
+  const record = asRecord(value);
+
+  const possibleFields = [
+    record.Price,
+    record.price,
+    record.p,
+    record.P,
+    record.close,
+    record.c,
+  ];
+
+  for (const field of possibleFields) {
+    const parsed = toNumber(field, 0);
+    if (parsed > 0) return parsed;
+  }
+
+  return 0;
+}
+
+/**
+ * Node 22 + NodeNext fix:
+ * Alpaca package works at runtime, but its ESM typings are not constructable.
+ */
+const AlpacaClient = (
+  (AlpacaModule as { default?: unknown; Alpaca?: unknown }).default ??
+  (AlpacaModule as { default?: unknown; Alpaca?: unknown }).Alpaca ??
+  AlpacaModule
+) as AlpacaConstructor;
+
+const envSchema = z.object({
+  PORT: z.coerce.number().default(3000),
+  FRONTEND_ORIGIN: z.string().default("http://localhost:5173"),
+  TRADE_MODE: z.enum(["paper", "live"]).default("paper"),
+
+  OPENAI_API_KEY: z.string().min(1, "Missing OPENAI_API_KEY"),
+
+  APCA_API_KEY_ID: z.string().min(1, "Missing APCA_API_KEY_ID"),
+  APCA_API_SECRET_KEY: z.string().min(1, "Missing APCA_API_SECRET_KEY"),
+
+  APCA_API_KEY_ID_LIVE: z.string().optional(),
+  APCA_API_SECRET_KEY_LIVE: z.string().optional(),
+
+  TELEGRAM_BOT_TOKEN: z.string().optional(),
+  TELEGRAM_CHAT_ID: z.string().optional(),
+});
+
+const envParse = envSchema.safeParse(process.env);
+
+if (!envParse.success) {
+  console.error("[ENV] Invalid environment variables:");
+  console.error(envParse.error.flatten().fieldErrors);
+  process.exit(1);
+}
+
+const ENV = envParse.data;
+
+if (ENV.TRADE_MODE === "live") {
+  if (!ENV.APCA_API_KEY_ID_LIVE || !ENV.APCA_API_SECRET_KEY_LIVE) {
+    console.error("[ENV] TRADE_MODE=live but live Alpaca keys are missing.");
+    process.exit(1);
   }
 }
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+app.disable("etag");
+
 app.use(
-  cors({ origin: process.env.FRONTEND_ORIGIN || "http://localhost:5173" }),
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+  }),
 );
 
-// --- ALPACA API SETUP (PAPER VS LIVE) ---
-const isLiveMode = process.env.TRADE_MODE === "live";
-const alpacaKey = isLiveMode
-  ? process.env.APCA_API_KEY_ID_LIVE
-  : process.env.APCA_API_KEY_ID;
-const alpacaSecret = isLiveMode
-  ? process.env.APCA_API_SECRET_KEY_LIVE
-  : process.env.APCA_API_SECRET_KEY;
+app.use(express.json({ limit: "1mb" }));
 
-if (!alpacaKey || !alpacaSecret) {
-  console.error(
-    `[FATAL] Missing Alpaca API keys for ${isLiveMode ? "LIVE" : "PAPER"} mode!`,
-  );
-  process.exit(1);
-}
+app.use((req, res, next) => {
+  console.log(`[HTTP-IN] ${req.method} ${req.originalUrl}`);
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const alpaca = new (Alpaca as any)({
-  keyId: alpacaKey,
-  secretKey: alpacaSecret,
+  const startedAt = Date.now();
+  res.on("finish", () => {
+    const duration = Date.now() - startedAt;
+    console.log(
+      `[HTTP-OUT] ${req.method} ${req.originalUrl} -> ${res.statusCode} ${duration}ms`,
+    );
+  });
+
+  next();
+});
+
+const isLiveMode = ENV.TRADE_MODE === "live";
+
+const alpaca = new AlpacaClient({
+  keyId: isLiveMode ? ENV.APCA_API_KEY_ID_LIVE! : ENV.APCA_API_KEY_ID,
+  secretKey: isLiveMode
+    ? ENV.APCA_API_SECRET_KEY_LIVE!
+    : ENV.APCA_API_SECRET_KEY,
   paper: !isLiveMode,
 });
 
-console.log(
-  `[SYSTEM] Trading Engine initialized in ${isLiveMode ? "🔴 LIVE (REAL MONEY)" : "🟢 PAPER (SIMULATED)"} mode.`,
-);
+let isAutopilotEnabled = false;
+let dynamicScreenerTickers: string[] = ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"];
 
-// --- RISK MANAGER (KILL SWITCH) ---
-let RISK_MANAGER_TRIPWIRE = false;
-const MAX_DAILY_DRAWDOWN_PERCENT = 5.0; // Stop trading if account loses > 5% in a day
+let transactionHistory: Array<{
+  timestamp: string;
+  ticker: string;
+  action: "BUY" | "SELL";
+  shares: number;
+  price: number;
+  orderId?: string;
+}> = [];
 
-async function checkRiskLimits() {
-  if (RISK_MANAGER_TRIPWIRE) return; // Already tripped, skip checking
-  try {
-    const account = await alpaca.getAccount();
-    const currentEquity = parseFloat(account.equity);
-    const lastEquity = parseFloat(account.last_equity);
+const sseClients = new Set<Response>();
 
-    // Calculate drawdown
-    if (lastEquity > 0 && currentEquity < lastEquity) {
-      const drawdown = ((lastEquity - currentEquity) / lastEquity) * 100;
+function writeSSE(res: Response, payload: unknown) {
+  if (res.writableEnded || res.destroyed) return;
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
 
-      if (drawdown >= MAX_DAILY_DRAWDOWN_PERCENT) {
-        RISK_MANAGER_TRIPWIRE = true;
-        isAutopilotEnabled = false; // Disable Autopilot immediately
-        const alertMsg = `🚨 *FATAL RISK ALERT*\nTrading HALTED. Max daily drawdown exceeded: -${drawdown.toFixed(2)}%.\nAutopilot engine disengaged.`;
-        console.error(
-          `\n[RISK MANAGER] KILL SWITCH ENGAGED! Drawdown: ${drawdown.toFixed(2)}%\n`,
-        );
-        await sendTelegramAlert(alertMsg);
-      }
+function broadcastSSE(payload: unknown) {
+  for (const client of sseClients) {
+    try {
+      writeSSE(client, payload);
+    } catch {
+      sseClients.delete(client);
     }
-  } catch (error) {
-    console.error("[RISK MANAGER] Failed to verify account equity:", error);
   }
 }
 
-const getAlpacaPortfolio = async () => {
+async function sendTelegramAlert(message: string) {
+  if (!ENV.TELEGRAM_BOT_TOKEN || !ENV.TELEGRAM_CHAT_ID) return;
+
   try {
-    const account = await alpaca.getAccount();
-    const positions = await alpaca.getPositions();
+    const url = `https://api.telegram.org/bot${ENV.TELEGRAM_BOT_TOKEN}/sendMessage`;
 
-    const posMap: Record<
-      string,
-      {
-        shares: number;
-        avgPrice: number;
-        currentPrice?: number;
-        pnl?: number;
-        pnlPercent?: number;
-      }
-    > = {};
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    positions.forEach((p: any) => {
-      posMap[p.symbol] = {
-        shares: parseFloat(p.qty),
-        avgPrice: parseFloat(p.avg_entry_price),
-        currentPrice: parseFloat(p.current_price),
-        pnl: parseFloat(p.unrealized_pl),
-        pnlPercent: parseFloat(p.unrealized_plpc) * 100,
-      };
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: ENV.TELEGRAM_CHAT_ID,
+        text: message,
+      }),
     });
+  } catch (error) {
+    console.error("[TELEGRAM] Failed to send alert:", error);
+  }
+}
+
+async function getPortfolioSnapshot() {
+  const accountRecord = asRecord(await alpaca.getAccount());
+  const positions = asArray(await alpaca.getPositions());
+
+  const positionMap: Record<string, PositionSnapshot> = {};
+
+  for (const position of positions) {
+    const p = asRecord(position);
+    const symbol = toStringValue(p.symbol).toUpperCase();
+
+    if (!symbol) continue;
+
+    positionMap[symbol] = {
+      shares: toNumber(p.qty),
+      avgPrice: toNumber(p.avg_entry_price),
+      currentPrice: toNumber(p.current_price),
+      pnl: toNumber(p.unrealized_pl),
+      pnlPercent: toNumber(p.unrealized_plpc) * 100,
+    };
+  }
+
+  return {
+    balance: toNumber(accountRecord.cash),
+    equity: toNumber(accountRecord.equity),
+    currency: toStringValue(accountRecord.currency, "USD"),
+    positions: positionMap,
+  };
+}
+
+async function getOrdersSnapshot() {
+  const orders = asArray(
+    await alpaca.getOrders({
+      status: "open",
+      direction: "desc",
+    }),
+  );
+
+  return orders.map((order) => {
+    const o = asRecord(order);
 
     return {
-      balance: parseFloat(account.cash),
-      equity: parseFloat(account.equity),
-      currency: account.currency || "USD",
-      positions: posMap,
-      tripwireTripped: RISK_MANAGER_TRIPWIRE,
+      id: toStringValue(o.id),
+      ticker: toStringValue(o.symbol).toUpperCase(),
+      action: toStringValue(o.side).toUpperCase(),
+      qty: toNumber(o.qty),
+      orderType: toStringValue(o.order_type || o.type).toUpperCase(),
+      limitPrice: o.limit_price ? toNumber(o.limit_price) : null,
+      status: toStringValue(o.status),
     };
-  } catch (error) {
-    console.error("[ALPACA] Error fetching portfolio:", error);
-    throw error;
-  }
-};
+  });
+}
 
-const executeAlpacaTrade = async (
-  ticker: string,
-  action: string,
-  shares: number,
-  orderType: string = "market",
+async function getWatchlistQuotesFromAlpaca(
+  tickers: string[],
+  positions: Record<string, PositionSnapshot>,
+): Promise<WatchlistItem[]> {
+  const uniqueTickers = Array.from(
+    new Set(tickers.map((ticker) => ticker.trim().toUpperCase()).filter(Boolean)),
+  );
+
+  const items = await Promise.all(
+    uniqueTickers.map(async (ticker): Promise<WatchlistItem> => {
+      const position = positions[ticker];
+
+      if (position && position.currentPrice > 0) {
+        return {
+          ticker,
+          name: ticker,
+          price: position.currentPrice,
+          change: position.pnlPercent,
+          isUp: position.pnlPercent >= 0,
+        };
+      }
+
+      try {
+        const latestTrade = await alpaca.getLatestTrade(ticker);
+        const price = extractAlpacaPrice(latestTrade);
+
+        if (price <= 0) {
+          console.warn(`[WATCHLIST] Alpaca returned no price for ${ticker}`, latestTrade);
+        }
+
+        return {
+          ticker,
+          name: ticker,
+          price,
+          change: 0,
+          isUp: true,
+        };
+      } catch (error) {
+        console.warn(`[WATCHLIST] Failed to fetch ${ticker} from Alpaca:`, error);
+
+        return {
+          ticker,
+          name: `${ticker} (unavailable)`,
+          price: 0,
+          change: 0,
+          isUp: true,
+        };
+      }
+    }),
+  );
+
+  return items;
+}
+
+async function getDashboardSnapshot() {
+  const portfolio = await getPortfolioSnapshot();
+  const orders = await getOrdersSnapshot();
+
+  const tickers = Array.from(
+    new Set([
+      ...dynamicScreenerTickers,
+      ...Object.keys(portfolio.positions),
+      ...orders.map((order) => order.ticker),
+    ]),
+  ).filter(Boolean);
+
+  const watchlist = await getWatchlistQuotesFromAlpaca(
+    tickers,
+    portfolio.positions,
+  );
+
+  return {
+    tradeMode: ENV.TRADE_MODE,
+    autopilotEnabled: isAutopilotEnabled,
+    portfolio,
+    orders,
+    watchlist,
+  };
+}
+
+async function getEstimatedPrice(ticker: string, fallbackPrice?: number) {
+  if (fallbackPrice && fallbackPrice > 0) return fallbackPrice;
+
+  const latestTrade = await alpaca.getLatestTrade(ticker);
+  const numericPrice = extractAlpacaPrice(latestTrade);
+
+  return numericPrice > 0 ? numericPrice : 1;
+}
+
+async function executeSafeTrade(
+  rawTicker: string,
+  rawAction: string,
+  rawRequestedShares: number,
+  rawOrderType: string = "market",
   limitPrice?: number,
   stopLoss?: number,
   takeProfit?: number,
-) => {
-  ticker = ticker.toUpperCase();
-
-  // RISK MANAGER INTERVENTION
-  if (RISK_MANAGER_TRIPWIRE && action.toLowerCase() === "buy") {
-    const blockMsg = `Risk Manager halted trading. Daily drawdown limit exceeded. BUY order for ${ticker} rejected.`;
-    console.warn(`🛡️ [RISK MANAGER] Blocked BUY order for ${ticker}`);
-    return { error: blockMsg };
-  }
-
+) {
   try {
-    console.log(
-      `[ALPACA] Sending ${action} ${orderType.toUpperCase()} order for ${shares}x ${ticker}...`,
-    );
+    const ticker = rawTicker.trim().toUpperCase();
+    const action = rawAction.toUpperCase() as "BUY" | "SELL";
+    const requestedShares = Number(rawRequestedShares);
+    const orderType = rawOrderType.toLowerCase();
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const orderPayload: any = {
-      symbol: ticker,
-      qty: shares,
-      side: action.toLowerCase() as "buy" | "sell",
-      type: orderType.toLowerCase(),
-      time_in_force: orderType.toLowerCase() === "limit" ? "gtc" : "day",
+    if (!ticker || !Number.isFinite(requestedShares) || requestedShares <= 0) {
+      return { status: "rejected", reason: "Invalid ticker or share quantity." };
+    }
+
+    const accountRecord = asRecord(await alpaca.getAccount());
+    const positions = asArray(await alpaca.getPositions());
+    const estimatedPrice = await getEstimatedPrice(ticker, limitPrice);
+
+    const previousEquity =
+      toNumber(accountRecord.last_equity) || toNumber(accountRecord.equity);
+    const currentEquity = toNumber(accountRecord.equity);
+
+    const dailyDrawdown =
+      previousEquity > 0 ? (currentEquity - previousEquity) / previousEquity : 0;
+
+    const accountState: AccountState = {
+      equity: currentEquity,
+      cash: toNumber(accountRecord.cash),
+      dailyDrawdownPercent: dailyDrawdown,
+      currentPositions: positions.map((position) => {
+        const p = asRecord(position);
+
+        return {
+          ticker: toStringValue(p.symbol).toUpperCase(),
+          shares: toNumber(p.qty),
+          marketValue: toNumber(p.market_value),
+        };
+      }),
     };
 
-    if (orderType.toLowerCase() === "limit" && limitPrice) {
+    const riskResult = evaluateTrade(
+      {
+        ticker,
+        action,
+        requestedShares,
+        estimatedPrice,
+      },
+      accountState,
+    );
+
+    if (!riskResult.approved) {
+      broadcastSSE({
+        type: "notification",
+        level: "error",
+        message: riskResult.reason,
+      });
+
+      await sendTelegramAlert(`REJECTED ${action} ${ticker}: ${riskResult.reason}`);
+
+      return {
+        status: "rejected",
+        reason: riskResult.reason,
+      };
+    }
+
+    const finalShares = riskResult.adjustedShares;
+
+    const orderPayload: UnknownRecord = {
+      symbol: ticker,
+      qty: finalShares,
+      side: action.toLowerCase(),
+      type: orderType,
+      time_in_force: orderType === "limit" ? "gtc" : "day",
+    };
+
+    if (orderType === "limit") {
+      if (!limitPrice || limitPrice <= 0) {
+        return {
+          status: "rejected",
+          reason: "Limit order requires a positive limitPrice.",
+        };
+      }
+
       orderPayload.limit_price = limitPrice;
     }
 
-    if (action.toLowerCase() === "buy" && (stopLoss || takeProfit)) {
+    if (action === "BUY" && (stopLoss || takeProfit)) {
       orderPayload.order_class = "bracket";
-      if (takeProfit) orderPayload.take_profit = { limit_price: takeProfit };
-      if (stopLoss)
-        orderPayload.stop_loss = {
-          stop_price: stopLoss,
-          limit_price: parseFloat((stopLoss * 0.99).toFixed(2)),
-        };
-      console.log(
-        `[ALPACA] Attached risk brackets -> SL: $${stopLoss || "None"}, TP: $${takeProfit || "None"}`,
-      );
+
+      if (takeProfit && takeProfit > 0) {
+        orderPayload.take_profit = { limit_price: takeProfit };
+      }
+
+      if (stopLoss && stopLoss > 0) {
+        orderPayload.stop_loss = { stop_price: stopLoss };
+      }
     }
 
-    const order = await alpaca.createOrder(orderPayload);
-    console.log(`[ALPACA] Order acknowledged! Status: ${order.status}`);
+    const createdOrder = asRecord(await alpaca.createOrder(orderPayload));
+    const orderId = toStringValue(createdOrder.id);
 
-    // RECORD TO DATABASE JOURNAL
-    logTrade(
+    transactionHistory.push({
+      timestamp: new Date().toISOString(),
       ticker,
-      action.toUpperCase(),
-      shares,
-      limitPrice || 0,
-      `Type: ${orderType.toUpperCase()}`,
+      action,
+      shares: finalShares,
+      price: estimatedPrice,
+      orderId,
+    });
+
+    broadcastSSE({
+      type: "trade",
+      data: {
+        ticker,
+        action,
+        shares: finalShares,
+        price: estimatedPrice,
+        orderId,
+      },
+    });
+
+    await sendTelegramAlert(
+      `ORDER ${action} ${finalShares} ${ticker} @ approx $${estimatedPrice}`,
     );
 
     return {
-      success: `Order placed successfully: ${action} ${shares} shares of ${ticker}. Type: ${orderType}. Status: ${order.status}.`,
+      status: "success",
+      order: createdOrder,
+      adjustedShares: finalShares,
     };
-  } catch (error: any) {
-    console.warn(`[ALPACA] Trade rejected by broker: ${error.message}`);
-    return { error: `Broker rejected the trade: ${error.message}` };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown trade error";
+    console.error("[TRADE] Failed:", error);
+
+    return {
+      status: "error",
+      reason: message,
+    };
   }
-};
+}
 
-// --- LIVE DATA STREAMING & SCREENER ---
-let connectedClients: express.Response[] = [];
-let isAutopilotEnabled = false;
-let isProcessingAutopilot = false;
-let dynamicScreenerTickers: string[] = ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"];
+// -----------------------------------------------------------------------------
+// ROUTES
+// -----------------------------------------------------------------------------
 
-// Refresh trending stocks every 15 minutes
-setInterval(
-  async () => {
-    dynamicScreenerTickers = await getTrendingStocks();
-    console.log(
-      `[SCREENER] Updated trending tickers: ${dynamicScreenerTickers.join(", ")}`,
-    );
-  },
-  15 * 60 * 1000,
-);
-
-// Fetch immediately on startup
-getTrendingStocks().then((tickers) => {
-  dynamicScreenerTickers = tickers;
-  console.log(
-    `[SCREENER] Initial trending tickers: ${dynamicScreenerTickers.join(", ")}`,
-  );
-});
-
-app.post("/api/autopilot", (req, res) => {
-  if (RISK_MANAGER_TRIPWIRE && req.body.enabled) {
-    return res.status(403).json({
-      error: "Cannot enable Autopilot. Risk Manager Kill Switch is active.",
-    });
-  }
-  isAutopilotEnabled = req.body.enabled;
-  console.log(
-    `[AUTOPILOT] Engine status: ${isAutopilotEnabled ? "ENABLED" : "DISABLED"}`,
-  );
-  res.json({ enabled: isAutopilotEnabled });
-});
-
-app.get("/api/stream", (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders();
-
-  connectedClients.push(res);
-  req.on("close", () => {
-    connectedClients = connectedClients.filter((client) => client !== res);
+app.get("/health", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({
+    ok: true,
+    service: "ai-trading-agent-backend",
+    mode: ENV.TRADE_MODE,
+    timestamp: new Date().toISOString(),
   });
 });
 
-// The Heartbeat: Polls the broker and market data every 3 seconds and pushes to all connected clients
-setInterval(async () => {
-  if (connectedClients.length === 0) return;
-
-  try {
-    await checkRiskLimits(); // Check risk manager on every heartbeat
-
-    const portfolio = await getAlpacaPortfolio();
-    const orders = await alpaca.getOrders({ status: "open" });
-    const formattedOrders = orders.map((o: any) => ({
-      id: o.id,
-      ticker: o.symbol,
-      action: o.side.toUpperCase(),
-      qty: parseFloat(o.qty),
-      orderType: o.order_type.toUpperCase(),
-      limitPrice: o.limit_price ? parseFloat(o.limit_price) : null,
-      status: o.status,
-    }));
-
-    const activeTickers = Array.from(
-      new Set([
-        ...dynamicScreenerTickers,
-        ...Object.keys(portfolio.positions),
-        ...formattedOrders.map((o: any) => o.ticker),
-      ]),
-    );
-    const watchlist = await getWatchlistQuotes(activeTickers);
-
-    const payload = JSON.stringify({
-      type: "update",
-      portfolio,
-      orders: formattedOrders,
-      watchlist,
-      tradeMode: process.env.TRADE_MODE || "paper",
-    });
-
-    connectedClients.forEach((client) => client.write(`data: ${payload}\n\n`));
-  } catch (error) {
-    // Silently catch polling errors to prevent stream crash
-  }
-}, 3000);
-
-// AUTOPILOT LOOP: Runs every 60 seconds to scan the market autonomously
-let lastAutopilotLog = "";
-
-setInterval(async () => {
-  if (
-    !isAutopilotEnabled ||
-    isProcessingAutopilot ||
-    connectedClients.length === 0 ||
-    RISK_MANAGER_TRIPWIRE
-  )
-    return;
-
-  isProcessingAutopilot = true;
-  try {
-    console.log("[AUTOPILOT] Initiating autonomous market scan...");
-
-    // FETCH BALANCE FOR STRICT RISK MANAGEMENT
-    const portfolio = await getAlpacaPortfolio();
-    const availableCash = portfolio.balance;
-    const maxTradeValue = availableCash * 0.2; // STRICT 20% LIMIT PER TRADE
-
-    const prompt = `[AUTOPILOT MODE] Your available cash is $${availableCash.toFixed(2)}. 
-    Perform a fast market scan for these trending tickers: ${dynamicScreenerTickers.join(", ")}. 
-    Check their technical indicators (RSI, MACD, Bollinger Bands) or news. 
-    RULE: NEVER buy more than 20% of your total cash in a single trade (Max trade value: $${maxTradeValue.toFixed(2)}). Calculate shares carefully.
-    If you identify a highly profitable trade setup, execute a BUY order immediately. Otherwise, briefly state that you are holding cash and observing. Keep the text extremely concise.`;
-
-    const activities = await alpaca.getAccountActivities({
-      activityTypes: ["FILL"],
-    });
-    const transactionHistory = activities.map((a: any) => ({
-      ticker: a.symbol,
-      action: a.side.toUpperCase(),
-      shares: parseFloat(a.qty),
-      price: parseFloat(a.price),
-      date: a.transaction_time,
-    }));
-
-    const agentResponse = await runTradingAgentStep(
-      prompt,
-      [],
-      transactionHistory,
-      executeAlpacaTrade,
-    );
-
-    const responseText = agentResponse.text || "";
-    const lowerText = responseText.toLowerCase();
-
-    // FIX FOR TELEGRAM SPAM:
-    // Ignore empty messages, fallback text, or typical idle text.
-    const isIdleOrError =
-      lowerText.includes("holding cash") ||
-      lowerText.includes("no response generated") ||
-      responseText.trim() === "";
-
-    if (!isIdleOrError) {
-      await sendTelegramAlert(`🤖 *AUTOPILOT ALERT*\n${responseText}`);
-    }
-
-    // Only update UI if the AI's conclusion has changed to prevent UI flicker
-    if (responseText && responseText !== lastAutopilotLog && !isIdleOrError) {
-      lastAutopilotLog = responseText;
-
-      const payload = JSON.stringify({
-        type: "autopilot_log",
-        message: responseText,
-        chartData: agentResponse.chartData,
-        ticker: agentResponse.ticker,
-        portfolio: agentResponse.portfolio,
-        technicalData: agentResponse.technicalData,
-        sentimentData: agentResponse.sentimentData,
-        fundamentalData: agentResponse.fundamentalData,
-      });
-
-      connectedClients.forEach((client) =>
-        client.write(`data: ${payload}\n\n`),
-      );
-    }
-  } catch (error) {
-    console.error("[AUTOPILOT] Cycle error:", error);
-  } finally {
-    isProcessingAutopilot = false;
-  }
-}, 60000);
-
-// --- STANDARD ENDPOINTS ---
-app.get("/api/mode", (req, res) => {
-  res.json({ mode: process.env.TRADE_MODE || "paper" });
+app.get("/api/mode", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.status(200).json({ mode: ENV.TRADE_MODE });
 });
 
-app.get("/api/portfolio", async (req, res) => {
+app.get("/api/stream", (req, res) => {
+  console.log("[SSE] Incoming connection request");
+
+  req.socket.setTimeout(0);
+  req.socket.setNoDelay(true);
+  req.socket.setKeepAlive(true);
+
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  (res as unknown as { flushHeaders?: () => void }).flushHeaders?.();
+
+  sseClients.add(res);
+
+  console.log(`[SSE] Client connected. total=${sseClients.size}`);
+
+  res.write(": connected\n\n");
+  writeSSE(res, {
+    type: "connected",
+    tradeMode: ENV.TRADE_MODE,
+    autopilotEnabled: isAutopilotEnabled,
+    timestamp: new Date().toISOString(),
+  });
+
+  const heartbeat = setInterval(() => {
+    if (res.writableEnded || res.destroyed) {
+      clearInterval(heartbeat);
+      sseClients.delete(res);
+      return;
+    }
+
+    res.write(": heartbeat\n\n");
+  }, 10_000);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    sseClients.delete(res);
+    console.log(`[SSE] Client disconnected. total=${sseClients.size}`);
+    res.end();
+  });
+});
+
+app.get("/api/dashboard", async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
   try {
-    res.json(await getAlpacaPortfolio());
+    res.json(await getDashboardSnapshot());
   } catch (error) {
-    res.status(500).json({ error: "Failed to fetch" });
+    console.error("[API] /api/dashboard failed:", error);
+    res.status(500).json({ error: "Failed to fetch dashboard data" });
   }
 });
 
-app.get("/api/orders", async (req, res) => {
+app.get("/api/portfolio", async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
   try {
-    const orders = await alpaca.getOrders({ status: "open" });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    res.json(await getPortfolioSnapshot());
+  } catch (error) {
+    console.error("[API] /api/portfolio failed:", error);
+    res.status(500).json({ error: "Failed to fetch portfolio" });
+  }
+});
+
+app.get("/api/orders", async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  try {
+    res.json(await getOrdersSnapshot());
+  } catch (error) {
+    console.error("[API] /api/orders failed:", error);
+    res.status(500).json({ error: "Failed to fetch orders" });
+  }
+});
+
+app.get("/api/watchlist", async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  try {
+    const portfolio = await getPortfolioSnapshot();
+
+    const tickers = Array.from(
+      new Set([...dynamicScreenerTickers, ...Object.keys(portfolio.positions)]),
+    ).filter(Boolean);
+
     res.json(
-      orders.map((o: any) => ({
-        id: o.id,
-        ticker: o.symbol,
-        action: o.side.toUpperCase(),
-        qty: parseFloat(o.qty),
-        orderType: o.order_type.toUpperCase(),
-        limitPrice: o.limit_price ? parseFloat(o.limit_price) : null,
-        status: o.status,
-      })),
+      await getWatchlistQuotesFromAlpaca(
+        tickers,
+        portfolio.positions,
+      ),
     );
   } catch (error) {
-    res.status(500).json({ error: "Failed to fetch" });
+    console.error("[API] /api/watchlist failed:", error);
+    res.status(500).json({ error: "Failed to fetch watchlist" });
   }
 });
 
 app.post("/api/trade", async (req, res) => {
-  const {
-    ticker,
-    action,
-    shares,
-    orderType,
-    limitPrice,
-    stopLoss,
-    takeProfit,
-  } = req.body;
-  if (!ticker || !action || !shares) {
-    res.status(400).json({ error: "Missing parameters." });
-    return;
+  const tradeSchema = z.object({
+    ticker: z.string().trim().min(1),
+    action: z.enum(["BUY", "SELL"]),
+    shares: z.coerce.number().positive(),
+    orderType: z
+      .string()
+      .default("market")
+      .transform((value) => value.toLowerCase()),
+    limitPrice: z.coerce.number().positive().optional(),
+    stopLoss: z.coerce.number().positive().optional(),
+    takeProfit: z.coerce.number().positive().optional(),
+  });
+
+  const parsed = tradeSchema.safeParse(req.body);
+
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Invalid trade request",
+      details: parsed.error.flatten(),
+    });
   }
-  const result = await executeAlpacaTrade(
-    ticker,
-    action,
-    shares,
-    orderType || "market",
-    limitPrice,
-    stopLoss,
-    takeProfit,
+
+  const result = await executeSafeTrade(
+    parsed.data.ticker,
+    parsed.data.action,
+    parsed.data.shares,
+    parsed.data.orderType,
+    parsed.data.limitPrice,
+    parsed.data.stopLoss,
+    parsed.data.takeProfit,
   );
-  if (result.error) res.status(400).json(result);
-  else res.json({ success: true, portfolio: await getAlpacaPortfolio() });
+
+  if (result.status !== "success") {
+    return res.status(400).json({
+      success: false,
+      error: result.reason || "Trade rejected",
+      result,
+    });
+  }
+
+  res.json({
+    success: true,
+    result,
+  });
 });
 
 app.post("/api/chat", async (req, res) => {
-  const { message, history } = req.body;
   try {
-    const activities = await alpaca.getAccountActivities({
-      activityTypes: ["FILL"],
+    const chatSchema = z.object({
+      message: z.string().min(1),
+      history: z.array(z.unknown()).optional().default([]),
     });
-    const transactionHistory = activities.map((a: any) => ({
-      ticker: a.symbol,
-      action: a.side.toUpperCase(),
-      shares: parseFloat(a.qty),
-      price: parseFloat(a.price),
-      date: a.transaction_time,
-    }));
-    const agentResponse = await runTradingAgentStep(
-      message,
-      history,
+
+    const parsed = chatSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: "Invalid chat request",
+        details: parsed.error.flatten(),
+      });
+    }
+
+    const response = await runTradingAgentStep(
+      parsed.data.message,
+      parsed.data.history,
       transactionHistory,
-      executeAlpacaTrade,
+      executeSafeTrade,
     );
+
     res.json({
-      reply: agentResponse.text,
-      chartData: agentResponse.chartData,
-      ticker: agentResponse.ticker,
-      portfolio: agentResponse.portfolio,
-      technicalData: agentResponse.technicalData,
-      sentimentData: agentResponse.sentimentData,
-      fundamentalData: agentResponse.fundamentalData,
+      reply: response.text,
+      chartData: response.chartData,
+      ticker: response.ticker,
+      portfolio: response.portfolio,
+      technicalData: response.technicalData,
+      sentimentData: response.sentimentData,
+      fundamentalData: response.fundamentalData,
     });
   } catch (error) {
-    console.error("Chat API error:", error);
+    console.error("[API] /api/chat failed:", error);
     res.status(500).json({ error: "AI engine error" });
   }
 });
 
-app.get("/api/watchlist", async (req, res) => {
-  try {
-    const portfolio = await getAlpacaPortfolio();
-    const activeTickers = Array.from(
-      new Set([...dynamicScreenerTickers, ...Object.keys(portfolio.positions)]),
-    );
-    res.json(await getWatchlistQuotes(activeTickers));
-  } catch (error) {
-    res.status(500).json({ error: "Watchlist error" });
+app.post("/api/autopilot", (req, res) => {
+  const parsed = z.object({ enabled: z.boolean() }).safeParse(req.body);
+
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Invalid autopilot request",
+      details: parsed.error.flatten(),
+    });
   }
+
+  isAutopilotEnabled = parsed.data.enabled;
+
+  broadcastSSE({
+    type: "autopilot_status",
+    enabled: isAutopilotEnabled,
+  });
+
+  res.json({
+    success: true,
+    enabled: isAutopilotEnabled,
+  });
 });
 
-app.listen(PORT, () =>
-  console.log(`[SERVER] Running on http://localhost:${PORT}`),
-);
+setInterval(async () => {
+  try {
+    dynamicScreenerTickers = await getTrendingStocks();
+    console.log(`[SCREENER] ${dynamicScreenerTickers.join(", ")}`);
+  } catch {
+    console.warn("[SCREENER] Failed to refresh trending tickers.");
+  }
+}, 15 * 60_000);
+
+getTrendingStocks()
+  .then((tickers) => {
+    dynamicScreenerTickers = tickers;
+    console.log(`[SCREENER] initial: ${dynamicScreenerTickers.join(", ")}`);
+  })
+  .catch(() => {
+    console.warn("[SCREENER] Initial load failed. Using fallback tickers.");
+  });
+
+setInterval(async () => {
+  if (!isAutopilotEnabled) return;
+
+  broadcastSSE({
+    type: "autopilot_log",
+    message: "[Autopilot] Worker heartbeat. Strategy execution is currently paused/safe.",
+  });
+}, 60_000);
+
+app.listen(ENV.PORT, () => {
+  console.log("");
+  console.log("[SERVER] AI Trading Agent backend is running");
+  console.log(`[SERVER] URL: http://localhost:${ENV.PORT}`);
+  console.log(`[SERVER] Mode: ${ENV.TRADE_MODE}`);
+  console.log(`[SERVER] Frontend origin: ${ENV.FRONTEND_ORIGIN}`);
+  console.log("");
+});
