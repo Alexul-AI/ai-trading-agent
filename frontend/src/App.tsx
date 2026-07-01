@@ -87,9 +87,38 @@ interface AutopilotStatus {
   minConfidence: number;
   maxSellFraction: number;
   telegramCooldownMinutes: number;
+  lastJournalRunId?: string | null;
   lastRunAt: string | null;
   lastError: string | null;
   lastDecisions: AutopilotDecision[];
+}
+
+interface JournalRun {
+  id: string;
+  timestamp: string;
+  trigger: "manual" | "scheduled";
+  executeTrades: boolean;
+  tradeMode: TradeMode;
+  enabled: boolean;
+  tickers: string[];
+  actionableCount: number;
+  decisions: AutopilotDecision[];
+}
+
+interface JournalResponse {
+  file: string;
+  runs: JournalRun[];
+}
+
+interface JournalSummary {
+  totalRuns: number;
+  totalDecisions: number;
+  actionableSignals: number;
+  executedSignals: number;
+  byAction: Record<string, number>;
+  byTicker: Record<string, number>;
+  byReasonType: Record<string, number>;
+  lastRunAt: string | null;
 }
 
 interface DashboardResponse {
@@ -156,14 +185,14 @@ const EMPTY_AUTOPILOT_STATUS: AutopilotStatus = {
   minConfidence: 0.75,
   maxSellFraction: 0.25,
   telegramCooldownMinutes: 30,
+  lastJournalRunId: null,
   lastRunAt: null,
   lastError: null,
   lastDecisions: [],
 };
 
 function formatMoney(value: number | undefined): string {
-  const safeValue = Number.isFinite(value) ? value ?? 0 : 0;
-
+  const safeValue = Number.isFinite(value) ? (value ?? 0) : 0;
   return safeValue.toLocaleString(undefined, {
     style: "currency",
     currency: "USD",
@@ -173,23 +202,20 @@ function formatMoney(value: number | undefined): string {
 }
 
 function formatPercent(value: number | undefined): string {
-  const safeValue = Number.isFinite(value) ? value ?? 0 : 0;
+  const safeValue = Number.isFinite(value) ? (value ?? 0) : 0;
   return `${safeValue >= 0 ? "+" : ""}${safeValue.toFixed(2)}%`;
 }
 
 function formatTimestamp(value: string | null): string {
   if (!value) return "Never";
-
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-
   return date.toLocaleTimeString();
 }
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
-
   try {
     return JSON.stringify(error);
   } catch {
@@ -198,14 +224,10 @@ function getErrorMessage(error: unknown): string {
 }
 
 function actionPillClass(action: SignalAction): string {
-  if (action === "BUY") {
+  if (action === "BUY")
     return "bg-emerald-500/10 text-emerald-300 border-emerald-500/30";
-  }
-
-  if (action === "SELL") {
+  if (action === "SELL")
     return "bg-rose-500/10 text-rose-300 border-rose-500/30";
-  }
-
   return "bg-slate-800 text-slate-400 border-slate-700";
 }
 
@@ -222,6 +244,20 @@ function getDecisionForTicker(
   return decisions.find((decision) => decision.ticker === ticker);
 }
 
+function getActionCount(
+  summary: JournalSummary | null,
+  action: SignalAction,
+): number {
+  return summary?.byAction?.[action] ?? 0;
+}
+
+function getTopTicker(summary: JournalSummary | null): string {
+  if (!summary || Object.keys(summary.byTicker).length === 0) return "—";
+  return (
+    Object.entries(summary.byTicker).sort((a, b) => b[1] - a[1])[0]?.[0] ?? "—"
+  );
+}
+
 export default function App() {
   const [tradeMode, setTradeMode] = useState<TradeMode>("paper");
   const [portfolio, setPortfolio] = useState<Portfolio>(EMPTY_PORTFOLIO);
@@ -230,6 +266,12 @@ export default function App() {
   const [autopilotStatus, setAutopilotStatus] = useState<AutopilotStatus>(
     EMPTY_AUTOPILOT_STATUS,
   );
+  const [journalRuns, setJournalRuns] = useState<JournalRun[]>([]);
+  const [journalSummary, setJournalSummary] = useState<JournalSummary | null>(
+    null,
+  );
+  const [journalFile, setJournalFile] = useState<string>("");
+  const [isLoadingJournal, setIsLoadingJournal] = useState(false);
   const [autopilotLogs, setAutopilotLogs] = useState<string[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<
     "connecting" | "connected" | "error"
@@ -270,29 +312,16 @@ export default function App() {
   );
 
   function addAutopilotLog(message: string) {
-    setAutopilotLogs((prev) => [
-      `[${new Date().toLocaleTimeString()}] ${message}`,
-      ...prev,
-    ].slice(0, 80));
+    setAutopilotLogs((prev) =>
+      [`[${new Date().toLocaleTimeString()}] ${message}`, ...prev].slice(0, 80),
+    );
   }
 
   function applyDashboardData(data: DashboardResponse) {
-    if (data.tradeMode) {
-      setTradeMode(data.tradeMode);
-    }
-
-    if (data.portfolio) {
-      setPortfolio(data.portfolio);
-    }
-
-    if (data.orders) {
-      setOrders(data.orders);
-    }
-
-    if (data.watchlist) {
-      setWatchlist(data.watchlist);
-    }
-
+    if (data.tradeMode) setTradeMode(data.tradeMode);
+    if (data.portfolio) setPortfolio(data.portfolio);
+    if (data.orders) setOrders(data.orders);
+    if (data.watchlist) setWatchlist(data.watchlist);
     if (data.autopilot) {
       setAutopilotStatus(data.autopilot);
     } else if (typeof data.autopilotEnabled === "boolean") {
@@ -301,7 +330,6 @@ export default function App() {
         enabled: data.autopilotEnabled ?? prev.enabled,
       }));
     }
-
     setLastDashboardUpdate(new Date().toLocaleTimeString());
   }
 
@@ -310,11 +338,8 @@ export default function App() {
       const response = await fetch(`${API_BASE_URL}/api/dashboard`, {
         cache: "no-store",
       });
-
-      if (!response.ok) {
+      if (!response.ok)
         throw new Error(`Dashboard request failed: ${response.status}`);
-      }
-
       const data = (await response.json()) as DashboardResponse;
       applyDashboardData(data);
       setConnectionStatus("connected");
@@ -329,15 +354,42 @@ export default function App() {
       const response = await fetch(`${API_BASE_URL}/api/autopilot/status`, {
         cache: "no-store",
       });
-
-      if (!response.ok) {
+      if (!response.ok)
         throw new Error(`Autopilot status failed: ${response.status}`);
-      }
-
       const data = (await response.json()) as AutopilotStatus;
       setAutopilotStatus(data);
     } catch (error) {
       console.warn("Autopilot status refresh failed:", error);
+    }
+  }
+
+  async function refreshAutopilotJournal() {
+    setIsLoadingJournal(true);
+    try {
+      const [journalResponse, summaryResponse] = await Promise.all([
+        fetch(`${API_BASE_URL}/api/autopilot/journal?limit=20`, {
+          cache: "no-store",
+        }),
+        fetch(`${API_BASE_URL}/api/autopilot/journal/summary?limit=200`, {
+          cache: "no-store",
+        }),
+      ]);
+      if (!journalResponse.ok)
+        throw new Error(`Journal request failed: ${journalResponse.status}`);
+      if (!summaryResponse.ok)
+        throw new Error(`Journal summary failed: ${summaryResponse.status}`);
+
+      const journal = (await journalResponse.json()) as JournalResponse;
+      const summary = (await summaryResponse.json()) as JournalSummary;
+
+      setJournalRuns(journal.runs);
+      setJournalFile(journal.file);
+      setJournalSummary(summary);
+    } catch (error) {
+      addAutopilotLog(`Journal refresh failed: ${getErrorMessage(error)}`);
+      console.warn("Autopilot journal refresh failed:", error);
+    } finally {
+      setIsLoadingJournal(false);
     }
   }
 
@@ -347,20 +399,20 @@ export default function App() {
 
   useEffect(() => {
     void refreshDashboard();
+    void refreshAutopilotJournal();
 
     const dashboardTimer = window.setInterval(() => {
       void refreshDashboard();
     }, 5000);
 
+    const journalTimer = window.setInterval(() => {
+      void refreshAutopilotJournal();
+    }, 15000);
+
     const eventSource = new EventSource(`${API_BASE_URL}/api/stream`);
 
-    eventSource.onopen = () => {
-      setConnectionStatus("connected");
-    };
-
-    eventSource.onerror = () => {
-      setConnectionStatus("error");
-    };
+    eventSource.onopen = () => setConnectionStatus("connected");
+    eventSource.onerror = () => setConnectionStatus("error");
 
     eventSource.onmessage = (event) => {
       try {
@@ -392,7 +444,7 @@ export default function App() {
         if (data.type === "autopilot_signal" && data.data) {
           const decision = data.data;
           addAutopilotLog(
-            `${decision.ticker}: ${decision.action} ${decision.suggestedShares} / confidence ${decision.confidence}.`,
+            `${decision.ticker}: ${decision.action} ${decision.suggestedShares} / conf ${decision.confidence}.`,
           );
           setAutopilotStatus((prev) => ({
             ...prev,
@@ -420,6 +472,7 @@ export default function App() {
           } else {
             void refreshAutopilotStatus();
           }
+          void refreshAutopilotJournal();
           return;
         }
 
@@ -444,24 +497,20 @@ export default function App() {
 
     return () => {
       window.clearInterval(dashboardTimer);
+      window.clearInterval(journalTimer);
       eventSource.close();
     };
   }, []);
 
   async function handleAutopilotToggle() {
     const targetState = !autopilotStatus.enabled;
-
     try {
       const response = await fetch(`${API_BASE_URL}/api/autopilot`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: targetState }),
       });
-
-      if (!response.ok) {
-        throw new Error(`Toggle failed: ${response.status}`);
-      }
-
+      if (!response.ok) throw new Error(`Toggle failed: ${response.status}`);
       const data = (await response.json()) as AutopilotToggleResponse;
       setAutopilotStatus(data.autopilot);
       addAutopilotLog(
@@ -474,18 +523,14 @@ export default function App() {
 
   async function handleRunAutopilotOnce() {
     setIsRunningAutopilot(true);
-
     try {
       const response = await fetch(`${API_BASE_URL}/api/autopilot/run-once`, {
         method: "POST",
       });
-
-      if (!response.ok) {
-        throw new Error(`Run once failed: ${response.status}`);
-      }
-
+      if (!response.ok) throw new Error(`Run once failed: ${response.status}`);
       const data = (await response.json()) as AutopilotRunResponse;
       setAutopilotStatus(data.status);
+      void refreshAutopilotJournal();
 
       if (data.skipped) {
         addAutopilotLog(data.reason ?? "Run skipped.");
@@ -497,7 +542,6 @@ export default function App() {
             decision.action !== "HOLD" &&
             decision.confidence >= data.status.minConfidence,
         ).length;
-
         addAutopilotLog(
           `Manual dry-run completed. Actionable signals: ${actionableCount}.`,
         );
@@ -511,7 +555,6 @@ export default function App() {
 
   async function handleSendMessage(event: React.SyntheticEvent) {
     event.preventDefault();
-
     if (!chatInput.trim() || isWaitingOnAI) return;
 
     const userMsg: ChatMessage = {
@@ -538,10 +581,7 @@ export default function App() {
         }),
       });
 
-      if (!response.ok) {
-        throw new Error(`Chat failed: ${response.status}`);
-      }
-
+      if (!response.ok) throw new Error(`Chat failed: ${response.status}`);
       const data = (await response.json()) as ChatResponse;
 
       setChatHistory((prev) => [
@@ -570,7 +610,6 @@ export default function App() {
 
   async function executeManualTrade(event: React.SyntheticEvent) {
     event.preventDefault();
-
     if (!tradeTicker.trim()) return;
 
     try {
@@ -582,22 +621,21 @@ export default function App() {
           action: tradeAction,
           shares: tradeQty,
           orderType: tradeType,
-          limitPrice: tradeLimitPrice ? Number.parseFloat(tradeLimitPrice) : undefined,
+          limitPrice: tradeLimitPrice
+            ? Number.parseFloat(tradeLimitPrice)
+            : undefined,
           stopLoss: tradeSL ? Number.parseFloat(tradeSL) : undefined,
           takeProfit: tradeTP ? Number.parseFloat(tradeTP) : undefined,
         }),
       });
 
       const result = (await response.json()) as TradeResponse;
-
-      if (!response.ok || !result.success) {
+      if (!response.ok || !result.success)
         throw new Error(result.error || "Trade rejected.");
-      }
 
       addAutopilotLog(
         `Manual order accepted: ${tradeAction} ${tradeQty} ${tradeTicker}.`,
       );
-
       setTradeTicker("");
       setTradeSL("");
       setTradeTP("");
@@ -623,8 +661,18 @@ export default function App() {
       <header className="px-6 py-4 border-b border-slate-800 bg-slate-900/40 flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
         <div className="flex items-center gap-4">
           <div className="p-2.5 rounded-xl bg-blue-500/10 text-blue-300 border border-blue-500/30">
-            <svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+            <svg
+              className="w-7 h-7"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="2"
+                d="M13 10V3L4 14h7v7l9-11h-7z"
+              />
             </svg>
           </div>
           <div>
@@ -648,7 +696,9 @@ export default function App() {
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px]">
           <div className="rounded-xl border border-slate-800 bg-slate-950/50 px-3 py-2">
-            <div className="text-slate-500 font-black uppercase">Connection</div>
+            <div className="text-slate-500 font-black uppercase">
+              Connection
+            </div>
             <div
               className={`font-bold ${
                 connectionStatus === "connected"
@@ -663,18 +713,32 @@ export default function App() {
           </div>
           <div className="rounded-xl border border-slate-800 bg-slate-950/50 px-3 py-2">
             <div className="text-slate-500 font-black uppercase">Autopilot</div>
-            <div className={autopilotEnabled ? "text-emerald-300 font-bold" : "text-slate-400 font-bold"}>
+            <div
+              className={
+                autopilotEnabled
+                  ? "text-emerald-300 font-bold"
+                  : "text-slate-400 font-bold"
+              }
+            >
               {autopilotEnabled ? "SCHEDULED ON" : "SCHEDULED OFF"}
             </div>
           </div>
           <div className="rounded-xl border border-slate-800 bg-slate-950/50 px-3 py-2">
             <div className="text-slate-500 font-black uppercase">Execution</div>
-            <div className={autopilotStatus.executeTrades ? "text-rose-300 font-bold" : "text-blue-300 font-bold"}>
+            <div
+              className={
+                autopilotStatus.executeTrades
+                  ? "text-rose-300 font-bold"
+                  : "text-blue-300 font-bold"
+              }
+            >
               {autopilotStatus.executeTrades ? "ENABLED" : "DRY-RUN"}
             </div>
           </div>
           <div className="rounded-xl border border-slate-800 bg-slate-950/50 px-3 py-2">
-            <div className="text-slate-500 font-black uppercase">Last Update</div>
+            <div className="text-slate-500 font-black uppercase">
+              Last Update
+            </div>
             <div className="text-slate-300 font-bold">
               {lastDashboardUpdate ?? "—"}
             </div>
@@ -701,8 +765,10 @@ export default function App() {
                 </div>
               ) : (
                 watchlist.map((item) => {
-                  const decision = getDecisionForTicker(latestDecisions, item.ticker);
-
+                  const decision = getDecisionForTicker(
+                    latestDecisions,
+                    item.ticker,
+                  );
                   return (
                     <div
                       key={item.ticker}
@@ -722,9 +788,7 @@ export default function App() {
                             {formatMoney(item.price)}
                           </div>
                           <div
-                            className={`text-[10px] font-bold ${
-                              item.isUp ? "text-emerald-400" : "text-rose-400"
-                            }`}
+                            className={`text-[10px] font-bold ${item.isUp ? "text-emerald-400" : "text-rose-400"}`}
                           >
                             {item.isUp ? "▲" : "▼"} {formatPercent(item.change)}
                           </div>
@@ -734,13 +798,13 @@ export default function App() {
                       {decision && (
                         <div className="mt-2 flex items-center justify-between gap-2">
                           <span
-                            className={`px-2 py-0.5 rounded-full border text-[10px] font-black ${actionPillClass(
-                              decision.action,
-                            )}`}
+                            className={`px-2 py-0.5 rounded-full border text-[10px] font-black ${actionPillClass(decision.action)}`}
                           >
                             {decision.action}
                           </span>
-                          <span className={`text-[10px] font-mono ${confidenceClass(decision.confidence)}`}>
+                          <span
+                            className={`text-[10px] font-mono ${confidenceClass(decision.confidence)}`}
+                          >
                             conf {decision.confidence}
                           </span>
                         </div>
@@ -755,7 +819,9 @@ export default function App() {
           <div className="bg-slate-900/60 rounded-2xl border border-slate-800 p-4">
             <h2 className="text-sm font-bold tracking-wider text-slate-400 mb-3 flex items-center justify-between">
               MANUAL ORDER
-              <span className={`w-2 h-2 rounded-full ${tradeMode === "live" ? "bg-red-500" : "bg-emerald-500"}`} />
+              <span
+                className={`w-2 h-2 rounded-full ${tradeMode === "live" ? "bg-red-500" : "bg-emerald-500"}`}
+              />
             </h2>
 
             <form onSubmit={executeManualTrade} className="space-y-3">
@@ -789,7 +855,9 @@ export default function App() {
                 required
                 placeholder="Ticker, e.g. AMD"
                 value={tradeTicker}
-                onChange={(event) => setTradeTicker(event.target.value.toUpperCase())}
+                onChange={(event) =>
+                  setTradeTicker(event.target.value.toUpperCase())
+                }
                 className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-slate-600"
               />
 
@@ -800,7 +868,9 @@ export default function App() {
                   required
                   value={tradeQty}
                   onChange={(event) =>
-                    setTradeQty(Math.max(1, Number.parseInt(event.target.value) || 1))
+                    setTradeQty(
+                      Math.max(1, Number.parseInt(event.target.value) || 1),
+                    )
                   }
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-slate-600"
                 />
@@ -906,7 +976,10 @@ export default function App() {
                   const pnl = data.pnl ?? 0;
                   const pnlPct = data.pnlPercent ?? 0;
                   const isGain = pnl >= 0;
-                  const decision = getDecisionForTicker(latestDecisions, symbol);
+                  const decision = getDecisionForTicker(
+                    latestDecisions,
+                    symbol,
+                  );
 
                   return (
                     <div
@@ -924,9 +997,7 @@ export default function App() {
                           {decision && (
                             <div className="mt-2 flex items-center gap-2">
                               <span
-                                className={`px-2 py-0.5 rounded-full border text-[10px] font-black ${actionPillClass(
-                                  decision.action,
-                                )}`}
+                                className={`px-2 py-0.5 rounded-full border text-[10px] font-black ${actionPillClass(decision.action)}`}
                               >
                                 {decision.action}
                               </span>
@@ -943,9 +1014,7 @@ export default function App() {
                             {formatMoney(marketValue)}
                           </div>
                           <div
-                            className={`text-[10px] font-black ${
-                              isGain ? "text-emerald-400" : "text-rose-400"
-                            }`}
+                            className={`text-[10px] font-black ${isGain ? "text-emerald-400" : "text-rose-400"}`}
                           >
                             {isGain ? "▲" : "▼"} {formatMoney(Math.abs(pnl))} (
                             {formatPercent(pnlPct)})
@@ -980,21 +1049,22 @@ export default function App() {
                   </thead>
                   <tbody>
                     {orders.map((order) => (
-                      <tr key={order.id} className="border-b border-slate-800/20 last:border-0">
+                      <tr
+                        key={order.id}
+                        className="border-b border-slate-800/20 last:border-0"
+                      >
                         <td className="py-2.5 font-bold">{order.ticker}</td>
                         <td className="py-2.5">
                           <span
-                            className={`px-1.5 py-0.5 rounded text-[10px] font-extrabold ${
-                              order.action === "BUY"
-                                ? "bg-emerald-500/10 text-emerald-300"
-                                : "bg-rose-500/10 text-rose-300"
-                            }`}
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-extrabold ${order.action === "BUY" ? "bg-emerald-500/10 text-emerald-300" : "bg-rose-500/10 text-rose-300"}`}
                           >
                             {order.action}
                           </span>
                         </td>
                         <td className="py-2.5 text-right font-mono text-slate-300">
-                          {order.limitPrice ? formatMoney(order.limitPrice) : "Market"}
+                          {order.limitPrice
+                            ? formatMoney(order.limitPrice)
+                            : "Market"}
                         </td>
                         <td className="py-2.5 text-right font-mono text-slate-400">
                           {order.qty}
@@ -1020,11 +1090,7 @@ export default function App() {
                 </p>
               </div>
               <span
-                className={`px-2 py-1 rounded-full border text-[10px] font-black ${
-                  autopilotStatus.running
-                    ? "bg-amber-500/10 text-amber-300 border-amber-500/30"
-                    : "bg-slate-950 text-slate-400 border-slate-800"
-                }`}
+                className={`px-2 py-1 rounded-full border text-[10px] font-black ${autopilotStatus.running ? "bg-amber-500/10 text-amber-300 border-amber-500/30" : "bg-slate-950 text-slate-400 border-slate-800"}`}
               >
                 {autopilotStatus.running ? "RUNNING" : "IDLE"}
               </span>
@@ -1032,28 +1098,45 @@ export default function App() {
 
             <div className="grid grid-cols-2 gap-2 mb-4 text-[10px]">
               <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-3">
-                <div className="text-slate-500 font-black uppercase">Execution</div>
-                <div className={autopilotStatus.executeTrades ? "text-rose-300 font-bold" : "text-blue-300 font-bold"}>
-                  {autopilotStatus.executeTrades ? "CAN EXECUTE" : "DRY-RUN ONLY"}
+                <div className="text-slate-500 font-black uppercase">
+                  Execution
+                </div>
+                <div
+                  className={
+                    autopilotStatus.executeTrades
+                      ? "text-rose-300 font-bold"
+                      : "text-blue-300 font-bold"
+                  }
+                >
+                  {autopilotStatus.executeTrades
+                    ? "CAN EXECUTE"
+                    : "DRY-RUN ONLY"}
                 </div>
               </div>
               <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-3">
-                <div className="text-slate-500 font-black uppercase">Buy / Sell</div>
+                <div className="text-slate-500 font-black uppercase">
+                  Buy / Sell
+                </div>
                 <div className="text-slate-300 font-bold">
                   BUY {autopilotStatus.allowBuy ? "ON" : "OFF"} · SELL{" "}
                   {autopilotStatus.allowSell ? "ON" : "OFF"}
                 </div>
               </div>
               <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-3">
-                <div className="text-slate-500 font-black uppercase">Min Confidence</div>
+                <div className="text-slate-500 font-black uppercase">
+                  Min Confidence
+                </div>
                 <div className="text-emerald-300 font-bold">
                   {autopilotStatus.minConfidence}
                 </div>
               </div>
               <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-3">
-                <div className="text-slate-500 font-black uppercase">Max Sell</div>
+                <div className="text-slate-500 font-black uppercase">
+                  Max Sell
+                </div>
                 <div className="text-amber-300 font-bold">
-                  {Math.round(autopilotStatus.maxSellFraction * 100)}% per signal
+                  {Math.round(autopilotStatus.maxSellFraction * 100)}% per
+                  signal
                 </div>
               </div>
             </div>
@@ -1068,19 +1151,19 @@ export default function App() {
               </button>
               <button
                 onClick={handleAutopilotToggle}
-                className={`flex-1 px-3 py-2 rounded-xl font-bold text-xs transition-colors ${
-                  autopilotEnabled
-                    ? "bg-emerald-600 hover:bg-emerald-500 text-white"
-                    : "bg-slate-800 hover:bg-slate-700 text-slate-300"
-                }`}
+                className={`flex-1 px-3 py-2 rounded-xl font-bold text-xs transition-colors ${autopilotEnabled ? "bg-emerald-600 hover:bg-emerald-500 text-white" : "bg-slate-800 hover:bg-slate-700 text-slate-300"}`}
               >
                 {autopilotEnabled ? "SCHEDULED ON" : "SCHEDULED OFF"}
               </button>
             </div>
 
             <div className="flex items-center justify-between text-[10px] text-slate-500 border-t border-slate-800 pt-3">
-              <span>Last run: {formatTimestamp(autopilotStatus.lastRunAt)}</span>
-              <span>Telegram cooldown: {autopilotStatus.telegramCooldownMinutes}m</span>
+              <span>
+                Last run: {formatTimestamp(autopilotStatus.lastRunAt)}
+              </span>
+              <span>
+                Telegram cooldown: {autopilotStatus.telegramCooldownMinutes}m
+              </span>
             </div>
 
             {autopilotStatus.lastError && (
@@ -1088,6 +1171,164 @@ export default function App() {
                 {autopilotStatus.lastError}
               </div>
             )}
+          </div>
+
+          <div className="bg-slate-900/60 rounded-2xl border border-slate-800 p-4">
+            <div className="flex items-start justify-between gap-4 mb-4">
+              <div>
+                <h2 className="text-sm font-bold tracking-wider text-slate-300">
+                  DECISION JOURNAL
+                </h2>
+                <p className="text-[10px] text-slate-500 truncate max-w-[300px]">
+                  {journalFile || "backend/data/autopilot-decisions.jsonl"}
+                </p>
+              </div>
+              <button
+                onClick={refreshAutopilotJournal}
+                disabled={isLoadingJournal}
+                className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:text-slate-600 text-[10px] font-black text-slate-300"
+              >
+                {isLoadingJournal ? "LOADING" : "REFRESH"}
+              </button>
+            </div>
+
+            <div className="grid grid-cols-4 gap-2 mb-4">
+              <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-2">
+                <div className="text-[9px] text-slate-500 font-black uppercase">
+                  Runs
+                </div>
+                <div className="text-lg font-black text-white">
+                  {journalSummary?.totalRuns ?? 0}
+                </div>
+              </div>
+              <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-2">
+                <div className="text-[9px] text-slate-500 font-black uppercase">
+                  Signals
+                </div>
+                <div className="text-lg font-black text-amber-300">
+                  {journalSummary?.actionableSignals ?? 0}
+                </div>
+              </div>
+              <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-2">
+                <div className="text-[9px] text-slate-500 font-black uppercase">
+                  Executed
+                </div>
+                <div className="text-lg font-black text-emerald-300">
+                  {journalSummary?.executedSignals ?? 0}
+                </div>
+              </div>
+              <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-2">
+                <div className="text-[9px] text-slate-500 font-black uppercase">
+                  Top
+                </div>
+                <div className="text-lg font-black text-blue-300">
+                  {getTopTicker(journalSummary)}
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 mb-4 text-[10px]">
+              <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-2">
+                <span className="text-emerald-300 font-black">BUY</span>
+                <span className="float-right font-mono">
+                  {getActionCount(journalSummary, "BUY")}
+                </span>
+              </div>
+              <div className="rounded-lg bg-rose-500/10 border border-rose-500/20 p-2">
+                <span className="text-rose-300 font-black">SELL</span>
+                <span className="float-right font-mono">
+                  {getActionCount(journalSummary, "SELL")}
+                </span>
+              </div>
+              <div className="rounded-lg bg-slate-950/60 border border-slate-800 p-2">
+                <span className="text-slate-400 font-black">HOLD</span>
+                <span className="float-right font-mono">
+                  {getActionCount(journalSummary, "HOLD")}
+                </span>
+              </div>
+            </div>
+
+            <div className="space-y-2 max-h-[240px] overflow-y-auto pr-1">
+              {journalRuns.length === 0 ? (
+                <div className="text-center text-slate-600 py-8 text-xs">
+                  No journal runs yet. Press RUN ONCE.
+                </div>
+              ) : (
+                journalRuns.map((run) => {
+                  const buyCount = run.decisions.filter(
+                    (decision) => decision.action === "BUY",
+                  ).length;
+                  const sellCount = run.decisions.filter(
+                    (decision) => decision.action === "SELL",
+                  ).length;
+                  const holdCount = run.decisions.filter(
+                    (decision) => decision.action === "HOLD",
+                  ).length;
+                  const strongestDecision = [...run.decisions].sort(
+                    (a, b) => b.confidence - a.confidence,
+                  )[0];
+
+                  return (
+                    <div
+                      key={run.id}
+                      className="rounded-xl border border-slate-800 bg-slate-950/50 p-3"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-black text-white">
+                              {formatTimestamp(run.timestamp)}
+                            </span>
+                            <span className="px-1.5 py-0.5 rounded bg-slate-800 text-[9px] font-black text-slate-400 uppercase">
+                              {run.trigger}
+                            </span>
+                            <span className="px-1.5 py-0.5 rounded bg-blue-500/10 text-[9px] font-black text-blue-300 uppercase">
+                              {run.executeTrades ? "execution" : "dry-run"}
+                            </span>
+                          </div>
+                          <div className="mt-1 text-[10px] text-slate-500">
+                            BUY {buyCount} · SELL {sellCount} · HOLD {holdCount}
+                          </div>
+                        </div>
+
+                        <div className="text-right">
+                          <div className="text-xs font-black text-amber-300">
+                            {run.actionableCount}
+                          </div>
+                          <div className="text-[9px] text-slate-500 uppercase">
+                            actionable
+                          </div>
+                        </div>
+                      </div>
+
+                      {strongestDecision && (
+                        <div className="mt-2 rounded-lg bg-slate-900/60 border border-slate-800 p-2 text-[10px]">
+                          <span
+                            className={`px-1.5 py-0.5 rounded-full border font-black mr-2 ${actionPillClass(strongestDecision.action)}`}
+                          >
+                            {strongestDecision.ticker}{" "}
+                            {strongestDecision.action}
+                          </span>
+                          <span
+                            className={confidenceClass(
+                              strongestDecision.confidence,
+                            )}
+                          >
+                            conf {strongestDecision.confidence}
+                          </span>
+                          {strongestDecision.originalSuggestedShares && (
+                            <span className="text-amber-300 ml-2">
+                              {strongestDecision.suggestedShares}/
+                              {strongestDecision.originalSuggestedShares}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
           </div>
 
           <div className="bg-slate-900/60 rounded-2xl border border-slate-800 p-4 flex flex-col min-h-[360px]">
@@ -1114,23 +1355,25 @@ export default function App() {
                     <div className="flex items-start justify-between gap-2">
                       <div>
                         <div className="flex items-center gap-2">
-                          <span className="font-black text-sm">{decision.ticker}</span>
+                          <span className="font-black text-sm">
+                            {decision.ticker}
+                          </span>
                           <span
-                            className={`px-2 py-0.5 rounded-full border text-[10px] font-black ${actionPillClass(
-                              decision.action,
-                            )}`}
+                            className={`px-2 py-0.5 rounded-full border text-[10px] font-black ${actionPillClass(decision.action)}`}
                           >
                             {decision.action}
                           </span>
                         </div>
                         <div className="text-[10px] text-slate-500 mt-1">
-                          RSI {decision.rsi} · MACD {decision.macdHistogram} · price{" "}
-                          {formatMoney(decision.price)}
+                          RSI {decision.rsi} · MACD {decision.macdHistogram} ·
+                          price {formatMoney(decision.price)}
                         </div>
                       </div>
 
                       <div className="text-right">
-                        <div className={`font-mono text-xs font-black ${confidenceClass(decision.confidence)}`}>
+                        <div
+                          className={`font-mono text-xs font-black ${confidenceClass(decision.confidence)}`}
+                        >
                           {decision.confidence}
                         </div>
                         <div className="text-[10px] text-slate-500">
@@ -1156,7 +1399,13 @@ export default function App() {
                         </div>
                         <div className="rounded-lg bg-slate-900/70 border border-slate-800 p-2">
                           <span className="text-slate-500">Executed</span>
-                          <div className={decision.executed ? "font-bold text-emerald-300" : "font-bold text-blue-300"}>
+                          <div
+                            className={
+                              decision.executed
+                                ? "font-bold text-emerald-300"
+                                : "font-bold text-blue-300"
+                            }
+                          >
                             {decision.executed ? "YES" : "NO"}
                           </div>
                         </div>
@@ -1185,7 +1434,9 @@ export default function App() {
               <span className="text-xs font-black tracking-widest text-slate-400">
                 CHAT TERMINAL
               </span>
-              <span className="text-[10px] text-slate-500">OpenAI via backend</span>
+              <span className="text-[10px] text-slate-500">
+                OpenAI via backend
+              </span>
             </div>
 
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
@@ -1199,21 +1450,13 @@ export default function App() {
                       {msg.timestamp}
                     </span>
                     <span
-                      className={`text-[9px] font-black tracking-wider uppercase px-1.5 rounded ${
-                        msg.role === "user"
-                          ? "bg-slate-800 text-slate-300"
-                          : "bg-blue-900/50 text-blue-300"
-                      }`}
+                      className={`text-[9px] font-black tracking-wider uppercase px-1.5 rounded ${msg.role === "user" ? "bg-slate-800 text-slate-300" : "bg-blue-900/50 text-blue-300"}`}
                     >
                       {msg.role === "user" ? "Operator" : "AI Agent"}
                     </span>
                   </div>
                   <div
-                    className={`p-3 rounded-2xl text-xs max-w-[90%] leading-relaxed ${
-                      msg.role === "user"
-                        ? "bg-slate-800 text-white rounded-tr-none"
-                        : "bg-slate-950/60 text-slate-200 rounded-tl-none border border-slate-800/60"
-                    }`}
+                    className={`p-3 rounded-2xl text-xs max-w-[90%] leading-relaxed ${msg.role === "user" ? "bg-slate-800 text-white rounded-tr-none" : "bg-slate-950/60 text-slate-200 rounded-tl-none border border-slate-800/60"}`}
                   >
                     {msg.content}
                   </div>
