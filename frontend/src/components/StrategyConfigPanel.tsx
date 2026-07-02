@@ -5,10 +5,13 @@ interface StrategyConfigPanelProps {
   journalRuns: JournalRun[];
 }
 
+type ConfigDiffType = "add" | "remove" | "modify";
+
 interface ConfigDiffItem {
   key: string;
   oldValue: unknown;
   newValue: unknown;
+  type: ConfigDiffType;
 }
 
 function getLatestRunForCurrentStrategy(
@@ -84,6 +87,51 @@ function readConfigBoolean(
   return "—";
 }
 
+function getConfigDiffType(
+  oldValue: unknown,
+  newValue: unknown,
+): ConfigDiffType {
+  if (oldValue === undefined && newValue !== undefined) {
+    return "add";
+  }
+
+  if (oldValue !== undefined && newValue === undefined) {
+    return "remove";
+  }
+
+  return "modify";
+}
+
+function getDiffTone(type: ConfigDiffType) {
+  if (type === "add") {
+    return {
+      card: "rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-2",
+      badge: "bg-emerald-500/20 text-emerald-200",
+      text: "text-emerald-200",
+      section: "border-emerald-500/20 bg-emerald-500/10",
+      arrow: "text-emerald-300",
+    };
+  }
+
+  if (type === "remove") {
+    return {
+      card: "rounded-xl border border-rose-500/30 bg-rose-500/10 p-2",
+      badge: "bg-rose-500/20 text-rose-200",
+      text: "text-rose-200",
+      section: "border-rose-500/20 bg-rose-500/10",
+      arrow: "text-rose-300",
+    };
+  }
+
+  return {
+    card: "rounded-xl border border-amber-500/30 bg-amber-500/10 p-2",
+    badge: "bg-amber-500/20 text-amber-200",
+    text: "text-amber-200",
+    section: "border-amber-500/20 bg-amber-500/10",
+    arrow: "text-amber-300",
+  };
+}
+
 function buildConfigDiff(
   journalConfig: Record<string, unknown> | undefined,
   liveConfig: Record<string, unknown> | undefined,
@@ -102,11 +150,17 @@ function buildConfigDiff(
         stableStringify(journalConfig[key]) !==
         stableStringify(liveConfig[key]),
     )
-    .map((key) => ({
-      key,
-      oldValue: journalConfig[key],
-      newValue: liveConfig[key],
-    }));
+    .map((key) => {
+      const oldValue = journalConfig[key];
+      const newValue = liveConfig[key];
+
+      return {
+        key,
+        oldValue,
+        newValue,
+        type: getConfigDiffType(oldValue, newValue),
+      };
+    });
 }
 
 function formatTimestamp(value: string | undefined): string {
@@ -145,8 +199,10 @@ function ConfigCard({
           ? "text-blue-300"
           : "text-slate-300";
 
+  const diffTone = diff ? getDiffTone(diff.type) : null;
+
   const cardClass = diff
-    ? "rounded-xl border border-amber-500/30 bg-amber-500/10 p-2"
+    ? diffTone!.card
     : "rounded-xl bg-slate-950/60 border border-slate-800 p-2";
 
   return (
@@ -156,9 +212,11 @@ function ConfigCard({
           {label}
         </div>
 
-        {diff && (
-          <div className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[8px] font-black uppercase text-amber-200">
-            changed
+        {diff && diffTone && (
+          <div
+            className={`rounded-full px-2 py-0.5 text-[8px] font-black uppercase ${diffTone.badge}`}
+          >
+            {diff.type}
           </div>
         )}
       </div>
@@ -168,7 +226,9 @@ function ConfigCard({
           <div className="truncate text-xs font-black text-slate-400">
             {formatConfigValue(diff.oldValue)}
           </div>
-          <div className="truncate text-sm font-black text-amber-200">
+          <div
+            className={`truncate text-sm font-black ${diffTone?.text ?? "text-amber-200"}`}
+          >
             → {formatConfigValue(diff.newValue)}
           </div>
         </div>
@@ -373,36 +433,48 @@ export function StrategyConfigPanel({
         )}
 
         {shouldShowDiff && (
-          <div className="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/10 p-3">
+          <div className="mt-3 rounded-xl border border-slate-700 bg-slate-950/40 p-3">
             <div className="flex items-center justify-between gap-3">
-              <div className="text-[10px] font-black uppercase text-amber-200">
+              <div className="text-[10px] font-black uppercase text-slate-300">
                 Config diff
               </div>
-              <div className="text-[9px] font-black uppercase text-amber-300">
+              <div className="text-[9px] font-black uppercase text-slate-500">
                 journal → live
               </div>
             </div>
 
             <div className="mt-2 space-y-2">
-              {configDiff.map((diff) => (
-                <div
-                  key={diff.key}
-                  className="rounded-lg border border-slate-700 bg-slate-950/40 p-2"
-                >
-                  <div className="text-[9px] font-black uppercase text-slate-400">
-                    {diff.key}
+              {configDiff.map((diff) => {
+                const tone = getDiffTone(diff.type);
+
+                return (
+                  <div
+                    key={diff.key}
+                    className={`rounded-lg border p-2 ${tone.section}`}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="text-[9px] font-black uppercase text-slate-300">
+                        {diff.key}
+                      </div>
+                      <div
+                        className={`rounded-full px-2 py-0.5 text-[8px] font-black uppercase ${tone.badge}`}
+                      >
+                        {diff.type}
+                      </div>
+                    </div>
+
+                    <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
+                      <span className="font-mono text-slate-400">
+                        {formatConfigValue(diff.oldValue)}
+                      </span>
+                      <span className={tone.arrow}>→</span>
+                      <span className={`font-mono font-black ${tone.text}`}>
+                        {formatConfigValue(diff.newValue)}
+                      </span>
+                    </div>
                   </div>
-                  <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
-                    <span className="font-mono text-slate-400">
-                      {formatConfigValue(diff.oldValue)}
-                    </span>
-                    <span className="text-amber-300">→</span>
-                    <span className="font-mono font-black text-amber-200">
-                      {formatConfigValue(diff.newValue)}
-                    </span>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
