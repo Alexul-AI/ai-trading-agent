@@ -159,3 +159,24 @@ export interface SseEvent {
   actionableCount?: number;
   timestamp?: string;
 }
+
+export interface MarketChartPoint {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  rsi: number | null;
+  macdHistogram: number | null;
+  bollingerLower: number | null;
+  bollingerMiddle: number | null;
+  bollingerUpper: number | null;
+}
+
+export interface MarketChartResponse {
+  ticker: string;
+  days: number;
+  feed: string;
+  points: MarketChartPoint[];
+}

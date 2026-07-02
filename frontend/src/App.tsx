@@ -4,6 +4,7 @@ import { AutopilotLogs } from "./components/AutopilotLogs";
 import { ChatTerminal } from "./components/ChatTerminal";
 import { DecisionJournalPanel } from "./components/DecisionJournalPanel";
 import { LastAutopilotDecisions } from "./components/LastAutopilotDecisions";
+import { TickerChartPanel } from "./components/TickerChartPanel";
 import type {
   AutopilotRunResponse,
   AutopilotStatus,
@@ -877,6 +878,13 @@ export default function App() {
               )}
             </div>
           </div>
+
+          <TickerChartPanel
+            apiBaseUrl={API_BASE_URL}
+            watchlist={watchlist}
+            positions={portfolio.positions}
+            latestDecisions={latestDecisions}
+          />
         </section>
 
         <section className="xl:col-span-4 flex flex-col gap-6">

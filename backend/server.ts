@@ -12,6 +12,11 @@ import {
   readAutopilotRuns,
   summarizeAutopilotRuns,
 } from "./decisionJournal.js";
+import {
+  calculateBollingerBands,
+  calculateMACD,
+  calculateRSI,
+} from "./indicators.js";
 
 dotenv.config();
 
@@ -53,6 +58,27 @@ interface AlpacaBar {
 interface AlpacaBarsResponse {
   bars?: AlpacaBar[];
   next_page_token?: string | null;
+}
+
+interface MarketChartPoint {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  rsi: number | null;
+  macdHistogram: number | null;
+  bollingerLower: number | null;
+  bollingerMiddle: number | null;
+  bollingerUpper: number | null;
+}
+
+interface MarketChartResponse {
+  ticker: string;
+  days: number;
+  feed: string;
+  points: MarketChartPoint[];
 }
 
 type AlpacaConstructor = new (config: {
@@ -113,11 +139,10 @@ function extractAlpacaPrice(value: unknown): number {
   return 0;
 }
 
-const AlpacaClient = (
-  (AlpacaModule as { default?: unknown; Alpaca?: unknown }).default ??
+const AlpacaClient = ((AlpacaModule as { default?: unknown; Alpaca?: unknown })
+  .default ??
   (AlpacaModule as { default?: unknown; Alpaca?: unknown }).Alpaca ??
-  AlpacaModule
-) as AlpacaConstructor;
+  AlpacaModule) as AlpacaConstructor;
 
 const envSchema = z.object({
   PORT: z.coerce.number().default(3000),
@@ -342,7 +367,10 @@ async function getPreviousCloseFromAlpaca(ticker: string): Promise<number> {
   return previousBar?.c ?? 0;
 }
 
-function calculateDailyChangePercent(price: number, previousClose: number): number {
+function calculateDailyChangePercent(
+  price: number,
+  previousClose: number,
+): number {
   if (price <= 0 || previousClose <= 0) return 0;
   return Number((((price - previousClose) / previousClose) * 100).toFixed(2));
 }
@@ -352,7 +380,9 @@ async function getWatchlistQuotesFromAlpaca(
   positions: Record<string, PositionSnapshot>,
 ): Promise<WatchlistItem[]> {
   const uniqueTickers = Array.from(
-    new Set(tickers.map((ticker) => ticker.trim().toUpperCase()).filter(Boolean)),
+    new Set(
+      tickers.map((ticker) => ticker.trim().toUpperCase()).filter(Boolean),
+    ),
   );
 
   const items = await Promise.all(
@@ -393,7 +423,10 @@ async function getWatchlistQuotesFromAlpaca(
           isUp: change >= 0,
         };
       } catch (error) {
-        console.warn(`[WATCHLIST] Failed to fetch ${ticker} from Alpaca:`, error);
+        console.warn(
+          `[WATCHLIST] Failed to fetch ${ticker} from Alpaca:`,
+          error,
+        );
 
         return {
           ticker,
@@ -407,6 +440,112 @@ async function getWatchlistQuotesFromAlpaca(
   );
 
   return items;
+}
+function roundOrNull(
+  value: number | null | undefined,
+  digits = 2,
+): number | null {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return null;
+  }
+
+  return Number(value.toFixed(digits));
+}
+
+async function fetchDailyBarsForChart(
+  ticker: string,
+  days: number,
+): Promise<AlpacaBar[]> {
+  if (!ticker) {
+    throw new Error("Ticker is required.");
+  }
+
+  const safeDays = Math.max(30, Math.min(365, days));
+  const endDate = new Date();
+  const startDate = new Date();
+
+  // Add buffer for weekends and market holidays.
+  startDate.setDate(endDate.getDate() - safeDays - 20);
+
+  const allBars: AlpacaBar[] = [];
+  let pageToken: string | undefined;
+
+  do {
+    const url = new URL(`https://data.alpaca.markets/v2/stocks/${ticker}/bars`);
+
+    url.searchParams.set("timeframe", "1Day");
+    url.searchParams.set("start", toIsoDate(startDate));
+    url.searchParams.set("end", toIsoDate(endDate));
+    url.searchParams.set("adjustment", "raw");
+    url.searchParams.set("feed", ALPACA_DATA_FEED);
+    url.searchParams.set("limit", "1000");
+
+    if (pageToken) {
+      url.searchParams.set("page_token", pageToken);
+    }
+
+    const keyId = isLiveMode ? ENV.APCA_API_KEY_ID_LIVE! : ENV.APCA_API_KEY_ID;
+    const secretKey = isLiveMode
+      ? ENV.APCA_API_SECRET_KEY_LIVE!
+      : ENV.APCA_API_SECRET_KEY;
+
+    const response = await fetch(url.toString(), {
+      headers: {
+        "APCA-API-KEY-ID": keyId,
+        "APCA-API-SECRET-KEY": secretKey,
+      },
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+
+      throw new Error(
+        `Alpaca chart bars request failed for ${ticker}: HTTP ${response.status} ${body}`,
+      );
+    }
+
+    const data = (await response.json()) as AlpacaBarsResponse;
+
+    if (data.bars) {
+      allBars.push(...data.bars);
+    }
+
+    pageToken = data.next_page_token || undefined;
+  } while (pageToken);
+
+  return allBars
+    .sort((a, b) => new Date(a.t).getTime() - new Date(b.t).getTime())
+    .slice(-safeDays);
+}
+
+function buildMarketChartPoints(bars: AlpacaBar[]): MarketChartPoint[] {
+  return bars.map((bar, index) => {
+    const closesUpToPoint = bars.slice(0, index + 1).map((item) => item.c);
+
+    const hasRsi = closesUpToPoint.length >= 15;
+    const hasMacd = closesUpToPoint.length >= 35;
+    const hasBollinger = closesUpToPoint.length >= 20;
+
+    const rsi = hasRsi ? calculateRSI(closesUpToPoint, 14) : null;
+    const macd = hasMacd ? calculateMACD(closesUpToPoint) : null;
+    const bb = hasBollinger
+      ? calculateBollingerBands(closesUpToPoint, 20, 2)
+      : null;
+
+    return {
+      date: bar.t.split("T")[0] ?? bar.t,
+      open: Number(bar.o.toFixed(2)),
+      high: Number(bar.h.toFixed(2)),
+      low: Number(bar.l.toFixed(2)),
+      close: Number(bar.c.toFixed(2)),
+      volume: bar.v,
+      rsi: roundOrNull(rsi, 2),
+      macdHistogram: roundOrNull(macd?.histogram, 4),
+      bollingerLower: roundOrNull(bb?.lower, 2),
+      bollingerMiddle: bb ? roundOrNull((bb.upper + bb.lower) / 2, 2) : null,
+      bollingerUpper: roundOrNull(bb?.upper, 2),
+    };
+  });
 }
 
 async function getDashboardSnapshot() {
@@ -461,7 +600,10 @@ async function executeSafeTrade(
     const orderType = rawOrderType.toLowerCase();
 
     if (!ticker || !Number.isFinite(requestedShares) || requestedShares <= 0) {
-      return { status: "rejected", reason: "Invalid ticker or share quantity." };
+      return {
+        status: "rejected",
+        reason: "Invalid ticker or share quantity.",
+      };
     }
 
     const accountRecord = asRecord(await alpaca.getAccount());
@@ -473,7 +615,9 @@ async function executeSafeTrade(
     const currentEquity = toNumber(accountRecord.equity);
 
     const dailyDrawdown =
-      previousEquity > 0 ? (currentEquity - previousEquity) / previousEquity : 0;
+      previousEquity > 0
+        ? (currentEquity - previousEquity) / previousEquity
+        : 0;
 
     const accountState: AccountState = {
       equity: currentEquity,
@@ -507,7 +651,9 @@ async function executeSafeTrade(
         message: riskResult.reason,
       });
 
-      await sendTelegramAlert(`REJECTED ${action} ${ticker}: ${riskResult.reason}`);
+      await sendTelegramAlert(
+        `REJECTED ${action} ${ticker}: ${riskResult.reason}`,
+      );
 
       return {
         status: "rejected",
@@ -581,7 +727,8 @@ async function executeSafeTrade(
       adjustedShares: finalShares,
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown trade error";
+    const message =
+      error instanceof Error ? error.message : "Unknown trade error";
     console.error("[TRADE] Failed:", error);
 
     return {
@@ -599,7 +746,9 @@ const autopilotWorker = createAutopilotWorker({
   sendTelegramAlert,
 });
 
-function createMarketContext(snapshot: Awaited<ReturnType<typeof getDashboardSnapshot>>) {
+function createMarketContext(
+  snapshot: Awaited<ReturnType<typeof getDashboardSnapshot>>,
+) {
   return [
     "CURRENT ALPACA SNAPSHOT:",
     JSON.stringify({
@@ -728,15 +877,38 @@ app.get("/api/watchlist", async (_req, res) => {
       new Set([...defaultWatchlist, ...Object.keys(portfolio.positions)]),
     ).filter(Boolean);
 
-    res.json(
-      await getWatchlistQuotesFromAlpaca(
-        tickers,
-        portfolio.positions,
-      ),
-    );
+    res.json(await getWatchlistQuotesFromAlpaca(tickers, portfolio.positions));
   } catch (error) {
     console.error("[API] /api/watchlist failed:", error);
     res.status(500).json({ error: "Failed to fetch watchlist" });
+  }
+});
+
+app.get("/api/market/chart/:ticker", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  try {
+    const ticker = String(req.params.ticker ?? "")
+      .trim()
+      .toUpperCase();
+    const days = Number.parseInt(String(req.query.days ?? "120"), 10);
+    const safeDays = Number.isFinite(days) ? days : 120;
+    const bars = await fetchDailyBarsForChart(ticker, safeDays);
+
+    const payload: MarketChartResponse = {
+      ticker,
+      days: Math.max(30, Math.min(365, safeDays)),
+      feed: ALPACA_DATA_FEED,
+      points: buildMarketChartPoints(bars),
+    };
+
+    res.json(payload);
+  } catch (error) {
+    console.error("[API] /api/market/chart/:ticker failed:", error);
+    res.status(500).json({
+      error:
+        error instanceof Error ? error.message : "Failed to load chart data",
+    });
   }
 });
 
