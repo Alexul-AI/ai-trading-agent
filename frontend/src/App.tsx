@@ -4,6 +4,7 @@ import { AutopilotLogs } from "./components/AutopilotLogs";
 import { ChatTerminal } from "./components/ChatTerminal";
 import { DecisionJournalPanel } from "./components/DecisionJournalPanel";
 import { LastAutopilotDecisions } from "./components/LastAutopilotDecisions";
+import { StrategyQualityPanel } from "./components/StrategyQualityPanel";
 import { TickerChartPanel } from "./components/TickerChartPanel";
 import type {
   AutopilotRunResponse,
@@ -909,6 +910,11 @@ export default function App() {
             journalSummary={journalSummary}
             isLoadingJournal={isLoadingJournal}
             onRefresh={refreshAutopilotJournal}
+          />
+
+          <StrategyQualityPanel
+            journalRuns={journalRuns}
+            minConfidence={autopilotStatus.minConfidence}
           />
 
           <LastAutopilotDecisions
