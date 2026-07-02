@@ -4,6 +4,7 @@ import { AutopilotLogs } from "./components/AutopilotLogs";
 import { ChatTerminal } from "./components/ChatTerminal";
 import { DecisionJournalPanel } from "./components/DecisionJournalPanel";
 import { LastAutopilotDecisions } from "./components/LastAutopilotDecisions";
+import { StrategyComparisonPanel } from "./components/StrategyComparisonPanel";
 import { StrategyConfigPanel } from "./components/StrategyConfigPanel";
 import { StrategyQualityPanel } from "./components/StrategyQualityPanel";
 import { SystemHealthBanner } from "./components/SystemHealthBanner";
@@ -901,7 +902,6 @@ export default function App() {
             journalRuns={journalRuns}
             minConfidence={autopilotStatus.minConfidence}
           />
-
         </section>
 
         <section className="xl:col-span-4 flex flex-col gap-6">
@@ -924,6 +924,13 @@ export default function App() {
           <StrategyQualityPanel
             journalRuns={journalRuns}
             minConfidence={autopilotStatus.minConfidence}
+          />
+
+          <StrategyComparisonPanel
+            journalRuns={journalRuns}
+            minConfidence={autopilotStatus.minConfidence}
+            liveStrategyVersion={autopilotStatus.strategyVersion}
+            liveStrategyConfigHash={autopilotStatus.strategyConfigHash}
           />
 
           <StrategyConfigPanel
