@@ -95,6 +95,7 @@ export interface AutopilotStatus {
   tickers: string[];
   minConfidence: number;
   maxSellFraction: number;
+  blockSellBelowAverageEntry: boolean;
   telegramCooldownMinutes: number;
   lastJournalRunId: string | null;
   lastRunAt: string | null;
@@ -147,6 +148,12 @@ const AUTOPILOT_EXECUTE_TRADES =
 
 const AUTOPILOT_ALLOW_BUY = process.env.AUTOPILOT_ALLOW_BUY === "true";
 const AUTOPILOT_ALLOW_SELL = process.env.AUTOPILOT_ALLOW_SELL === "true";
+
+// Default safety behavior:
+// normal SELL_SIGNAL should not sell a held position below average entry.
+// STOP_LOSS remains allowed to protect capital.
+const AUTOPILOT_BLOCK_SELL_BELOW_AVG =
+  process.env.AUTOPILOT_BLOCK_SELL_BELOW_AVG !== "false";
 
 const AUTOPILOT_ENABLED_DEFAULT =
   process.env.AUTOPILOT_ENABLED_DEFAULT === "true";
@@ -201,6 +208,45 @@ function getSafeSellShares(
   }
 
   return { shares: safeShares };
+}
+
+function shouldBlockNormalSellBelowAverageEntry({
+  action,
+  reasonType,
+  sharesOwned,
+  price,
+  averageEntryPrice,
+}: {
+  action: StrategyDecision["action"];
+  reasonType: StrategyDecision["reasonType"];
+  sharesOwned: number;
+  price: number;
+  averageEntryPrice: number;
+}): boolean {
+  if (!AUTOPILOT_BLOCK_SELL_BELOW_AVG) return false;
+  if (action !== "SELL") return false;
+  if (reasonType !== "SELL_SIGNAL") return false;
+  if (sharesOwned <= 0) return false;
+  if (averageEntryPrice <= 0) return false;
+
+  return price < averageEntryPrice;
+}
+
+function appendSafetyNote(
+  existingNote: string | undefined,
+  nextNote: string,
+): string {
+  if (!existingNote) return nextNote;
+  return `${existingNote} | ${nextNote}`;
+}
+
+function isActionableDecision(decision: AutopilotDecisionLog): boolean {
+  return (
+    decision.action !== "HOLD" &&
+    decision.confidence >= AUTOPILOT_MIN_CONFIDENCE &&
+    decision.suggestedShares > 0 &&
+    !decision.skippedReason
+  );
 }
 
 async function fetchAlpacaBars(ticker: string): Promise<AlpacaBar[]> {
@@ -384,6 +430,27 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       return log;
     }
 
+    if (
+      shouldBlockNormalSellBelowAverageEntry({
+        action: decision.action,
+        reasonType: decision.reasonType,
+        sharesOwned,
+        price,
+        averageEntryPrice,
+      })
+    ) {
+      const guardNote = `Position guard: blocked normal SELL_SIGNAL because current price ${price.toFixed(
+        2,
+      )} is below average entry ${averageEntryPrice.toFixed(
+        2,
+      )}. STOP_LOSS can still sell below average entry.`;
+
+      log.safetyNote = appendSafetyNote(log.safetyNote, guardNote);
+      log.skippedReason =
+        "Position guard blocked SELL_SIGNAL below average entry.";
+      return log;
+    }
+
     if (decision.confidence < AUTOPILOT_MIN_CONFIDENCE) {
       log.skippedReason = `Confidence ${decision.confidence} is below min ${AUTOPILOT_MIN_CONFIDENCE}.`;
       return log;
@@ -419,12 +486,18 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
 
     const stopLoss =
       decision.action === "BUY"
-        ? Number((price * (1 - DEFAULT_STRATEGY_CONFIG.stopLossPercent)).toFixed(2))
+        ? Number(
+            (price * (1 - DEFAULT_STRATEGY_CONFIG.stopLossPercent)).toFixed(2),
+          )
         : undefined;
 
     const takeProfit =
       decision.action === "BUY"
-        ? Number((price * (1 + DEFAULT_STRATEGY_CONFIG.takeProfitPercent)).toFixed(2))
+        ? Number(
+            (price * (1 + DEFAULT_STRATEGY_CONFIG.takeProfitPercent)).toFixed(
+              2,
+            ),
+          )
         : undefined;
 
     const result = await options.executeSafeTrade(
@@ -565,11 +638,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       lastDecisions = decisions;
       lastRunAt = new Date().toISOString();
 
-      const actionable = decisions.filter(
-        (decision) =>
-          decision.action !== "HOLD" &&
-          decision.confidence >= AUTOPILOT_MIN_CONFIDENCE,
-      );
+      const actionable = decisions.filter(isActionableDecision);
 
       try {
         const journalRun = await appendAutopilotRun({
@@ -675,6 +744,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       tickers: AUTOPILOT_TICKERS,
       minConfidence: AUTOPILOT_MIN_CONFIDENCE,
       maxSellFraction: clampFraction(AUTOPILOT_MAX_SELL_FRACTION),
+      blockSellBelowAverageEntry: AUTOPILOT_BLOCK_SELL_BELOW_AVG,
       telegramCooldownMinutes: AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES,
       lastJournalRunId,
       lastRunAt,

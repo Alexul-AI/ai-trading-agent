@@ -167,6 +167,18 @@ function summarizeCluster(
   };
 }
 
+function isDecisionActionable(
+  decision: AutopilotDecision,
+  minConfidence: number,
+): boolean {
+  return (
+    decision.action !== "HOLD" &&
+    decision.confidence >= minConfidence &&
+    decision.suggestedShares > 0 &&
+    !decision.skippedReason
+  );
+}
+
 export function TickerChartPanel({
   apiBaseUrl,
   watchlist,
@@ -240,6 +252,9 @@ export function TickerChartPanel({
   const selectedDecision = latestDecisions.find(
     (decision) => decision.ticker === selectedTicker,
   );
+  const selectedDecisionActionable = selectedDecision
+    ? isDecisionActionable(selectedDecision, minConfidence)
+    : false;
   const selectedPosition = positions[selectedTicker];
   const activePoint =
     hoverIndex !== null ? points[hoverIndex] : points[points.length - 1];
@@ -427,7 +442,7 @@ export function TickerChartPanel({
       {selectedDecision && (
         <div className="mb-3 rounded-xl border border-slate-800 bg-slate-950/50 p-3">
           <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <span
                 className={`px-2 py-0.5 rounded-full border text-[10px] font-black ${actionPillClass(
                   selectedDecision.action,
@@ -441,6 +456,15 @@ export function TickerChartPanel({
                 )}`}
               >
                 confidence {selectedDecision.confidence}
+              </span>
+              <span
+                className={`px-2 py-0.5 rounded-full border text-[10px] font-black ${
+                  selectedDecisionActionable
+                    ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/30"
+                    : "bg-slate-800 text-slate-400 border-slate-700"
+                }`}
+              >
+                {selectedDecisionActionable ? "ACTIONABLE" : "NOT ACTIONABLE"}
               </span>
             </div>
 
@@ -459,6 +483,12 @@ export function TickerChartPanel({
           {selectedDecision.safetyNote && (
             <div className="mt-2 text-[10px] text-amber-300">
               {selectedDecision.safetyNote}
+            </div>
+          )}
+
+          {selectedDecision.skippedReason && (
+            <div className="mt-2 rounded-lg border border-slate-800 bg-slate-900/70 p-2 text-[10px] text-slate-400">
+              Skipped: {selectedDecision.skippedReason}
             </div>
           )}
         </div>
