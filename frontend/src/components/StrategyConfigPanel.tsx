@@ -5,6 +5,12 @@ interface StrategyConfigPanelProps {
   journalRuns: JournalRun[];
 }
 
+interface ConfigDiffItem {
+  key: string;
+  oldValue: unknown;
+  newValue: unknown;
+}
+
 function getLatestRunForCurrentStrategy(
   journalRuns: JournalRun[],
   strategyVersion?: string,
@@ -16,6 +22,42 @@ function getLatestRunForCurrentStrategy(
     journalRuns[0] ??
     null
   );
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`;
+  }
+
+  const record = value as Record<string, unknown>;
+
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+    .join(",")}}`;
+}
+
+function formatConfigValue(value: unknown): string {
+  if (value === undefined) return "—";
+  if (value === null) return "null";
+
+  if (typeof value === "boolean") {
+    return value ? "true" : "false";
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? String(value) : "—";
+  }
+
+  if (typeof value === "string") {
+    return value.length > 0 ? value : "empty";
+  }
+
+  return stableStringify(value);
 }
 
 function readConfigNumber(
@@ -42,6 +84,31 @@ function readConfigBoolean(
   return "—";
 }
 
+function buildConfigDiff(
+  journalConfig: Record<string, unknown> | undefined,
+  liveConfig: Record<string, unknown> | undefined,
+): ConfigDiffItem[] {
+  if (!journalConfig || !liveConfig) {
+    return [];
+  }
+
+  const keys = Array.from(
+    new Set([...Object.keys(journalConfig), ...Object.keys(liveConfig)]),
+  ).sort();
+
+  return keys
+    .filter(
+      (key) =>
+        stableStringify(journalConfig[key]) !==
+        stableStringify(liveConfig[key]),
+    )
+    .map((key) => ({
+      key,
+      oldValue: journalConfig[key],
+      newValue: liveConfig[key],
+    }));
+}
+
 function formatTimestamp(value: string | undefined): string {
   if (!value) return "—";
 
@@ -58,11 +125,17 @@ function ConfigCard({
   label,
   value,
   tone = "neutral",
+  fieldKey,
+  diffByKey,
 }: {
   label: string;
   value: string;
   tone?: "neutral" | "good" | "warn" | "info";
+  fieldKey?: string;
+  diffByKey?: Map<string, ConfigDiffItem>;
 }) {
+  const diff = fieldKey ? diffByKey?.get(fieldKey) : undefined;
+
   const toneClass =
     tone === "good"
       ? "text-emerald-300"
@@ -72,12 +145,38 @@ function ConfigCard({
           ? "text-blue-300"
           : "text-slate-300";
 
+  const cardClass = diff
+    ? "rounded-xl border border-amber-500/30 bg-amber-500/10 p-2"
+    : "rounded-xl bg-slate-950/60 border border-slate-800 p-2";
+
   return (
-    <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-2">
-      <div className="text-[9px] text-slate-500 font-black uppercase">
-        {label}
+    <div className={cardClass}>
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[9px] text-slate-500 font-black uppercase">
+          {label}
+        </div>
+
+        {diff && (
+          <div className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[8px] font-black uppercase text-amber-200">
+            changed
+          </div>
+        )}
       </div>
-      <div className={`truncate text-sm font-black ${toneClass}`}>{value}</div>
+
+      {diff ? (
+        <div className="mt-1 min-w-0">
+          <div className="truncate text-xs font-black text-slate-400">
+            {formatConfigValue(diff.oldValue)}
+          </div>
+          <div className="truncate text-sm font-black text-amber-200">
+            → {formatConfigValue(diff.newValue)}
+          </div>
+        </div>
+      ) : (
+        <div className={`truncate text-sm font-black ${toneClass}`}>
+          {value}
+        </div>
+      )}
     </div>
   );
 }
@@ -100,6 +199,12 @@ export function StrategyConfigPanel({
   const hashMatches =
     Boolean(liveHash && journalHash) && liveHash === journalHash;
 
+  const configDiff = buildConfigDiff(journalConfig, liveConfig);
+  const diffByKey = new Map(configDiff.map((diff) => [diff.key, diff]));
+
+  const shouldShowDiff =
+    Boolean(liveHash && journalHash && !hashMatches) && configDiff.length > 0;
+
   const hasLiveConfig = Boolean(liveConfig);
   const hasJournalConfig = Boolean(journalConfig);
 
@@ -120,7 +225,11 @@ export function StrategyConfigPanel({
             Source
           </div>
           <div className="text-xs font-black text-emerald-300">
-            {hasLiveConfig ? "live status" : hasJournalConfig ? "journal" : "none"}
+            {hasLiveConfig
+              ? "live status"
+              : hasJournalConfig
+                ? "journal"
+                : "none"}
           </div>
         </div>
       </div>
@@ -128,13 +237,17 @@ export function StrategyConfigPanel({
       <div className="grid grid-cols-2 gap-2 mb-4">
         <ConfigCard
           label="Version"
-          value={autopilotStatus.strategyVersion ?? latestRun?.strategyVersion ?? "legacy"}
+          value={
+            autopilotStatus.strategyVersion ??
+            latestRun?.strategyVersion ??
+            "legacy"
+          }
           tone="good"
         />
         <ConfigCard
           label="Config hash"
           value={liveHash ?? journalHash ?? "—"}
-          tone="info"
+          tone={hashMatches ? "good" : "info"}
         />
       </div>
 
@@ -143,16 +256,22 @@ export function StrategyConfigPanel({
           label="Buy score"
           value={readConfigNumber(config, "minBuySignalScore")}
           tone="info"
+          fieldKey="minBuySignalScore"
+          diffByKey={diffByKey}
         />
         <ConfigCard
           label="Sell score"
           value={readConfigNumber(config, "minSellSignalScore")}
           tone="info"
+          fieldKey="minSellSignalScore"
+          diffByKey={diffByKey}
         />
         <ConfigCard
           label="Strong score"
           value={readConfigNumber(config, "strongSignalScore")}
           tone="warn"
+          fieldKey="strongSignalScore"
+          diffByKey={diffByKey}
         />
       </div>
 
@@ -160,18 +279,26 @@ export function StrategyConfigPanel({
         <ConfigCard
           label="Buy RSI"
           value={readConfigNumber(config, "buyRsiThreshold")}
+          fieldKey="buyRsiThreshold"
+          diffByKey={diffByKey}
         />
         <ConfigCard
           label="Buy momentum RSI"
           value={readConfigNumber(config, "buyRsiWithMomentumThreshold")}
+          fieldKey="buyRsiWithMomentumThreshold"
+          diffByKey={diffByKey}
         />
         <ConfigCard
           label="Sell RSI"
           value={readConfigNumber(config, "sellRsiThreshold")}
+          fieldKey="sellRsiThreshold"
+          diffByKey={diffByKey}
         />
         <ConfigCard
           label="Sell weak RSI"
           value={readConfigNumber(config, "sellRsiWithoutMomentumThreshold")}
+          fieldKey="sellRsiWithoutMomentumThreshold"
+          diffByKey={diffByKey}
         />
       </div>
 
@@ -180,19 +307,27 @@ export function StrategyConfigPanel({
           label="Stop loss"
           value={readConfigNumber(config, "stopLossPercent")}
           tone="warn"
+          fieldKey="stopLossPercent"
+          diffByKey={diffByKey}
         />
         <ConfigCard
           label="Take profit"
           value={readConfigNumber(config, "takeProfitPercent")}
           tone="good"
+          fieldKey="takeProfitPercent"
+          diffByKey={diffByKey}
         />
         <ConfigCard
           label="Max buy cash"
           value={readConfigNumber(config, "maxBuyCashFraction")}
+          fieldKey="maxBuyCashFraction"
+          diffByKey={diffByKey}
         />
         <ConfigCard
           label="Max position"
           value={readConfigNumber(config, "maxPositionEquityFraction")}
+          fieldKey="maxPositionEquityFraction"
+          diffByKey={diffByKey}
         />
       </div>
 
@@ -200,11 +335,18 @@ export function StrategyConfigPanel({
         <ConfigCard
           label="Cooldown bars"
           value={readConfigNumber(config, "cooldownBars")}
+          fieldKey="cooldownBars"
+          diffByKey={diffByKey}
         />
         <ConfigCard
           label="Block sell below avg"
-          value={readConfigBoolean(config, "downgradeNormalSellBelowAverageEntry")}
+          value={readConfigBoolean(
+            config,
+            "downgradeNormalSellBelowAverageEntry",
+          )}
           tone="good"
+          fieldKey="downgradeNormalSellBelowAverageEntry"
+          diffByKey={diffByKey}
         />
       </div>
 
@@ -226,7 +368,50 @@ export function StrategyConfigPanel({
           >
             {hashMatches
               ? "Live config hash matches latest journal run for this strategy."
-              : "Live config hash differs from latest journal run. Run Autopilot once to record the current config."}
+              : "Live config hash differs from latest journal run. Review the diff below or run Autopilot once to record the current config."}
+          </div>
+        )}
+
+        {shouldShowDiff && (
+          <div className="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/10 p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-[10px] font-black uppercase text-amber-200">
+                Config diff
+              </div>
+              <div className="text-[9px] font-black uppercase text-amber-300">
+                journal → live
+              </div>
+            </div>
+
+            <div className="mt-2 space-y-2">
+              {configDiff.map((diff) => (
+                <div
+                  key={diff.key}
+                  className="rounded-lg border border-slate-700 bg-slate-950/40 p-2"
+                >
+                  <div className="text-[9px] font-black uppercase text-slate-400">
+                    {diff.key}
+                  </div>
+                  <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
+                    <span className="font-mono text-slate-400">
+                      {formatConfigValue(diff.oldValue)}
+                    </span>
+                    <span className="text-amber-300">→</span>
+                    <span className="font-mono font-black text-amber-200">
+                      {formatConfigValue(diff.newValue)}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {liveHash && journalHash && !hashMatches && configDiff.length === 0 && (
+          <div className="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-amber-200">
+            Config hashes differ, but the visible config fields look identical.
+            This can happen if serialization changed or hidden fields were
+            added.
           </div>
         )}
 
