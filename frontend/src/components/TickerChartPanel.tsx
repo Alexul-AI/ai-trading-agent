@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import type {
   AutopilotDecision,
+  JournalRun,
   MarketChartPoint,
   MarketChartResponse,
   Position,
+  SignalAction,
   WatchlistItem,
 } from "../types";
 import {
@@ -18,6 +20,32 @@ interface TickerChartPanelProps {
   watchlist: WatchlistItem[];
   positions: Record<string, Position>;
   latestDecisions: AutopilotDecision[];
+  journalRuns: JournalRun[];
+  minConfidence: number;
+}
+
+interface ChartSignalMarker {
+  id: string;
+  date: string;
+  ticker: string;
+  action: SignalAction;
+  confidence: number;
+  suggestedShares: number;
+  originalSuggestedShares?: number;
+  reasonType: string;
+  executed: boolean;
+  skippedReason?: string;
+  runTimestamp: string;
+}
+
+interface ChartSignalCluster {
+  date: string;
+  markers: ChartSignalMarker[];
+  primaryMarker: ChartSignalMarker;
+  actionableCount: number;
+  skippedCount: number;
+  buyCount: number;
+  sellCount: number;
 }
 
 interface SvgPoint {
@@ -70,11 +98,82 @@ function latestNonNull<T>(
   return null;
 }
 
+function dateKey(value: string): string {
+  return value.split("T")[0] ?? value;
+}
+
+function markerClass(action: SignalAction): string {
+  if (action === "BUY") return "fill-emerald-300";
+  if (action === "SELL") return "fill-rose-300";
+  return "fill-slate-500";
+}
+
+function markerStrokeClass(action: SignalAction): string {
+  if (action === "BUY") return "stroke-emerald-950";
+  if (action === "SELL") return "stroke-rose-950";
+  return "stroke-slate-950";
+}
+
+function markerLabel(action: SignalAction): string {
+  if (action === "BUY") return "B";
+  if (action === "SELL") return "S";
+  return "H";
+}
+
+function isActionableMarker(
+  marker: ChartSignalMarker,
+  minConfidence: number,
+): boolean {
+  return (
+    marker.action !== "HOLD" &&
+    marker.confidence >= minConfidence &&
+    !marker.skippedReason
+  );
+}
+
+function getPrimaryMarker(
+  markers: ChartSignalMarker[],
+  minConfidence: number,
+): ChartSignalMarker {
+  return [...markers].sort((a, b) => {
+    const aActionable = isActionableMarker(a, minConfidence) ? 1 : 0;
+    const bActionable = isActionableMarker(b, minConfidence) ? 1 : 0;
+
+    if (aActionable !== bActionable) return bActionable - aActionable;
+
+    return b.confidence - a.confidence;
+  })[0];
+}
+
+function summarizeCluster(
+  date: string,
+  markers: ChartSignalMarker[],
+  minConfidence: number,
+): ChartSignalCluster {
+  const primaryMarker = getPrimaryMarker(markers, minConfidence);
+
+  return {
+    date,
+    markers,
+    primaryMarker,
+    actionableCount: markers.filter((marker) =>
+      isActionableMarker(marker, minConfidence),
+    ).length,
+    skippedCount: markers.filter(
+      (marker) => !isActionableMarker(marker, minConfidence),
+    ).length,
+    buyCount: markers.filter((marker) => marker.action === "BUY").length,
+    sellCount: markers.filter((marker) => marker.action === "SELL").length,
+  };
+}
+
 export function TickerChartPanel({
   apiBaseUrl,
   watchlist,
   positions,
   latestDecisions,
+  journalRuns,
+  minConfidence,
 }: TickerChartPanelProps) {
   const tickers = useMemo(
     () => getTickerUniverse(watchlist, positions),
@@ -88,6 +187,8 @@ export function TickerChartPanel({
   const [days, setDays] = useState(120);
   const [chartData, setChartData] = useState<MarketChartResponse | null>(null);
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const [hoveredCluster, setHoveredCluster] =
+    useState<ChartSignalCluster | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -116,6 +217,7 @@ export function TickerChartPanel({
         const data = (await response.json()) as MarketChartResponse;
         setChartData(data);
         setHoverIndex(null);
+        setHoveredCluster(null);
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") {
           return;
@@ -134,13 +236,74 @@ export function TickerChartPanel({
     };
   }, [apiBaseUrl, selectedTicker, days]);
 
-  const points = chartData?.points ?? [];
+  const points = useMemo(() => chartData?.points ?? [], [chartData?.points]);
   const selectedDecision = latestDecisions.find(
     (decision) => decision.ticker === selectedTicker,
   );
   const selectedPosition = positions[selectedTicker];
   const activePoint =
     hoverIndex !== null ? points[hoverIndex] : points[points.length - 1];
+
+  const chartSignalMarkers = useMemo<ChartSignalMarker[]>(() => {
+    if (!selectedTicker) return [];
+
+    const chartDates = new Set(points.map((point) => point.date));
+
+    return journalRuns
+      .flatMap((run) =>
+        run.decisions.map((decision) => ({
+          id: `${run.id}-${decision.ticker}-${decision.timestamp}`,
+          date: dateKey(decision.timestamp),
+          ticker: decision.ticker,
+          action: decision.action,
+          confidence: decision.confidence,
+          suggestedShares: decision.suggestedShares,
+          originalSuggestedShares: decision.originalSuggestedShares,
+          reasonType: decision.reasonType,
+          executed: decision.executed,
+          skippedReason: decision.skippedReason,
+          runTimestamp: run.timestamp,
+        })),
+      )
+      .filter(
+        (marker) =>
+          marker.ticker === selectedTicker &&
+          marker.action !== "HOLD" &&
+          chartDates.has(marker.date),
+      )
+      .sort(
+        (a, b) =>
+          new Date(a.runTimestamp).getTime() -
+          new Date(b.runTimestamp).getTime(),
+      );
+  }, [journalRuns, points, selectedTicker]);
+
+  const markerClusterByDate = useMemo(() => {
+    const markersByDate = new Map<string, ChartSignalMarker[]>();
+
+    for (const marker of chartSignalMarkers) {
+      markersByDate.set(marker.date, [
+        ...(markersByDate.get(marker.date) ?? []),
+        marker,
+      ]);
+    }
+
+    const clusters = new Map<string, ChartSignalCluster>();
+
+    for (const [date, markers] of markersByDate.entries()) {
+      clusters.set(date, summarizeCluster(date, markers, minConfidence));
+    }
+
+    return clusters;
+  }, [chartSignalMarkers, minConfidence]);
+
+  const totalActionableMarkers = useMemo(
+    () =>
+      chartSignalMarkers.filter((marker) =>
+        isActionableMarker(marker, minConfidence),
+      ).length,
+    [chartSignalMarkers, minConfidence],
+  );
 
   const chartWidth = 720;
   const chartHeight = 260;
@@ -453,6 +616,67 @@ export function TickerChartPanel({
                 />
               )}
 
+              {points.map((point, index) => {
+                const cluster = markerClusterByDate.get(point.date);
+
+                if (!cluster) return null;
+
+                const marker = cluster.primaryMarker;
+                const x = xForIndex(index);
+                const y = yForValue(point.close);
+                const actionable = cluster.actionableCount > 0;
+                const radius = actionable ? 9 : 7;
+
+                return (
+                  <g
+                    key={`${cluster.date}-${cluster.markers.length}`}
+                    onPointerEnter={() => setHoveredCluster(cluster)}
+                    onPointerLeave={() => setHoveredCluster(null)}
+                    className="cursor-pointer"
+                  >
+                    <circle
+                      cx={x}
+                      cy={y}
+                      r={radius}
+                      strokeWidth={actionable ? 3 : 2}
+                      strokeDasharray={actionable ? undefined : "3 3"}
+                      className={`${markerClass(marker.action)} ${markerStrokeClass(
+                        marker.action,
+                      )}`}
+                    />
+                    <text
+                      x={x}
+                      y={y + 3.5}
+                      textAnchor="middle"
+                      className="fill-slate-950 text-[9px] font-black pointer-events-none"
+                    >
+                      {cluster.buyCount > 0 && cluster.sellCount > 0
+                        ? "M"
+                        : markerLabel(marker.action)}
+                    </text>
+                    {cluster.markers.length > 1 && (
+                      <>
+                        <circle
+                          cx={x + 10}
+                          cy={y - 10}
+                          r="7"
+                          className="fill-slate-950 stroke-slate-600"
+                          strokeWidth="1"
+                        />
+                        <text
+                          x={x + 10}
+                          y={y - 6.5}
+                          textAnchor="middle"
+                          className="fill-slate-200 text-[8px] font-black pointer-events-none"
+                        >
+                          {cluster.markers.length}
+                        </text>
+                      </>
+                    )}
+                  </g>
+                );
+              })}
+
               {hoverIndex !== null && points[hoverIndex] && (
                 <>
                   <line
@@ -476,6 +700,89 @@ export function TickerChartPanel({
           )}
         </div>
       )}
+
+      <div className="mt-3 rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+        <div className="flex items-center justify-between gap-3 text-[10px]">
+          <div className="text-slate-500 font-black uppercase">
+            Journal markers
+          </div>
+          <div className="text-slate-300 font-mono">
+            {chartSignalMarkers.length} BUY/SELL · {totalActionableMarkers}{" "}
+            actionable
+          </div>
+        </div>
+
+        {hoveredCluster ? (
+          <div className="mt-2 space-y-2 text-[10px]">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-slate-400">{hoveredCluster.date}</span>
+              <span className="text-slate-500">
+                {hoveredCluster.markers.length} signal
+                {hoveredCluster.markers.length === 1 ? "" : "s"}
+              </span>
+              <span className="text-emerald-300">
+                {hoveredCluster.actionableCount} actionable
+              </span>
+              <span className="text-slate-500">
+                {hoveredCluster.skippedCount} skipped
+              </span>
+            </div>
+
+            <div className="space-y-1.5">
+              {hoveredCluster.markers.map((marker) => {
+                const actionable = isActionableMarker(marker, minConfidence);
+
+                return (
+                  <div
+                    key={marker.id}
+                    className={`rounded-lg border p-2 ${
+                      actionable
+                        ? "border-emerald-500/30 bg-emerald-500/10"
+                        : "border-slate-800 bg-slate-900/70"
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span
+                        className={`px-2 py-0.5 rounded-full border font-black ${actionPillClass(
+                          marker.action,
+                        )}`}
+                      >
+                        {marker.action}
+                      </span>
+                      <span className={confidenceClass(marker.confidence)}>
+                        conf {marker.confidence}
+                      </span>
+                      <span className="text-slate-400">
+                        {marker.suggestedShares} shares
+                        {marker.originalSuggestedShares
+                          ? ` / original ${marker.originalSuggestedShares}`
+                          : ""}
+                      </span>
+                      <span
+                        className={
+                          actionable ? "text-emerald-300" : "text-slate-500"
+                        }
+                      >
+                        {actionable ? "actionable" : "skipped"}
+                      </span>
+                    </div>
+                    {marker.skippedReason && (
+                      <div className="mt-1 text-slate-500">
+                        skipped: {marker.skippedReason}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : (
+          <div className="mt-2 text-[10px] text-slate-500">
+            Hover over B/S markers to inspect clustered Autopilot decisions from
+            journal. Dashed markers are skipped / non-actionable signals.
+          </div>
+        )}
+      </div>
 
       <div className="grid grid-cols-2 md:grid-cols-5 gap-2 mt-3 text-[10px]">
         <div className="rounded-lg bg-slate-950/60 border border-slate-800 p-2">

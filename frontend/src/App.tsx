@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AutopilotControlCenter } from "./components/AutopilotControlCenter";
 import { AutopilotLogs } from "./components/AutopilotLogs";
 import { ChatTerminal } from "./components/ChatTerminal";
@@ -113,13 +113,13 @@ export default function App() {
       decision.confidence >= autopilotStatus.minConfidence,
   );
 
-  function addAutopilotLog(message: string) {
+  const addAutopilotLog = useCallback((message: string) => {
     setAutopilotLogs((prev) =>
       [`[${new Date().toLocaleTimeString()}] ${message}`, ...prev].slice(0, 80),
     );
-  }
+  }, []);
 
-  function applyDashboardData(data: DashboardResponse) {
+  const applyDashboardData = useCallback((data: DashboardResponse) => {
     if (data.tradeMode) setTradeMode(data.tradeMode);
     if (data.portfolio) setPortfolio(data.portfolio);
     if (data.orders) setOrders(data.orders);
@@ -133,9 +133,9 @@ export default function App() {
       }));
     }
     setLastDashboardUpdate(new Date().toLocaleTimeString());
-  }
+  }, []);
 
-  async function refreshDashboard() {
+  const refreshDashboard = useCallback(async () => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/dashboard`, {
         cache: "no-store",
@@ -149,9 +149,9 @@ export default function App() {
       setConnectionStatus("error");
       console.warn("Dashboard refresh failed:", error);
     }
-  }
+  }, [applyDashboardData]);
 
-  async function refreshAutopilotStatus() {
+  const refreshAutopilotStatus = useCallback(async () => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/autopilot/status`, {
         cache: "no-store",
@@ -163,9 +163,9 @@ export default function App() {
     } catch (error) {
       console.warn("Autopilot status refresh failed:", error);
     }
-  }
+  }, []);
 
-  async function refreshAutopilotJournal() {
+  const refreshAutopilotJournal = useCallback(async () => {
     setIsLoadingJournal(true);
     try {
       const [journalResponse, summaryResponse] = await Promise.all([
@@ -193,7 +193,7 @@ export default function App() {
     } finally {
       setIsLoadingJournal(false);
     }
-  }
+  }, [addAutopilotLog]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -302,7 +302,12 @@ export default function App() {
       window.clearInterval(journalTimer);
       eventSource.close();
     };
-  }, []);
+  }, [
+    addAutopilotLog,
+    refreshAutopilotJournal,
+    refreshAutopilotStatus,
+    refreshDashboard,
+  ]);
 
   async function handleAutopilotToggle() {
     const targetState = !autopilotStatus.enabled;
@@ -884,6 +889,8 @@ export default function App() {
             watchlist={watchlist}
             positions={portfolio.positions}
             latestDecisions={latestDecisions}
+            journalRuns={journalRuns}
+            minConfidence={autopilotStatus.minConfidence}
           />
         </section>
 
