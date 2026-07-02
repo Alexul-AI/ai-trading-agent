@@ -13,6 +13,11 @@ import {
   summarizeAutopilotRuns,
 } from "./decisionJournal.js";
 import {
+  buildHealthReport,
+  getSafeErrorMessage,
+  type ServiceHealth,
+} from "./envHealth.js";
+import {
   calculateBollingerBands,
   calculateMACD,
   calculateRSI,
@@ -79,6 +84,17 @@ interface MarketChartResponse {
   days: number;
   feed: string;
   points: MarketChartPoint[];
+}
+
+interface DashboardHealthWarning {
+  service: string;
+  status: ServiceHealth["status"];
+  message: string;
+}
+
+interface DashboardHealthSummary {
+  ok: boolean;
+  warnings: DashboardHealthWarning[];
 }
 
 type AlpacaConstructor = new (config: {
@@ -547,22 +563,85 @@ function buildMarketChartPoints(bars: AlpacaBar[]): MarketChartPoint[] {
     };
   });
 }
+function toHealthWarning(
+  service: ServiceHealth,
+): DashboardHealthWarning | null {
+  if (service.status === "ok") return null;
+
+  return {
+    service: service.name,
+    status: service.status,
+    message: service.message,
+  };
+}
+
+async function buildDashboardHealthSummary(): Promise<DashboardHealthSummary> {
+  const report = await buildHealthReport({
+    checkAlpacaConnectivity: false,
+    checkOpenAIConnectivity: false,
+  });
+
+  const warnings = report.services
+    .map(toHealthWarning)
+    .filter((warning): warning is DashboardHealthWarning => warning !== null);
+
+  return {
+    ok: warnings.length === 0,
+    warnings,
+  };
+}
+
+async function safeCall<T>(
+  label: string,
+  operation: () => Promise<T>,
+  fallback: T,
+  warnings: DashboardHealthWarning[],
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    warnings.push({
+      service: label,
+      status: "error",
+      message: getSafeErrorMessage(error),
+    });
+
+    return fallback;
+  }
+}
 
 async function getDashboardSnapshot() {
-  const portfolio = await getPortfolioSnapshot();
-  const orders = await getOrdersSnapshot();
+  const health = await buildDashboardHealthSummary();
+  const warnings = [...health.warnings];
 
-  const tickers = Array.from(
-    new Set([
-      ...defaultWatchlist,
-      ...Object.keys(portfolio.positions),
-      ...orders.map((order) => order.ticker),
-    ]),
+  const portfolio = await safeCall(
+    "alpaca_portfolio",
+    getPortfolioSnapshot,
+    {
+      balance: 0,
+      equity: 0,
+      currency: "USD",
+      positions: {},
+    },
+    warnings,
+  );
+
+  const orders = await safeCall(
+    "alpaca_orders",
+    getOrdersSnapshot,
+    [],
+    warnings,
+  );
+
+  const watchlistTickers = Array.from(
+    new Set([...defaultWatchlist, ...Object.keys(portfolio.positions)]),
   ).filter(Boolean);
 
-  const watchlist = await getWatchlistQuotesFromAlpaca(
-    tickers,
-    portfolio.positions,
+  const watchlist = await safeCall(
+    "alpaca_watchlist",
+    () => getWatchlistQuotesFromAlpaca(watchlistTickers, portfolio.positions),
+    [],
+    warnings,
   );
 
   return {
@@ -572,6 +651,10 @@ async function getDashboardSnapshot() {
     portfolio,
     orders,
     watchlist,
+    health: {
+      ok: warnings.length === 0,
+      warnings,
+    },
   };
 }
 
@@ -834,6 +917,29 @@ app.get("/api/stream", (req, res) => {
   });
 });
 
+app.get("/api/health", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  try {
+    const deep =
+      String(req.query.deep ?? "false").toLowerCase() === "true" ||
+      String(req.query.deep ?? "0") === "1";
+
+    const report = await buildHealthReport({
+      checkAlpacaConnectivity: deep,
+      checkOpenAIConnectivity: false,
+    });
+
+    res.status(report.ok ? 200 : 503).json(report);
+  } catch (error) {
+    console.error("[API] /api/health failed:", error);
+    res.status(500).json({
+      ok: false,
+      error: getSafeErrorMessage(error),
+    });
+  }
+});
+
 app.get("/api/dashboard", async (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
 
@@ -841,7 +947,30 @@ app.get("/api/dashboard", async (_req, res) => {
     res.json(await getDashboardSnapshot());
   } catch (error) {
     console.error("[API] /api/dashboard failed:", error);
-    res.status(500).json({ error: "Failed to fetch dashboard data" });
+
+    res.status(200).json({
+      tradeMode: ENV.TRADE_MODE,
+      autopilotEnabled: autopilotWorker.getStatus().enabled,
+      autopilot: autopilotWorker.getStatus(),
+      portfolio: {
+        balance: 0,
+        equity: 0,
+        currency: "USD",
+        positions: {},
+      },
+      orders: [],
+      watchlist: [],
+      health: {
+        ok: false,
+        warnings: [
+          {
+            service: "dashboard",
+            status: "error",
+            message: getSafeErrorMessage(error),
+          },
+        ],
+      },
+    });
   }
 });
 

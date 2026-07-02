@@ -13,6 +13,7 @@ import type {
   AutopilotToggleResponse,
   ChatMessage,
   ChatResponse,
+  DashboardHealthSummary,
   DashboardResponse,
   JournalResponse,
   JournalRun,
@@ -80,6 +81,8 @@ export default function App() {
   const [connectionStatus, setConnectionStatus] = useState<
     "connecting" | "connected" | "error"
   >("connecting");
+  const [dashboardHealth, setDashboardHealth] =
+    useState<DashboardHealthSummary | null>(null);
   const [isRunningAutopilot, setIsRunningAutopilot] = useState(false);
   const [lastDashboardUpdate, setLastDashboardUpdate] = useState<string | null>(
     null,
@@ -122,6 +125,7 @@ export default function App() {
   }, []);
 
   const applyDashboardData = useCallback((data: DashboardResponse) => {
+    if (data.health) setDashboardHealth(data.health);
     if (data.tradeMode) setTradeMode(data.tradeMode);
     if (data.portfolio) setPortfolio(data.portfolio);
     if (data.orders) setOrders(data.orders);
@@ -223,7 +227,8 @@ export default function App() {
         const data = JSON.parse(event.data) as SseEvent;
 
         if (data.type === "connected") {
-          if (data.tradeMode) setTradeMode(data.tradeMode);
+          if (data.health) setDashboardHealth(data.health);
+    if (data.tradeMode) setTradeMode(data.tradeMode);
           if (data.autopilot) setAutopilotStatus(data.autopilot);
           addAutopilotLog("SSE connected.");
           return;
@@ -555,7 +560,24 @@ export default function App() {
         </div>
       </header>
 
-      <main className="flex-1 grid grid-cols-1 xl:grid-cols-12 p-6 gap-6">
+            {dashboardHealth && dashboardHealth.warnings.length > 0 && (
+        <div className="mx-6 mb-6 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4">
+          <div className="text-sm font-black text-amber-200">
+            Dashboard health warning
+          </div>
+          <div className="mt-2 space-y-1 text-xs text-amber-100">
+            {dashboardHealth.warnings.map((warning) => (
+              <div key={`${warning.service}-${warning.message}`}>
+                <span className="font-black uppercase">{warning.service}</span>
+                {": "}
+                {warning.message}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+<main className="flex-1 grid grid-cols-1 xl:grid-cols-12 p-6 gap-6">
         <section className="xl:col-span-3 flex flex-col gap-6">
           <div className="bg-slate-900/60 rounded-2xl border border-slate-800 p-4 flex flex-col min-h-[320px]">
             <div className="flex items-center justify-between mb-3">

@@ -127,6 +127,7 @@ export interface DashboardResponse {
   portfolio?: Portfolio;
   orders?: Order[];
   watchlist?: WatchlistItem[];
+  health?: DashboardHealthSummary;
 }
 
 export interface AutopilotRunResponse {
@@ -186,4 +187,16 @@ export interface MarketChartResponse {
   days: number;
   feed: string;
   points: MarketChartPoint[];
+}
+
+
+export interface DashboardHealthWarning {
+  service: string;
+  status: "ok" | "missing" | "warning" | "error";
+  message: string;
+}
+
+export interface DashboardHealthSummary {
+  ok: boolean;
+  warnings: DashboardHealthWarning[];
 }
