@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { promises as fs } from "fs";
 import path from "path";
 
@@ -30,6 +31,15 @@ export interface JournalRun {
   enabled: boolean;
   tickers: string[];
   actionableCount: number;
+
+  /**
+   * Strategy metadata enables clean comparisons after algorithm changes.
+   * Old journal rows will not have these fields and should be treated as legacy.
+   */
+  strategyVersion?: string;
+  strategyConfigHash?: string;
+  strategyConfig?: Record<string, unknown>;
+
   decisions: JournalDecision[];
 }
 
@@ -47,6 +57,30 @@ export interface JournalSummary {
 const DATA_DIR = path.resolve(process.cwd(), "data");
 const JOURNAL_FILE = path.join(DATA_DIR, "autopilot-decisions.jsonl");
 
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+
+  const objectValue = value as Record<string, unknown>;
+  const keys = Object.keys(objectValue).sort();
+
+  return `{${keys
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(objectValue[key])}`)
+    .join(",")}}`;
+}
+
+export function createStrategyConfigHash(config: unknown): string {
+  return createHash("sha256")
+    .update(stableStringify(config))
+    .digest("hex")
+    .slice(0, 12);
+}
+
 async function ensureDataDir() {
   await fs.mkdir(DATA_DIR, { recursive: true });
 }
@@ -60,16 +94,19 @@ export async function appendAutopilotRun(
 ): Promise<JournalRun> {
   await ensureDataDir();
 
+  const strategyConfigHash =
+    run.strategyConfigHash ??
+    (run.strategyConfig
+      ? createStrategyConfigHash(run.strategyConfig)
+      : undefined);
+
   const runWithId: JournalRun = {
     ...run,
     id: createRunId(run.timestamp),
+    strategyConfigHash,
   };
 
-  await fs.appendFile(
-    JOURNAL_FILE,
-    `${JSON.stringify(runWithId)}\n`,
-    "utf-8",
-  );
+  await fs.appendFile(JOURNAL_FILE, `${JSON.stringify(runWithId)}\n`, "utf-8");
 
   return runWithId;
 }
@@ -102,7 +139,9 @@ export async function readAutopilotRuns(limit = 50): Promise<JournalRun[]> {
   }
 }
 
-export async function summarizeAutopilotRuns(limit = 200): Promise<JournalSummary> {
+export async function summarizeAutopilotRuns(
+  limit = 200,
+): Promise<JournalSummary> {
   const runs = await readAutopilotRuns(limit);
   const chronologicalRuns = [...runs].reverse();
 

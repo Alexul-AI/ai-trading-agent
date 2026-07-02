@@ -7,6 +7,7 @@ interface StrategyQualityPanelProps {
 }
 
 type QualityWindow = "LAST_RUN" | "LAST_5" | "LAST_10" | "ALL";
+type StrategyFilter = "LATEST" | "ALL" | string;
 
 type PrimaryOutcome =
   | "ACTIONABLE"
@@ -213,7 +214,8 @@ function calculateStats(
   return {
     totalRuns: journalRuns.length,
     totalDecisions: decisions.length,
-    buySignals: decisions.filter((decision) => decision.action === "BUY").length,
+    buySignals: decisions.filter((decision) => decision.action === "BUY")
+      .length,
     sellSignals: decisions.filter((decision) => decision.action === "SELL")
       .length,
     holdSignals: decisions.filter((decision) => decision.action === "HOLD")
@@ -450,13 +452,83 @@ function getWindowLabel(window: QualityWindow): string {
   return "All";
 }
 
+function getRunStrategyVersion(run: JournalRun): string {
+  return run.strategyVersion ?? "legacy";
+}
+
+function getStrategyFilterLabel(
+  filter: StrategyFilter,
+  latestVersion: string | null,
+): string {
+  if (filter === "ALL") return "All strategies";
+  if (filter === "LATEST")
+    return latestVersion ? `Latest: ${latestVersion}` : "Latest";
+  return filter;
+}
+
+function getUniqueStrategyVersions(journalRuns: JournalRun[]): string[] {
+  return Array.from(new Set(journalRuns.map(getRunStrategyVersion))).sort();
+}
+
+function filterRunsByStrategy(
+  journalRuns: JournalRun[],
+  filter: StrategyFilter,
+  latestVersion: string | null,
+): JournalRun[] {
+  if (filter === "ALL") return journalRuns;
+
+  const versionToUse = filter === "LATEST" ? latestVersion : filter;
+
+  if (!versionToUse) return journalRuns;
+
+  return journalRuns.filter(
+    (run) => getRunStrategyVersion(run) === versionToUse,
+  );
+}
+
+function formatCoverageDuration(journalRuns: JournalRun[]): string {
+  if (journalRuns.length === 0) return "No runs";
+  if (journalRuns.length === 1) return "Single run";
+
+  const latest = new Date(journalRuns[0]?.timestamp ?? "").getTime();
+  const oldest = new Date(
+    journalRuns[journalRuns.length - 1]?.timestamp ?? "",
+  ).getTime();
+
+  if (!Number.isFinite(latest) || !Number.isFinite(oldest)) {
+    return "Coverage unavailable";
+  }
+
+  const diffMs = Math.abs(latest - oldest);
+  const diffMinutes = Math.round(diffMs / 60000);
+
+  if (diffMinutes < 1) return "Covers <1 minute";
+  if (diffMinutes < 60)
+    return `Covers ${diffMinutes} minute${diffMinutes === 1 ? "" : "s"}`;
+
+  const diffHours = Math.round(diffMinutes / 60);
+
+  if (diffHours < 48)
+    return `Covers ${diffHours} hour${diffHours === 1 ? "" : "s"}`;
+
+  const diffDays = Math.round(diffHours / 24);
+  return `Covers ${diffDays} day${diffDays === 1 ? "" : "s"}`;
+}
+
+function getRequestedWindowCount(window: QualityWindow): number | null {
+  if (window === "LAST_RUN") return 1;
+  if (window === "LAST_5") return 5;
+  if (window === "LAST_10") return 10;
+  return null;
+}
+
 function filterRunsByWindow(
   journalRuns: JournalRun[],
   window: QualityWindow,
 ): JournalRun[] {
   if (window === "ALL") return journalRuns;
 
-  const count = window === "LAST_RUN" ? 1 : window === "LAST_5" ? 5 : 10;
+  const count = getRequestedWindowCount(window) ?? journalRuns.length;
 
   return journalRuns.slice(0, count);
 }
@@ -465,13 +537,40 @@ export function StrategyQualityPanel({
   journalRuns,
   minConfidence,
 }: StrategyQualityPanelProps) {
-  const [qualityWindow, setQualityWindow] =
-    useState<QualityWindow>("LAST_10");
+  const [qualityWindow, setQualityWindow] = useState<QualityWindow>("LAST_10");
+  const [strategyFilter, setStrategyFilter] =
+    useState<StrategyFilter>("LATEST");
+
+  const latestStrategyVersion = journalRuns[0]
+    ? getRunStrategyVersion(journalRuns[0])
+    : null;
+
+  const strategyVersions = useMemo(
+    () => getUniqueStrategyVersions(journalRuns),
+    [journalRuns],
+  );
+
+  const strategyFilteredRuns = useMemo(
+    () =>
+      filterRunsByStrategy(journalRuns, strategyFilter, latestStrategyVersion),
+    [journalRuns, latestStrategyVersion, strategyFilter],
+  );
 
   const filteredJournalRuns = useMemo(
-    () => filterRunsByWindow(journalRuns, qualityWindow),
-    [journalRuns, qualityWindow],
+    () => filterRunsByWindow(strategyFilteredRuns, qualityWindow),
+    [qualityWindow, strategyFilteredRuns],
   );
+
+  const coverageLabel = useMemo(
+    () => formatCoverageDuration(filteredJournalRuns),
+    [filteredJournalRuns],
+  );
+
+  const requestedWindowCount = getRequestedWindowCount(qualityWindow);
+  const isWindowUndersupplied =
+    requestedWindowCount !== null &&
+    strategyFilteredRuns.length > 0 &&
+    strategyFilteredRuns.length < requestedWindowCount;
 
   const stats = calculateStats(filteredJournalRuns, minConfidence);
   const tickerStats = calculateTickerStats(filteredJournalRuns, minConfidence);
@@ -485,15 +584,16 @@ export function StrategyQualityPanel({
   );
   const waterfallMatchesTotal = stats.waterfallTotal === stats.buySellTotal;
   const isHoldOnlyWindow =
-    stats.totalDecisions > 0 && stats.buySellTotal === 0 && stats.holdSignals > 0;
+    stats.totalDecisions > 0 &&
+    stats.buySellTotal === 0 &&
+    stats.holdSignals > 0;
 
-  const verdict =
-    isHoldOnlyWindow
-      ? "Latest analysis window is HOLD-only: the strategy filtered out weak BUY/SELL setups."
-      : stats.buySellTotal === 0
-        ? "No BUY/SELL signal history yet."
-        : stats.actionableSignals === 0
-          ? "Strategy is still observational: signals exist, but none are actionable."
+  const verdict = isHoldOnlyWindow
+    ? "Latest analysis window is HOLD-only: the strategy filtered out weak BUY/SELL setups."
+    : stats.buySellTotal === 0
+      ? "No BUY/SELL signal history yet."
+      : stats.actionableSignals === 0
+        ? "Strategy is still observational: signals exist, but none are actionable."
         : actionableRatio < 20
           ? "Strategy is conservative: most signals are filtered before execution."
           : "Strategy is producing actionable candidates. Review them carefully before execution.";
@@ -521,20 +621,56 @@ export function StrategyQualityPanel({
       </div>
 
       <div className="mb-4 rounded-xl border border-slate-800 bg-slate-950/40 p-2">
-        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-          <div>
-            <div className="text-[10px] text-slate-400 font-black uppercase">
-              Analysis window
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div>
+              <div className="text-[10px] text-slate-400 font-black uppercase">
+                Strategy filter
+              </div>
+              <div className="text-[9px] text-slate-500">
+                {getStrategyFilterLabel(strategyFilter, latestStrategyVersion)}
+                {latestStrategyVersion && (
+                  <>
+                    {" "}
+                    · latest version:{" "}
+                    <span className="text-blue-300">
+                      {latestStrategyVersion}
+                    </span>
+                  </>
+                )}
+              </div>
             </div>
-            <div className="text-[9px] text-slate-500">
-              Showing {getWindowLabel(qualityWindow)} · {stats.totalRuns} of{" "}
-              {journalRuns.length} journal runs
-            </div>
+
+            <select
+              value={strategyFilter}
+              onChange={(event) => setStrategyFilter(event.target.value)}
+              className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-slate-600"
+            >
+              <option value="LATEST">Latest strategy</option>
+              <option value="ALL">All strategies</option>
+              {strategyVersions.map((version) => (
+                <option key={version} value={version}>
+                  {version}
+                </option>
+              ))}
+            </select>
           </div>
 
-          <div className="grid grid-cols-4 gap-1">
-            {(["LAST_RUN", "LAST_5", "LAST_10", "ALL"] as QualityWindow[]).map(
-              (window) => (
+          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div>
+              <div className="text-[10px] text-slate-400 font-black uppercase">
+                Analysis window
+              </div>
+              <div className="text-[9px] text-slate-500">
+                Showing {getWindowLabel(qualityWindow)} · {stats.totalRuns} of{" "}
+                {strategyFilteredRuns.length} filtered runs
+              </div>
+            </div>
+
+            <div className="grid grid-cols-4 gap-1">
+              {(
+                ["LAST_RUN", "LAST_5", "LAST_10", "ALL"] as QualityWindow[]
+              ).map((window) => (
                 <button
                   key={window}
                   onClick={() => setQualityWindow(window)}
@@ -546,11 +682,49 @@ export function StrategyQualityPanel({
                 >
                   {getWindowLabel(window)}
                 </button>
-              ),
-            )}
+              ))}
+            </div>
           </div>
         </div>
       </div>
+
+      <div className="mb-4 grid grid-cols-1 gap-2 md:grid-cols-3">
+        <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+          <div className="text-[9px] text-slate-500 font-black uppercase">
+            Coverage
+          </div>
+          <div className="text-xs font-black text-blue-300">
+            {coverageLabel}
+          </div>
+        </div>
+
+        <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+          <div className="text-[9px] text-slate-500 font-black uppercase">
+            Filtered runs
+          </div>
+          <div className="text-xs font-black text-slate-200">
+            {stats.totalRuns} / {strategyFilteredRuns.length}
+          </div>
+        </div>
+
+        <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+          <div className="text-[9px] text-slate-500 font-black uppercase">
+            Strategy
+          </div>
+          <div className="truncate text-xs font-black text-emerald-300">
+            {getStrategyFilterLabel(strategyFilter, latestStrategyVersion)}
+          </div>
+        </div>
+      </div>
+
+      {isWindowUndersupplied && (
+        <div className="mb-4 rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-[10px] text-amber-200">
+          You selected {getWindowLabel(qualityWindow)}, but this strategy filter
+          currently has only {strategyFilteredRuns.length} run
+          {strategyFilteredRuns.length === 1 ? "" : "s"}. Run Autopilot more
+          times to build a larger comparison window.
+        </div>
+      )}
 
       {isHoldOnlyWindow && (
         <div className="mb-4 rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-3">
@@ -559,8 +733,8 @@ export function StrategyQualityPanel({
           </div>
           <div className="mt-1 text-xs leading-relaxed text-emerald-100">
             This window has {stats.holdSignals} HOLD decisions and no BUY/SELL
-            candidates. That usually means the confluence filter is doing its job:
-            weak setups are watched, not traded.
+            candidates. That usually means the confluence filter is doing its
+            job: weak setups are watched, not traded.
           </div>
         </div>
       )}
@@ -582,11 +756,15 @@ export function StrategyQualityPanel({
         <StatCard
           label="Blocked"
           value={stats.buySellTotal - stats.actionableSignals}
-          tone={stats.buySellTotal > stats.actionableSignals ? "warn" : "neutral"}
+          tone={
+            stats.buySellTotal > stats.actionableSignals ? "warn" : "neutral"
+          }
         />
         <StatCard
           label="Avg conf"
-          value={stats.buySellTotal > 0 ? stats.averageConfidence.toFixed(2) : "N/A"}
+          value={
+            stats.buySellTotal > 0 ? stats.averageConfidence.toFixed(2) : "N/A"
+          }
           tone="info"
         />
       </div>
@@ -612,8 +790,8 @@ export function StrategyQualityPanel({
 
         {stats.buySellTotal === 0 ? (
           <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-xs text-slate-400">
-            No BUY/SELL candidates in this window. The waterfall is empty because
-            every ticker ended as HOLD.
+            No BUY/SELL candidates in this window. The waterfall is empty
+            because every ticker ended as HOLD.
           </div>
         ) : (
           <div className="space-y-3">
@@ -662,8 +840,8 @@ export function StrategyQualityPanel({
 
         {stats.buySellTotal === 0 ? (
           <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-xs text-slate-400">
-            No safety modifier flags in this window because there were no BUY/SELL
-            candidates.
+            No safety modifier flags in this window because there were no
+            BUY/SELL candidates.
           </div>
         ) : (
           <div className="space-y-2">
@@ -719,13 +897,16 @@ export function StrategyQualityPanel({
                         {ticker.ticker}
                       </div>
                       <div className="mt-1 text-[10px] text-slate-500">
-                        BUY {ticker.buy} · SELL {ticker.sell} · HOLD {ticker.hold}
+                        BUY {ticker.buy} · SELL {ticker.sell} · HOLD{" "}
+                        {ticker.hold}
                       </div>
                     </div>
 
                     <div className="text-right">
                       <div className="text-xs font-black text-blue-300">
-                        {ticker.buySellTotal > 0 ? ticker.averageConfidence.toFixed(2) : "N/A"}
+                        {ticker.buySellTotal > 0
+                          ? ticker.averageConfidence.toFixed(2)
+                          : "N/A"}
                       </div>
                       <div className="text-[9px] text-slate-500 uppercase">
                         avg conf
@@ -786,7 +967,8 @@ export function StrategyQualityPanel({
 
                   {ticker.buySellTotal === 0 && ticker.hold > 0 && (
                     <div className="mt-2 text-[10px] text-emerald-300">
-                      HOLD-only in this window. No BUY/SELL candidate was emitted.
+                      HOLD-only in this window. No BUY/SELL candidate was
+                      emitted.
                     </div>
                   )}
 
@@ -843,12 +1025,14 @@ export function StrategyQualityPanel({
         />
       </div>
 
-      {qualityWindow !== "ALL" && journalRuns.length > filteredJournalRuns.length && (
-        <div className="mb-4 rounded-xl border border-blue-500/20 bg-blue-500/10 p-3 text-[10px] text-blue-200">
-          Older journal runs are hidden in this view. Use ALL only when you want
-          long-term history, not quick validation after a strategy change.
-        </div>
-      )}
+      {qualityWindow !== "ALL" &&
+        strategyFilteredRuns.length > filteredJournalRuns.length && (
+          <div className="mb-4 rounded-xl border border-blue-500/20 bg-blue-500/10 p-3 text-[10px] text-blue-200">
+            Older journal runs for this strategy filter are hidden in this view.
+            Use ALL only when you want long-term history, not quick validation
+            after a strategy change.
+          </div>
+        )}
 
       <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-xs text-slate-300 leading-relaxed">
         <span className="font-black text-slate-200">Verdict: </span>

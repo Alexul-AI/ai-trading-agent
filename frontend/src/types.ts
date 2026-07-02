@@ -74,6 +74,7 @@ export interface AutopilotStatus {
   allowBuy: boolean;
   allowSell: boolean;
   tradeMode: TradeMode;
+  strategyVersion?: string;
   running: boolean;
   intervalMs: number;
   tickers: string[];
@@ -95,6 +96,9 @@ export interface JournalRun {
   enabled: boolean;
   tickers: string[];
   actionableCount: number;
+  strategyVersion?: string;
+  strategyConfigHash?: string;
+  strategyConfig?: Record<string, unknown>;
   decisions: AutopilotDecision[];
 }
 

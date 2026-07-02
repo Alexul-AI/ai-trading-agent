@@ -90,6 +90,7 @@ export interface AutopilotStatus {
   allowBuy: boolean;
   allowSell: boolean;
   tradeMode: "paper" | "live";
+  strategyVersion: string;
   running: boolean;
   intervalMs: number;
   tickers: string[];
@@ -157,6 +158,9 @@ const AUTOPILOT_BLOCK_SELL_BELOW_AVG =
 
 const AUTOPILOT_ENABLED_DEFAULT =
   process.env.AUTOPILOT_ENABLED_DEFAULT === "true";
+
+const STRATEGY_VERSION =
+  process.env.STRATEGY_VERSION ?? "v1.2-confluence-scoring";
 
 function toIsoDate(date: Date): string {
   return date.toISOString().split("T")[0] ?? date.toISOString();
@@ -649,6 +653,11 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           enabled,
           tickers,
           actionableCount: actionable.length,
+          strategyVersion: STRATEGY_VERSION,
+          strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<
+            string,
+            unknown
+          >,
           decisions,
         });
 
@@ -739,6 +748,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       allowBuy: AUTOPILOT_ALLOW_BUY,
       allowSell: AUTOPILOT_ALLOW_SELL,
       tradeMode: options.tradeMode,
+      strategyVersion: STRATEGY_VERSION,
       running,
       intervalMs: AUTOPILOT_INTERVAL_MS,
       tickers: AUTOPILOT_TICKERS,
