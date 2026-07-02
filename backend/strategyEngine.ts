@@ -19,6 +19,21 @@ export interface StrategyConfig {
   sellRsiWithoutMomentumThreshold: number;
   lowerBandBuffer: number;
   upperBandBuffer: number;
+
+  /**
+   * Confluence scoring:
+   * A single weak condition should not produce noisy BUY/SELL signals.
+   * Require several aligned conditions before emitting BUY_SIGNAL/SELL_SIGNAL.
+   */
+  minBuySignalScore: number;
+  minSellSignalScore: number;
+  strongSignalScore: number;
+
+  /**
+   * Normal SELL_SIGNAL should usually be profit-taking / risk reduction.
+   * STOP_LOSS is handled separately before this rule.
+   */
+  downgradeNormalSellBelowAverageEntry: boolean;
 }
 
 export interface StrategyInput {
@@ -45,8 +60,17 @@ export interface StrategyDecision {
   reason: string;
   diagnostics: {
     macdRising: boolean;
+    macdFalling: boolean;
     nearLowerBand: boolean;
     nearUpperBand: boolean;
+    deepOversold: boolean;
+    momentumBuy: boolean;
+    overbought: boolean;
+    momentumSell: boolean;
+    buyScore: number;
+    sellScore: number;
+    buyReasons: string[];
+    sellReasons: string[];
     positionReturnPercent: number;
     currentPositionValue: number;
     remainingPositionCapacity: number;
@@ -68,6 +92,15 @@ export const DEFAULT_STRATEGY_CONFIG: StrategyConfig = {
   sellRsiWithoutMomentumThreshold: 55,
   lowerBandBuffer: 1.01,
   upperBandBuffer: 0.99,
+
+  // Step 15: reduce weak repeated signals.
+  // NVDA-style "RSI < 46 + MACD rising" alone should become HOLD/watch.
+  // AMD-style "RSI > 55 + MACD falling" alone should become HOLD/watch.
+  minBuySignalScore: 2,
+  minSellSignalScore: 2,
+  strongSignalScore: 3,
+
+  downgradeNormalSellBelowAverageEntry: true,
 };
 
 function mergeConfig(config?: Partial<StrategyConfig>): StrategyConfig {
@@ -85,6 +118,12 @@ function clampConfidence(value: number): number {
   return Math.max(0, Math.min(1, Number(value.toFixed(2))));
 }
 
+function confidenceFromScore(score: number, strongSignalScore: number): number {
+  if (score >= strongSignalScore + 1) return 0.9;
+  if (score >= strongSignalScore) return 0.8;
+  return 0.72;
+}
+
 function buildHoldDecision(
   reason: string,
   diagnostics: StrategyDecision["diagnostics"],
@@ -99,10 +138,28 @@ function buildHoldDecision(
   };
 }
 
+function scoreSignal(
+  conditions: Array<{ active: boolean; points: number; label: string }>,
+): { score: number; reasons: string[] } {
+  return conditions.reduce(
+    (acc, condition) => {
+      if (!condition.active) return acc;
+
+      return {
+        score: acc.score + condition.points,
+        reasons: [...acc.reasons, condition.label],
+      };
+    },
+    { score: 0, reasons: [] as string[] },
+  );
+}
+
 export function decideTradeSignal(input: StrategyInput): StrategyDecision {
   const config = mergeConfig(input.config);
 
   const macdRising = input.macdHistogram > input.previousMacdHistogram;
+  const macdFalling = input.macdHistogram < input.previousMacdHistogram;
+
   const nearLowerBand =
     input.bollingerLower > 0 &&
     input.price <= input.bollingerLower * config.lowerBandBuffer;
@@ -130,10 +187,67 @@ export function decideTradeSignal(input: StrategyInput): StrategyDecision {
       ? (input.price - input.averageEntryPrice) / input.averageEntryPrice
       : 0;
 
+  const deepOversold = input.rsi < config.buyRsiThreshold;
+  const momentumBuy =
+    input.rsi < config.buyRsiWithMomentumThreshold && macdRising;
+  const overbought = input.rsi > config.sellRsiThreshold;
+  const momentumSell =
+    input.rsi > config.sellRsiWithoutMomentumThreshold && macdFalling;
+
+  const buySignal = scoreSignal([
+    {
+      active: deepOversold,
+      points: 2,
+      label: `deepOversold(RSI ${input.rsi} < ${config.buyRsiThreshold})`,
+    },
+    {
+      active: nearLowerBand,
+      points: 2,
+      label: "nearLowerBollingerBand",
+    },
+    {
+      active: momentumBuy,
+      points: 1,
+      label: "momentumBuy(RSI below momentum threshold + MACD rising)",
+    },
+  ]);
+
+  const sellSignal = scoreSignal([
+    {
+      active: overbought,
+      points: 2,
+      label: `overbought(RSI ${input.rsi} > ${config.sellRsiThreshold})`,
+    },
+    {
+      active: nearUpperBand,
+      points: 2,
+      label: "nearUpperBollingerBand",
+    },
+    {
+      active: momentumSell,
+      points: 1,
+      label: "momentumSell(RSI above weak sell threshold + MACD falling)",
+    },
+    {
+      active: positionReturn > 0.03,
+      points: 1,
+      label: `positionProfitable(${formatPercent(positionReturn * 100)})`,
+    },
+  ]);
+
   const diagnostics: StrategyDecision["diagnostics"] = {
     macdRising,
+    macdFalling,
     nearLowerBand,
     nearUpperBand,
+    deepOversold,
+    momentumBuy,
+    overbought,
+    momentumSell,
+    buyScore: buySignal.score,
+    sellScore: sellSignal.score,
+    buyReasons: buySignal.reasons,
+    sellReasons: sellSignal.reasons,
     positionReturnPercent: positionReturn * 100,
     currentPositionValue,
     remainingPositionCapacity,
@@ -170,21 +284,37 @@ export function decideTradeSignal(input: StrategyInput): StrategyDecision {
     }
   }
 
-  if (
-    input.sharesOwned > 0 &&
-    (input.rsi > config.sellRsiThreshold ||
-      nearUpperBand ||
-      (input.rsi > config.sellRsiWithoutMomentumThreshold && !macdRising))
-  ) {
-    const confidence =
-      input.rsi > config.sellRsiThreshold || nearUpperBand ? 0.8 : 0.6;
+  if (input.sharesOwned > 0 && sellSignal.score >= config.minSellSignalScore) {
+    if (
+      config.downgradeNormalSellBelowAverageEntry &&
+      input.averageEntryPrice > 0 &&
+      positionReturn < 0
+    ) {
+      return buildHoldDecision(
+        `Normal SELL downgraded to HOLD for ${input.ticker}: price is below average entry, positionReturn=${formatPercent(
+          positionReturn * 100,
+        )}, sellScore=${sellSignal.score}, sellReasons=${sellSignal.reasons.join(
+          ", ",
+        )}`,
+        diagnostics,
+      );
+    }
+
+    const confidence = confidenceFromScore(
+      sellSignal.score,
+      config.strongSignalScore,
+    );
 
     return {
       action: "SELL",
       suggestedShares: input.sharesOwned,
       confidence: clampConfidence(confidence),
       reasonType: "SELL_SIGNAL",
-      reason: `Sell signal for ${input.ticker}: RSI=${input.rsi}, nearUpperBand=${nearUpperBand}, macdRising=${macdRising}`,
+      reason: `Sell signal for ${input.ticker}: sellScore=${sellSignal.score}, sellReasons=${sellSignal.reasons.join(
+        ", ",
+      )}, RSI=${input.rsi}, nearUpperBand=${nearUpperBand}, macdFalling=${macdFalling}, positionReturn=${formatPercent(
+        positionReturn * 100,
+      )}`,
       diagnostics,
     };
   }
@@ -203,24 +333,26 @@ export function decideTradeSignal(input: StrategyInput): StrategyDecision {
     );
   }
 
-  const deepOversold = input.rsi < config.buyRsiThreshold;
-  const momentumBuy = input.rsi < config.buyRsiWithMomentumThreshold && macdRising;
-
-  if (deepOversold || nearLowerBand || momentumBuy) {
-    const confidence = deepOversold || nearLowerBand ? 0.75 : 0.55;
+  if (buySignal.score >= config.minBuySignalScore) {
+    const confidence = confidenceFromScore(
+      buySignal.score,
+      config.strongSignalScore,
+    );
 
     return {
       action: "BUY",
       suggestedShares: maxSharesToBuy,
       confidence: clampConfidence(confidence),
       reasonType: "BUY_SIGNAL",
-      reason: `Buy signal for ${input.ticker}: RSI=${input.rsi}, nearLowerBand=${nearLowerBand}, macdRising=${macdRising}`,
+      reason: `Buy signal for ${input.ticker}: buyScore=${buySignal.score}, buyReasons=${buySignal.reasons.join(
+        ", ",
+      )}, RSI=${input.rsi}, nearLowerBand=${nearLowerBand}, macdRising=${macdRising}`,
       diagnostics,
     };
   }
 
   return buildHoldDecision(
-    `No clear signal for ${input.ticker}: RSI=${input.rsi}, nearLowerBand=${nearLowerBand}, nearUpperBand=${nearUpperBand}, macdRising=${macdRising}`,
+    `No confluence signal for ${input.ticker}: buyScore=${buySignal.score}/${config.minBuySignalScore}, sellScore=${sellSignal.score}/${config.minSellSignalScore}, RSI=${input.rsi}, nearLowerBand=${nearLowerBand}, nearUpperBand=${nearUpperBand}, macdRising=${macdRising}, macdFalling=${macdFalling}`,
     diagnostics,
   );
 }
