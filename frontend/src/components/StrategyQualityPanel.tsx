@@ -1,4 +1,4 @@
-import type { JournalRun } from "../types";
+import type { AutopilotDecision, JournalRun } from "../types";
 
 interface StrategyQualityPanelProps {
   journalRuns: JournalRun[];
@@ -34,6 +34,24 @@ interface StrategyQualityStats {
   executedSignals: number;
   averageConfidence: number;
   waterfallTotal: number;
+}
+
+interface TickerQualityStats {
+  ticker: string;
+  total: number;
+  buy: number;
+  sell: number;
+  hold: number;
+  buySellTotal: number;
+  actionable: number;
+  blockedByConfidence: number;
+  blockedByPositionGuard: number;
+  blockedByExecutionPolicy: number;
+  otherBlocked: number;
+  safetyCapReduced: number;
+  averageConfidence: number;
+  lastDecision: AutopilotDecision | null;
+  lastRunAt: string | null;
 }
 
 function isBuySellSignal(action: string): boolean {
@@ -192,7 +210,8 @@ function calculateStats(
   return {
     totalRuns: journalRuns.length,
     totalDecisions: decisions.length,
-    buySignals: decisions.filter((decision) => decision.action === "BUY").length,
+    buySignals: decisions.filter((decision) => decision.action === "BUY")
+      .length,
     sellSignals: decisions.filter((decision) => decision.action === "SELL")
       .length,
     holdSignals: decisions.filter((decision) => decision.action === "HOLD")
@@ -223,6 +242,90 @@ function calculateStats(
       blockedByExecutionPolicy +
       otherBlocked,
   };
+}
+
+function calculateTickerStats(
+  journalRuns: JournalRun[],
+  minConfidence: number,
+): TickerQualityStats[] {
+  const byTicker = new Map<
+    string,
+    Array<{ decision: AutopilotDecision; runTimestamp: string }>
+  >();
+
+  for (const run of journalRuns) {
+    for (const decision of run.decisions) {
+      byTicker.set(decision.ticker, [
+        ...(byTicker.get(decision.ticker) ?? []),
+        {
+          decision,
+          runTimestamp: run.timestamp,
+        },
+      ]);
+    }
+  }
+
+  return Array.from(byTicker.entries())
+    .map(([ticker, entries]) => {
+      const decisions = entries.map((entry) => entry.decision);
+      const buySellDecisions = decisions.filter((decision) =>
+        isBuySellSignal(decision.action),
+      );
+      const outcomes = buySellDecisions.map((decision) =>
+        classifyPrimaryOutcome(decision, minConfidence),
+      );
+      const confidenceValues = buySellDecisions.map(
+        (decision) => decision.confidence,
+      );
+      const averageConfidence =
+        confidenceValues.length === 0
+          ? 0
+          : confidenceValues.reduce((sum, value) => sum + value, 0) /
+            confidenceValues.length;
+
+      const sortedEntries = [...entries].sort(
+        (a, b) =>
+          new Date(b.runTimestamp).getTime() -
+          new Date(a.runTimestamp).getTime(),
+      );
+
+      return {
+        ticker,
+        total: decisions.length,
+        buy: decisions.filter((decision) => decision.action === "BUY").length,
+        sell: decisions.filter((decision) => decision.action === "SELL").length,
+        hold: decisions.filter((decision) => decision.action === "HOLD").length,
+        buySellTotal: buySellDecisions.length,
+        actionable: outcomes.filter((outcome) => outcome === "ACTIONABLE")
+          .length,
+        blockedByConfidence: outcomes.filter(
+          (outcome) => outcome === "CONFIDENCE",
+        ).length,
+        blockedByPositionGuard: outcomes.filter(
+          (outcome) => outcome === "POSITION_GUARD",
+        ).length,
+        blockedByExecutionPolicy: outcomes.filter(
+          (outcome) => outcome === "EXECUTION_POLICY",
+        ).length,
+        otherBlocked: outcomes.filter((outcome) => outcome === "OTHER_BLOCKED")
+          .length,
+        safetyCapReduced: buySellDecisions.filter(hasSafetyCapReduced).length,
+        averageConfidence,
+        lastDecision: sortedEntries[0]?.decision ?? null,
+        lastRunAt: sortedEntries[0]?.runTimestamp ?? null,
+      };
+    })
+    .sort((a, b) => {
+      if (b.buySellTotal !== a.buySellTotal) {
+        return b.buySellTotal - a.buySellTotal;
+      }
+
+      if (b.total !== a.total) {
+        return b.total - a.total;
+      }
+
+      return a.ticker.localeCompare(b.ticker);
+    });
 }
 
 function qualityRatio(numerator: number, denominator: number): number {
@@ -320,11 +423,30 @@ function FlagRow({
   );
 }
 
+function actionTone(action: string): string {
+  if (action === "BUY") return "text-emerald-300";
+  if (action === "SELL") return "text-rose-300";
+  return "text-slate-400";
+}
+
+function formatLastRun(value: string | null): string {
+  if (!value) return "—";
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return date.toLocaleTimeString();
+}
+
 export function StrategyQualityPanel({
   journalRuns,
   minConfidence,
 }: StrategyQualityPanelProps) {
   const stats = calculateStats(journalRuns, minConfidence);
+  const tickerStats = calculateTickerStats(journalRuns, minConfidence);
   const actionableRatio = qualityRatio(
     stats.actionableSignals,
     stats.buySellTotal,
@@ -383,7 +505,9 @@ export function StrategyQualityPanel({
         <StatCard
           label="Blocked"
           value={stats.buySellTotal - stats.actionableSignals}
-          tone={stats.buySellTotal > stats.actionableSignals ? "warn" : "neutral"}
+          tone={
+            stats.buySellTotal > stats.actionableSignals ? "warn" : "neutral"
+          }
         />
         <StatCard
           label="Avg conf"
@@ -470,6 +594,144 @@ export function StrategyQualityPanel({
             value={stats.executionPolicyFlags}
             total={stats.buySellTotal}
           />
+        </div>
+      </div>
+
+      <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3 mb-4">
+        <div className="mb-3">
+          <div className="text-[10px] text-slate-400 font-black uppercase">
+            Per-ticker breakdown
+          </div>
+          <div className="text-[9px] text-slate-500">
+            Which tickers produce BUY/SELL signals and why they are blocked.
+          </div>
+        </div>
+
+        <div className="space-y-2 max-h-[360px] overflow-y-auto pr-1">
+          {tickerStats.length === 0 ? (
+            <div className="text-center text-slate-600 py-6 text-xs">
+              No ticker history yet.
+            </div>
+          ) : (
+            tickerStats.map((ticker) => {
+              const actionablePercent = qualityRatio(
+                ticker.actionable,
+                ticker.buySellTotal,
+              );
+
+              return (
+                <div
+                  key={ticker.ticker}
+                  className="rounded-xl border border-slate-800 bg-slate-950/50 p-3"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-black text-white">
+                        {ticker.ticker}
+                      </div>
+                      <div className="mt-1 text-[10px] text-slate-500">
+                        BUY {ticker.buy} · SELL {ticker.sell} · HOLD{" "}
+                        {ticker.hold}
+                      </div>
+                    </div>
+
+                    <div className="text-right">
+                      <div className="text-xs font-black text-blue-300">
+                        {ticker.averageConfidence.toFixed(2)}
+                      </div>
+                      <div className="text-[9px] text-slate-500 uppercase">
+                        avg conf
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-4 gap-2 mt-3 text-[10px]">
+                    <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-2">
+                      <div className="text-slate-500 font-black uppercase">
+                        Signals
+                      </div>
+                      <div className="font-mono text-slate-300">
+                        {ticker.buySellTotal}
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-2">
+                      <div className="text-slate-500 font-black uppercase">
+                        Action
+                      </div>
+                      <div className="font-mono text-emerald-300">
+                        {ticker.actionable}
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-2">
+                      <div className="text-slate-500 font-black uppercase">
+                        Conf
+                      </div>
+                      <div className="font-mono text-amber-300">
+                        {ticker.blockedByConfidence}
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-2">
+                      <div className="text-slate-500 font-black uppercase">
+                        Guard
+                      </div>
+                      <div className="font-mono text-rose-300">
+                        {ticker.blockedByPositionGuard}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-3">
+                    <div className="flex items-center justify-between text-[10px] mb-1">
+                      <span className="text-slate-500">Actionable ratio</span>
+                      <span className="text-slate-500 font-mono">
+                        {ticker.actionable} / {ticker.buySellTotal} ·{" "}
+                        {actionablePercent}%
+                      </span>
+                    </div>
+                    <div className="h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                      <div
+                        className="h-full rounded-full bg-emerald-400"
+                        style={{ width: `${actionablePercent}%` }}
+                      />
+                    </div>
+                  </div>
+
+                  {ticker.safetyCapReduced > 0 && (
+                    <div className="mt-2 text-[10px] text-amber-300">
+                      Safety cap reduced {ticker.safetyCapReduced} signal
+                      {ticker.safetyCapReduced === 1 ? "" : "s"}.
+                    </div>
+                  )}
+
+                  {ticker.lastDecision && (
+                    <div className="mt-2 rounded-lg border border-slate-800 bg-slate-900/70 p-2 text-[10px]">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-slate-500">
+                          Last:{" "}
+                          <span
+                            className={`font-black ${actionTone(
+                              ticker.lastDecision.action,
+                            )}`}
+                          >
+                            {ticker.lastDecision.action}
+                          </span>{" "}
+                          conf {ticker.lastDecision.confidence}
+                        </span>
+                        <span className="text-slate-600">
+                          {formatLastRun(ticker.lastRunAt)}
+                        </span>
+                      </div>
+                      {ticker.lastDecision.skippedReason && (
+                        <div className="mt-1 text-slate-500">
+                          {ticker.lastDecision.skippedReason}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
         </div>
       </div>
 
