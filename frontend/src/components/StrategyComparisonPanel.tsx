@@ -1,3 +1,4 @@
+import { useMemo, useState } from "react";
 import type { JournalRun } from "../types";
 
 interface StrategyComparisonPanelProps {
@@ -25,6 +26,9 @@ interface StrategyVariantStats {
   lastRunAt: string;
 }
 
+const WINNER_MIN_RUNS = 10;
+const LOW_RUN_THRESHOLD = 5;
+
 function versionOf(run: JournalRun): string {
   return run.strategyVersion ?? "legacy";
 }
@@ -43,6 +47,16 @@ function formatPercent(numerator: number, denominator: number): string {
   return `${Math.round((numerator / denominator) * 100)}%`;
 }
 
+function ratio(numerator: number, denominator: number): number {
+  if (denominator <= 0) return -1;
+  return numerator / denominator;
+}
+
+function avgConfidenceValue(stats: StrategyVariantStats): number {
+  if (stats.confidenceCount <= 0) return -1;
+  return stats.confidenceSum / stats.confidenceCount;
+}
+
 function formatConfidence(value: number, count: number): string {
   if (count <= 0) return "N/A";
   return (value / count).toFixed(2);
@@ -50,12 +64,11 @@ function formatConfidence(value: number, count: number): string {
 
 function formatTime(value: string): string {
   const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString();
+}
 
-  if (Number.isNaN(date.getTime())) {
-    return value;
-  }
-
-  return date.toLocaleTimeString();
+function isLegacy(stats: StrategyVariantStats): boolean {
+  return stats.version === "legacy" || stats.hash === "no-hash";
 }
 
 function isActionableDecision(
@@ -149,9 +162,31 @@ function buildStats(
       new Date(b.lastRunAt).getTime() - new Date(a.lastRunAt).getTime();
 
     if (lastRunDiff !== 0) return lastRunDiff;
-
     return b.runs - a.runs;
   });
+}
+
+function chooseWinner(
+  stats: StrategyVariantStats[],
+): StrategyVariantStats | null {
+  const eligible = stats.filter(
+    (variant) => variant.runs >= WINNER_MIN_RUNS && variant.buySell > 0,
+  );
+
+  if (eligible.length === 0) return null;
+
+  return [...eligible].sort((a, b) => {
+    const actionableDiff =
+      ratio(b.actionable, b.buySell) - ratio(a.actionable, a.buySell);
+
+    if (actionableDiff !== 0) return actionableDiff;
+
+    const confidenceDiff = avgConfidenceValue(b) - avgConfidenceValue(a);
+
+    if (confidenceDiff !== 0) return confidenceDiff;
+
+    return b.runs - a.runs;
+  })[0];
 }
 
 function StatPill({
@@ -182,12 +217,66 @@ function StatPill({
   );
 }
 
+function FilterToggle({
+  checked,
+  onChange,
+  label,
+}: {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  label: string;
+}) {
+  return (
+    <label className="flex cursor-pointer items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/50 px-3 py-2 text-xs text-slate-300 hover:border-slate-700">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+        className="h-3 w-3 accent-blue-500"
+      />
+      <span>{label}</span>
+    </label>
+  );
+}
+
+function WinnerSummary({ winner }: { winner: StrategyVariantStats | null }) {
+  if (!winner) {
+    return (
+      <div className="mb-4 rounded-xl border border-slate-800 bg-slate-950/40 p-3 text-xs text-slate-400">
+        🏆 No winner yet. A variant needs at least {WINNER_MIN_RUNS} runs and at
+        least one BUY/SELL candidate to be ranked.
+      </div>
+    );
+  }
+
+  return (
+    <div className="mb-4 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3">
+      <div className="text-xs font-black text-amber-200">
+        🏆 Current winner: {winner.version}
+      </div>
+      <div className="mt-1 text-[10px] text-amber-100">
+        hash {shortHash(winner.hash)} · actionable ratio{" "}
+        <span className="font-black">
+          {formatPercent(winner.actionable, winner.buySell)}
+        </span>{" "}
+        · avg confidence{" "}
+        <span className="font-black">
+          {formatConfidence(winner.confidenceSum, winner.confidenceCount)}
+        </span>{" "}
+        · runs <span className="font-black">{winner.runs}</span>
+      </div>
+    </div>
+  );
+}
+
 function VariantRow({
   stats,
   isLive,
+  isWinner,
 }: {
   stats: StrategyVariantStats;
   isLive: boolean;
+  isWinner: boolean;
 }) {
   const holdRatio = formatPercent(stats.hold, stats.decisions);
   const actionableRatio = formatPercent(stats.actionable, stats.buySell);
@@ -199,20 +288,28 @@ function VariantRow({
   return (
     <div
       className={`rounded-2xl border p-3 ${
-        isLive
-          ? "border-emerald-500/30 bg-emerald-500/10"
-          : "border-slate-800 bg-slate-950/40"
+        isWinner
+          ? "border-amber-500/40 bg-amber-500/10"
+          : isLive
+            ? "border-emerald-500/30 bg-emerald-500/10"
+            : "border-slate-800 bg-slate-950/40"
       }`}
     >
       <div className="mb-3 flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <div className="truncate text-sm font-black text-slate-200">
+              {isWinner ? "🏆 " : ""}
               {stats.version}
             </div>
             {isLive && (
               <div className="rounded-full bg-emerald-500/20 px-2 py-0.5 text-[8px] font-black uppercase text-emerald-200">
                 live
+              </div>
+            )}
+            {isWinner && (
+              <div className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[8px] font-black uppercase text-amber-200">
+                winner
               </div>
             )}
           </div>
@@ -255,7 +352,26 @@ export function StrategyComparisonPanel({
   liveStrategyVersion,
   liveStrategyConfigHash,
 }: StrategyComparisonPanelProps) {
-  const stats = buildStats(journalRuns, minConfidence);
+  const [hideLegacy, setHideLegacy] = useState(false);
+  const [hideLowRunVariants, setHideLowRunVariants] = useState(false);
+
+  const allStats = useMemo(
+    () => buildStats(journalRuns, minConfidence),
+    [journalRuns, minConfidence],
+  );
+
+  const visibleStats = useMemo(
+    () =>
+      allStats.filter((variant) => {
+        if (hideLegacy && isLegacy(variant)) return false;
+        if (hideLowRunVariants && variant.runs < LOW_RUN_THRESHOLD)
+          return false;
+        return true;
+      }),
+    [allStats, hideLegacy, hideLowRunVariants],
+  );
+
+  const winner = useMemo(() => chooseWinner(visibleStats), [visibleStats]);
 
   if (journalRuns.length === 0) {
     return (
@@ -292,23 +408,47 @@ export function StrategyComparisonPanel({
           <div className="text-[9px] font-black uppercase text-slate-500">
             Variants
           </div>
-          <div className="text-xs font-black text-blue-300">{stats.length}</div>
+          <div className="text-xs font-black text-blue-300">
+            {visibleStats.length} / {allStats.length}
+          </div>
         </div>
       </div>
 
-      {stats.length === 1 && (
+      <div className="mb-4 flex flex-wrap gap-2">
+        <FilterToggle
+          checked={hideLegacy}
+          onChange={setHideLegacy}
+          label="Hide legacy"
+        />
+        <FilterToggle
+          checked={hideLowRunVariants}
+          onChange={setHideLowRunVariants}
+          label={`Hide variants with < ${LOW_RUN_THRESHOLD} runs`}
+        />
+      </div>
+
+      <WinnerSummary winner={winner} />
+
+      {allStats.length === 1 && (
         <div className="mb-4 rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">
           Only one strategy/config variant exists in the journal. Change config
           or run another strategy version to compare.
         </div>
       )}
 
+      {visibleStats.length === 0 && (
+        <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3 text-xs text-slate-400">
+          No variants match the current filters.
+        </div>
+      )}
+
       <div className="space-y-3">
-        {stats.map((variant) => (
+        {visibleStats.map((variant) => (
           <VariantRow
             key={variant.key}
             stats={variant}
             isLive={liveKey === variant.key}
+            isWinner={winner?.key === variant.key}
           />
         ))}
       </div>
