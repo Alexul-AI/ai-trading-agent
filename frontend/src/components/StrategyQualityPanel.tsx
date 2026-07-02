@@ -1,9 +1,12 @@
+import { useMemo, useState } from "react";
 import type { AutopilotDecision, JournalRun } from "../types";
 
 interface StrategyQualityPanelProps {
   journalRuns: JournalRun[];
   minConfidence: number;
 }
+
+type QualityWindow = "LAST_RUN" | "LAST_5" | "LAST_10" | "ALL";
 
 type PrimaryOutcome =
   | "ACTIONABLE"
@@ -210,8 +213,7 @@ function calculateStats(
   return {
     totalRuns: journalRuns.length,
     totalDecisions: decisions.length,
-    buySignals: decisions.filter((decision) => decision.action === "BUY")
-      .length,
+    buySignals: decisions.filter((decision) => decision.action === "BUY").length,
     sellSignals: decisions.filter((decision) => decision.action === "SELL")
       .length,
     holdSignals: decisions.filter((decision) => decision.action === "HOLD")
@@ -441,12 +443,38 @@ function formatLastRun(value: string | null): string {
   return date.toLocaleTimeString();
 }
 
+function getWindowLabel(window: QualityWindow): string {
+  if (window === "LAST_RUN") return "Last run";
+  if (window === "LAST_5") return "Last 5";
+  if (window === "LAST_10") return "Last 10";
+  return "All";
+}
+
+function filterRunsByWindow(
+  journalRuns: JournalRun[],
+  window: QualityWindow,
+): JournalRun[] {
+  if (window === "ALL") return journalRuns;
+
+  const count = window === "LAST_RUN" ? 1 : window === "LAST_5" ? 5 : 10;
+
+  return journalRuns.slice(0, count);
+}
+
 export function StrategyQualityPanel({
   journalRuns,
   minConfidence,
 }: StrategyQualityPanelProps) {
-  const stats = calculateStats(journalRuns, minConfidence);
-  const tickerStats = calculateTickerStats(journalRuns, minConfidence);
+  const [qualityWindow, setQualityWindow] =
+    useState<QualityWindow>("LAST_10");
+
+  const filteredJournalRuns = useMemo(
+    () => filterRunsByWindow(journalRuns, qualityWindow),
+    [journalRuns, qualityWindow],
+  );
+
+  const stats = calculateStats(filteredJournalRuns, minConfidence);
+  const tickerStats = calculateTickerStats(filteredJournalRuns, minConfidence);
   const actionableRatio = qualityRatio(
     stats.actionableSignals,
     stats.buySellTotal,
@@ -456,12 +484,16 @@ export function StrategyQualityPanel({
     stats.buySellTotal,
   );
   const waterfallMatchesTotal = stats.waterfallTotal === stats.buySellTotal;
+  const isHoldOnlyWindow =
+    stats.totalDecisions > 0 && stats.buySellTotal === 0 && stats.holdSignals > 0;
 
   const verdict =
-    stats.buySellTotal === 0
-      ? "No BUY/SELL signal history yet."
-      : stats.actionableSignals === 0
-        ? "Strategy is still observational: signals exist, but none are actionable."
+    isHoldOnlyWindow
+      ? "Latest analysis window is HOLD-only: the strategy filtered out weak BUY/SELL setups."
+      : stats.buySellTotal === 0
+        ? "No BUY/SELL signal history yet."
+        : stats.actionableSignals === 0
+          ? "Strategy is still observational: signals exist, but none are actionable."
         : actionableRatio < 20
           ? "Strategy is conservative: most signals are filtered before execution."
           : "Strategy is producing actionable candidates. Review them carefully before execution.";
@@ -488,6 +520,51 @@ export function StrategyQualityPanel({
         </div>
       </div>
 
+      <div className="mb-4 rounded-xl border border-slate-800 bg-slate-950/40 p-2">
+        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+          <div>
+            <div className="text-[10px] text-slate-400 font-black uppercase">
+              Analysis window
+            </div>
+            <div className="text-[9px] text-slate-500">
+              Showing {getWindowLabel(qualityWindow)} · {stats.totalRuns} of{" "}
+              {journalRuns.length} journal runs
+            </div>
+          </div>
+
+          <div className="grid grid-cols-4 gap-1">
+            {(["LAST_RUN", "LAST_5", "LAST_10", "ALL"] as QualityWindow[]).map(
+              (window) => (
+                <button
+                  key={window}
+                  onClick={() => setQualityWindow(window)}
+                  className={`rounded-lg px-2 py-1 text-[10px] font-black transition-colors ${
+                    qualityWindow === window
+                      ? "bg-blue-600 text-white"
+                      : "bg-slate-900 text-slate-400 hover:bg-slate-800"
+                  }`}
+                >
+                  {getWindowLabel(window)}
+                </button>
+              ),
+            )}
+          </div>
+        </div>
+      </div>
+
+      {isHoldOnlyWindow && (
+        <div className="mb-4 rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-3">
+          <div className="text-[10px] font-black uppercase text-emerald-300">
+            HOLD-only window
+          </div>
+          <div className="mt-1 text-xs leading-relaxed text-emerald-100">
+            This window has {stats.holdSignals} HOLD decisions and no BUY/SELL
+            candidates. That usually means the confluence filter is doing its job:
+            weak setups are watched, not traded.
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-4 gap-2 mb-4">
         <StatCard label="Runs" value={stats.totalRuns} />
         <StatCard label="BUY" value={stats.buySignals} tone="good" />
@@ -505,13 +582,11 @@ export function StrategyQualityPanel({
         <StatCard
           label="Blocked"
           value={stats.buySellTotal - stats.actionableSignals}
-          tone={
-            stats.buySellTotal > stats.actionableSignals ? "warn" : "neutral"
-          }
+          tone={stats.buySellTotal > stats.actionableSignals ? "warn" : "neutral"}
         />
         <StatCard
           label="Avg conf"
-          value={stats.averageConfidence.toFixed(2)}
+          value={stats.buySellTotal > 0 ? stats.averageConfidence.toFixed(2) : "N/A"}
           tone="info"
         />
       </div>
@@ -535,37 +610,44 @@ export function StrategyQualityPanel({
           </div>
         </div>
 
-        <div className="space-y-3">
-          <BarRow
-            label="Actionable"
-            value={stats.actionableSignals}
-            total={stats.buySellTotal}
-            tone="good"
-          />
-          <BarRow
-            label="Blocked by confidence"
-            value={stats.blockedByConfidence}
-            total={stats.buySellTotal}
-            tone="warn"
-          />
-          <BarRow
-            label="Blocked by position guard"
-            value={stats.blockedByPositionGuard}
-            total={stats.buySellTotal}
-            tone="bad"
-          />
-          <BarRow
-            label="Blocked by execution policy"
-            value={stats.blockedByExecutionPolicy}
-            total={stats.buySellTotal}
-            tone="info"
-          />
-          <BarRow
-            label="Other blocked"
-            value={stats.otherBlocked}
-            total={stats.buySellTotal}
-          />
-        </div>
+        {stats.buySellTotal === 0 ? (
+          <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-xs text-slate-400">
+            No BUY/SELL candidates in this window. The waterfall is empty because
+            every ticker ended as HOLD.
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <BarRow
+              label="Actionable"
+              value={stats.actionableSignals}
+              total={stats.buySellTotal}
+              tone="good"
+            />
+            <BarRow
+              label="Blocked by confidence"
+              value={stats.blockedByConfidence}
+              total={stats.buySellTotal}
+              tone="warn"
+            />
+            <BarRow
+              label="Blocked by position guard"
+              value={stats.blockedByPositionGuard}
+              total={stats.buySellTotal}
+              tone="bad"
+            />
+            <BarRow
+              label="Blocked by execution policy"
+              value={stats.blockedByExecutionPolicy}
+              total={stats.buySellTotal}
+              tone="info"
+            />
+            <BarRow
+              label="Other blocked"
+              value={stats.otherBlocked}
+              total={stats.buySellTotal}
+            />
+          </div>
+        )}
       </div>
 
       <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3 mb-4">
@@ -578,23 +660,30 @@ export function StrategyQualityPanel({
           </div>
         </div>
 
-        <div className="space-y-2">
-          <FlagRow
-            label="Reduced by safety cap"
-            value={stats.safetyCapReduced}
-            total={stats.buySellTotal}
-          />
-          <FlagRow
-            label="Has position guard note"
-            value={stats.positionGuardFlags}
-            total={stats.buySellTotal}
-          />
-          <FlagRow
-            label="Dry-run / execution policy flag"
-            value={stats.executionPolicyFlags}
-            total={stats.buySellTotal}
-          />
-        </div>
+        {stats.buySellTotal === 0 ? (
+          <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-xs text-slate-400">
+            No safety modifier flags in this window because there were no BUY/SELL
+            candidates.
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <FlagRow
+              label="Reduced by safety cap"
+              value={stats.safetyCapReduced}
+              total={stats.buySellTotal}
+            />
+            <FlagRow
+              label="Has position guard note"
+              value={stats.positionGuardFlags}
+              total={stats.buySellTotal}
+            />
+            <FlagRow
+              label="Dry-run / execution policy flag"
+              value={stats.executionPolicyFlags}
+              total={stats.buySellTotal}
+            />
+          </div>
+        )}
       </div>
 
       <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3 mb-4">
@@ -630,14 +719,13 @@ export function StrategyQualityPanel({
                         {ticker.ticker}
                       </div>
                       <div className="mt-1 text-[10px] text-slate-500">
-                        BUY {ticker.buy} · SELL {ticker.sell} · HOLD{" "}
-                        {ticker.hold}
+                        BUY {ticker.buy} · SELL {ticker.sell} · HOLD {ticker.hold}
                       </div>
                     </div>
 
                     <div className="text-right">
                       <div className="text-xs font-black text-blue-300">
-                        {ticker.averageConfidence.toFixed(2)}
+                        {ticker.buySellTotal > 0 ? ticker.averageConfidence.toFixed(2) : "N/A"}
                       </div>
                       <div className="text-[9px] text-slate-500 uppercase">
                         avg conf
@@ -696,6 +784,12 @@ export function StrategyQualityPanel({
                     </div>
                   </div>
 
+                  {ticker.buySellTotal === 0 && ticker.hold > 0 && (
+                    <div className="mt-2 text-[10px] text-emerald-300">
+                      HOLD-only in this window. No BUY/SELL candidate was emitted.
+                    </div>
+                  )}
+
                   {ticker.safetyCapReduced > 0 && (
                     <div className="mt-2 text-[10px] text-amber-300">
                       Safety cap reduced {ticker.safetyCapReduced} signal
@@ -748,6 +842,13 @@ export function StrategyQualityPanel({
           tone={stats.executedSignals > 0 ? "bad" : "neutral"}
         />
       </div>
+
+      {qualityWindow !== "ALL" && journalRuns.length > filteredJournalRuns.length && (
+        <div className="mb-4 rounded-xl border border-blue-500/20 bg-blue-500/10 p-3 text-[10px] text-blue-200">
+          Older journal runs are hidden in this view. Use ALL only when you want
+          long-term history, not quick validation after a strategy change.
+        </div>
+      )}
 
       <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-xs text-slate-300 leading-relaxed">
         <span className="font-black text-slate-200">Verdict: </span>
