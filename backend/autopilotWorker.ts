@@ -8,7 +8,10 @@ import {
   decideTradeSignal,
   type StrategyDecision,
 } from "./strategyEngine.js";
-import { appendAutopilotRun } from "./decisionJournal.js";
+import {
+  appendAutopilotRun,
+  createStrategyConfigHash,
+} from "./decisionJournal.js";
 
 interface AlpacaBar {
   t: string;
@@ -91,6 +94,8 @@ export interface AutopilotStatus {
   allowSell: boolean;
   tradeMode: "paper" | "live";
   strategyVersion: string;
+  strategyConfigHash: string;
+  strategyConfig: Record<string, unknown>;
   running: boolean;
   intervalMs: number;
   tickers: string[];
@@ -161,6 +166,8 @@ const AUTOPILOT_ENABLED_DEFAULT =
 
 const STRATEGY_VERSION =
   process.env.STRATEGY_VERSION ?? "v1.2-confluence-scoring";
+
+const STRATEGY_CONFIG_HASH = createStrategyConfigHash(DEFAULT_STRATEGY_CONFIG);
 
 function toIsoDate(date: Date): string {
   return date.toISOString().split("T")[0] ?? date.toISOString();
@@ -490,18 +497,12 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
 
     const stopLoss =
       decision.action === "BUY"
-        ? Number(
-            (price * (1 - DEFAULT_STRATEGY_CONFIG.stopLossPercent)).toFixed(2),
-          )
+        ? Number((price * (1 - DEFAULT_STRATEGY_CONFIG.stopLossPercent)).toFixed(2))
         : undefined;
 
     const takeProfit =
       decision.action === "BUY"
-        ? Number(
-            (price * (1 + DEFAULT_STRATEGY_CONFIG.takeProfitPercent)).toFixed(
-              2,
-            ),
-          )
+        ? Number((price * (1 + DEFAULT_STRATEGY_CONFIG.takeProfitPercent)).toFixed(2))
         : undefined;
 
     const result = await options.executeSafeTrade(
@@ -654,10 +655,8 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           tickers,
           actionableCount: actionable.length,
           strategyVersion: STRATEGY_VERSION,
-          strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<
-            string,
-            unknown
-          >,
+          strategyConfigHash: STRATEGY_CONFIG_HASH,
+          strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<string, unknown>,
           decisions,
         });
 
@@ -749,6 +748,8 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       allowSell: AUTOPILOT_ALLOW_SELL,
       tradeMode: options.tradeMode,
       strategyVersion: STRATEGY_VERSION,
+      strategyConfigHash: STRATEGY_CONFIG_HASH,
+      strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<string, unknown>,
       running,
       intervalMs: AUTOPILOT_INTERVAL_MS,
       tickers: AUTOPILOT_TICKERS,

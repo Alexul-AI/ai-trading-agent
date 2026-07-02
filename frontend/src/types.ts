@@ -75,6 +75,8 @@ export interface AutopilotStatus {
   allowSell: boolean;
   tradeMode: TradeMode;
   strategyVersion?: string;
+  strategyConfigHash?: string;
+  strategyConfig?: Record<string, unknown>;
   running: boolean;
   intervalMs: number;
   tickers: string[];
@@ -163,6 +165,7 @@ export interface SseEvent {
   actionableCount?: number;
   timestamp?: string;
 }
+
 
 export interface MarketChartPoint {
   date: string;
