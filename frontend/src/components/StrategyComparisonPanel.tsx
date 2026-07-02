@@ -26,6 +26,10 @@ interface StrategyVariantStats {
   lastRunAt: string;
 }
 
+interface WinnerOptions {
+  allowLegacyWinner: boolean;
+}
+
 const WINNER_MIN_RUNS = 10;
 const LOW_RUN_THRESHOLD = 5;
 
@@ -166,11 +170,24 @@ function buildStats(
   });
 }
 
+function isWinnerEligible(
+  stats: StrategyVariantStats,
+  options: WinnerOptions,
+): boolean {
+  if (stats.runs < WINNER_MIN_RUNS) return false;
+  if (stats.buySell <= 0) return false;
+  if (stats.actionable <= 0) return false;
+  if (!options.allowLegacyWinner && isLegacy(stats)) return false;
+
+  return true;
+}
+
 function chooseWinner(
   stats: StrategyVariantStats[],
+  options: WinnerOptions,
 ): StrategyVariantStats | null {
-  const eligible = stats.filter(
-    (variant) => variant.runs >= WINNER_MIN_RUNS && variant.buySell > 0,
+  const eligible = stats.filter((variant) =>
+    isWinnerEligible(variant, options),
   );
 
   if (eligible.length === 0) return null;
@@ -239,12 +256,20 @@ function FilterToggle({
   );
 }
 
-function WinnerSummary({ winner }: { winner: StrategyVariantStats | null }) {
+function WinnerSummary({
+  winner,
+  allowLegacyWinner,
+}: {
+  winner: StrategyVariantStats | null;
+  allowLegacyWinner: boolean;
+}) {
   if (!winner) {
     return (
       <div className="mb-4 rounded-xl border border-slate-800 bg-slate-950/40 p-3 text-xs text-slate-400">
-        🏆 No winner yet. A variant needs at least {WINNER_MIN_RUNS} runs and at
-        least one BUY/SELL candidate to be ranked.
+        🏆 No winner yet. A winner needs at least {WINNER_MIN_RUNS} runs, at
+        least one BUY/SELL candidate, and at least one real actionable signal.
+        {!allowLegacyWinner &&
+          " Legacy is excluded from winner ranking by default."}
       </div>
     );
   }
@@ -259,7 +284,8 @@ function WinnerSummary({ winner }: { winner: StrategyVariantStats | null }) {
         <span className="font-black">
           {formatPercent(winner.actionable, winner.buySell)}
         </span>{" "}
-        · avg confidence{" "}
+        · actionable signals{" "}
+        <span className="font-black">{winner.actionable}</span> · avg confidence{" "}
         <span className="font-black">
           {formatConfidence(winner.confidenceSum, winner.confidenceCount)}
         </span>{" "}
@@ -269,14 +295,56 @@ function WinnerSummary({ winner }: { winner: StrategyVariantStats | null }) {
   );
 }
 
+function EligibilityNote({
+  stats,
+  allowLegacyWinner,
+}: {
+  stats: StrategyVariantStats;
+  allowLegacyWinner: boolean;
+}) {
+  const reasons: string[] = [];
+
+  if (stats.runs < WINNER_MIN_RUNS) {
+    reasons.push(`needs ${WINNER_MIN_RUNS - stats.runs} more runs`);
+  }
+
+  if (stats.buySell <= 0) {
+    reasons.push("needs BUY/SELL candidates");
+  }
+
+  if (stats.actionable <= 0) {
+    reasons.push("needs actionable signal");
+  }
+
+  if (!allowLegacyWinner && isLegacy(stats)) {
+    reasons.push("legacy excluded");
+  }
+
+  if (reasons.length === 0) {
+    return (
+      <div className="mt-2 text-[10px] font-black text-emerald-300">
+        Eligible for winner ranking
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-2 text-[10px] text-slate-500">
+      Not eligible: {reasons.join(" · ")}
+    </div>
+  );
+}
+
 function VariantRow({
   stats,
   isLive,
   isWinner,
+  allowLegacyWinner,
 }: {
   stats: StrategyVariantStats;
   isLive: boolean;
   isWinner: boolean;
+  allowLegacyWinner: boolean;
 }) {
   const holdRatio = formatPercent(stats.hold, stats.decisions);
   const actionableRatio = formatPercent(stats.actionable, stats.buySell);
@@ -316,6 +384,10 @@ function VariantRow({
           <div className="mt-1 font-mono text-[10px] text-slate-500">
             hash: {shortHash(stats.hash)}
           </div>
+          <EligibilityNote
+            stats={stats}
+            allowLegacyWinner={allowLegacyWinner}
+          />
         </div>
 
         <div className="text-right text-[10px] text-slate-500">
@@ -354,6 +426,7 @@ export function StrategyComparisonPanel({
 }: StrategyComparisonPanelProps) {
   const [hideLegacy, setHideLegacy] = useState(false);
   const [hideLowRunVariants, setHideLowRunVariants] = useState(false);
+  const [allowLegacyWinner, setAllowLegacyWinner] = useState(false);
 
   const allStats = useMemo(
     () => buildStats(journalRuns, minConfidence),
@@ -371,7 +444,10 @@ export function StrategyComparisonPanel({
     [allStats, hideLegacy, hideLowRunVariants],
   );
 
-  const winner = useMemo(() => chooseWinner(visibleStats), [visibleStats]);
+  const winner = useMemo(
+    () => chooseWinner(visibleStats, { allowLegacyWinner }),
+    [visibleStats, allowLegacyWinner],
+  );
 
   if (journalRuns.length === 0) {
     return (
@@ -425,9 +501,14 @@ export function StrategyComparisonPanel({
           onChange={setHideLowRunVariants}
           label={`Hide variants with < ${LOW_RUN_THRESHOLD} runs`}
         />
+        <FilterToggle
+          checked={allowLegacyWinner}
+          onChange={setAllowLegacyWinner}
+          label="Allow legacy to win"
+        />
       </div>
 
-      <WinnerSummary winner={winner} />
+      <WinnerSummary winner={winner} allowLegacyWinner={allowLegacyWinner} />
 
       {allStats.length === 1 && (
         <div className="mb-4 rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">
@@ -449,6 +530,7 @@ export function StrategyComparisonPanel({
             stats={variant}
             isLive={liveKey === variant.key}
             isWinner={winner?.key === variant.key}
+            allowLegacyWinner={allowLegacyWinner}
           />
         ))}
       </div>
