@@ -12,6 +12,7 @@ import {
   getStaleThresholdMs,
   isSignalStale,
 } from "../utils/dateTime";
+import { getLatestSignalReadyDecision } from "../utils/signalReadiness";
 
 interface ExecutionReadinessPanelProps {
   autopilotStatus: AutopilotStatus;
@@ -178,70 +179,6 @@ function buildOrderPreviewPlan(
       extended_hours: false,
     },
   };
-}
-
-function isExecutionOnlySkippedReason(
-  skippedReason: string | undefined,
-): boolean {
-  if (!skippedReason) return false;
-
-  const reason = skippedReason.toLowerCase();
-
-  return (
-    reason.includes("dry-run") ||
-    reason.includes("dry run") ||
-    reason.includes("execution blocked") ||
-    reason.includes("allow_autopilot") ||
-    reason.includes("allow_buy") ||
-    reason.includes("allow_sell") ||
-    reason.includes("outside paper mode")
-  );
-}
-
-function isSignalReadyDecision(
-  decision: AutopilotDecision,
-  minConfidence: number,
-): boolean {
-  const legacyDecision = decision as AutopilotDecision & {
-    isActionable?: boolean;
-  };
-
-  if (
-    decision.signalStatus === "ready" ||
-    decision.isSignalReady === true ||
-    legacyDecision.isActionable === true
-  ) {
-    return true;
-  }
-
-  if (
-    decision.signalStatus === "blocked" ||
-    decision.isSignalReady === false ||
-    legacyDecision.isActionable === false
-  ) {
-    return false;
-  }
-
-  return (
-    decision.action !== "HOLD" &&
-    decision.suggestedShares > 0 &&
-    decision.confidence >= minConfidence &&
-    (!decision.skippedReason ||
-      isExecutionOnlySkippedReason(decision.skippedReason))
-  );
-}
-
-function getLatestSignalReadyDecision(
-  decisions: AutopilotDecision[],
-  minConfidence: number,
-): AutopilotDecision | null {
-  const candidates = decisions.filter((decision) =>
-    isSignalReadyDecision(decision, minConfidence),
-  );
-
-  if (candidates.length === 0) return null;
-
-  return [...candidates].sort((a, b) => b.confidence - a.confidence)[0];
 }
 
 function getExecutionPreview(
