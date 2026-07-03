@@ -5,6 +5,10 @@ import type {
   ExecutionBlockReasonCategory,
   JournalRun,
 } from "../types";
+import {
+  isBuySellSignal,
+  isSignalReadyDecision,
+} from "../utils/signalReadiness";
 
 interface ActionableSignalDebugPanelProps {
   journalRuns: JournalRun[];
@@ -151,33 +155,6 @@ function toneForExecution(reason: ExecutionBlockReasonCategory | null): string {
   return "text-slate-300";
 }
 
-function isSignalReady(
-  decision: AutopilotDecision,
-  minConfidence: number,
-): boolean {
-  const legacyDecision = decision as AutopilotDecision & {
-    isActionable?: boolean;
-  };
-
-  if (typeof decision.isSignalReady === "boolean") {
-    return decision.isSignalReady;
-  }
-
-  if (typeof legacyDecision.isActionable === "boolean") {
-    return legacyDecision.isActionable;
-  }
-
-  const signalBlockReason = fallbackSignalBlockReason(decision, minConfidence);
-
-  if (signalBlockReason) return false;
-
-  return (
-    decision.action !== "HOLD" &&
-    decision.confidence >= minConfidence &&
-    decision.suggestedShares > 0
-  );
-}
-
 function buildCandidates(
   journalRuns: JournalRun[],
   minConfidence: number,
@@ -199,11 +176,9 @@ function buildCandidates(
       const strategyConfigHash = hashOf(run);
 
       return run.decisions
-        .filter(
-          (decision) => decision.action === "BUY" || decision.action === "SELL",
-        )
+        .filter((decision) => isBuySellSignal(decision.action))
         .map((decision) => {
-          const ready = isSignalReady(decision, minConfidence);
+          const ready = isSignalReadyDecision(decision, minConfidence);
           const signalBlockReason =
             decision.blockReasonCategory ??
             fallbackSignalBlockReason(decision, minConfidence);
