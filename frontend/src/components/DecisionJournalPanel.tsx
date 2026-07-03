@@ -6,6 +6,11 @@ import {
   getActionCount,
   getTopTicker,
 } from "../utils";
+import {
+  isBuySellSignal,
+  isExecutionOnlySkippedReason,
+  isSignalReadyDecision,
+} from "../utils/signalReadiness";
 
 interface DecisionJournalPanelProps {
   journalFile: string;
@@ -26,65 +31,10 @@ interface JournalSignalStats {
 
 const DEFAULT_MIN_CONFIDENCE = 0.75;
 
-function isBuySellSignal(action: string): boolean {
-  return action === "BUY" || action === "SELL";
-}
-
-function isExecutionOnlySkippedReason(
-  skippedReason: string | undefined,
-): boolean {
-  if (!skippedReason) return false;
-
-  const reason = skippedReason.toLowerCase();
-
-  return (
-    reason.includes("dry-run") ||
-    reason.includes("dry run") ||
-    reason.includes("execution blocked") ||
-    reason.includes("allow_autopilot") ||
-    reason.includes("allow_buy") ||
-    reason.includes("allow_sell") ||
-    reason.includes("outside paper mode")
-  );
-}
-
 function isDryRunDecision(decision: JournalRun["decisions"][number]): boolean {
   if (decision.executionStatus === "dry_run") return true;
 
   return isExecutionOnlySkippedReason(decision.skippedReason);
-}
-
-function isSignalReadyDecision(
-  decision: JournalRun["decisions"][number],
-  minConfidence: number,
-): boolean {
-  const legacyDecision = decision as JournalRun["decisions"][number] & {
-    isActionable?: boolean;
-  };
-
-  if (
-    decision.signalStatus === "ready" ||
-    decision.isSignalReady === true ||
-    legacyDecision.isActionable === true
-  ) {
-    return true;
-  }
-
-  if (
-    decision.signalStatus === "blocked" ||
-    decision.isSignalReady === false ||
-    legacyDecision.isActionable === false
-  ) {
-    return false;
-  }
-
-  return (
-    isBuySellSignal(decision.action) &&
-    decision.suggestedShares > 0 &&
-    decision.confidence >= minConfidence &&
-    (!decision.skippedReason ||
-      isExecutionOnlySkippedReason(decision.skippedReason))
-  );
 }
 
 function buildRunSignalStats(
