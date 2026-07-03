@@ -98,7 +98,7 @@ export interface AutopilotDecision {
   finalStatus?: DecisionFinalStatus;
   signalStatus?: SignalStatus;
   executionStatus?: ExecutionStatus;
-  isActionable?: boolean;
+  isSignalReady?: boolean;
   blockReasonCategory?: BlockReasonCategory;
   blockReasonCode?: string;
   blockReasonDetail?: string;
@@ -138,18 +138,10 @@ export interface JournalRun {
   tradeMode: TradeMode;
   enabled: boolean;
   tickers: string[];
-
-  /**
-   * Deprecated compatibility alias.
-   * Use signalReadyCount for new code.
-   */
-  actionableCount: number;
-
   signalReadyCount?: number;
   signalBlockedCount?: number;
   dryRunCount?: number;
   executedCount?: number;
-
   strategyVersion?: string;
   strategyConfigHash?: string;
   strategyConfig?: Record<string, unknown>;
@@ -164,13 +156,6 @@ export interface JournalResponse {
 export interface JournalSummary {
   totalRuns: number;
   totalDecisions: number;
-
-  /**
-   * Deprecated compatibility alias.
-   * Use signalReadySignals for new code.
-   */
-  actionableSignals: number;
-
   signalReadySignals?: number;
   signalBlockedSignals?: number;
   dryRunSignals?: number;
@@ -195,6 +180,10 @@ export interface AutopilotRunResponse {
   skipped: boolean;
   reason?: string;
   decisions?: AutopilotDecision[];
+  signalReadyCount?: number;
+  signalBlockedCount?: number;
+  dryRunCount?: number;
+  executedCount?: number;
   status: AutopilotStatus;
   error?: string;
 }
@@ -224,7 +213,6 @@ export interface SseEvent {
   message?: string;
   data?: AutopilotDecision;
   decisions?: AutopilotDecision[];
-  actionableCount?: number;
   signalReadyCount?: number;
   signalBlockedCount?: number;
   dryRunCount?: number;

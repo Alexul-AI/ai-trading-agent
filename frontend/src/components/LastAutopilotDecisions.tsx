@@ -1,18 +1,14 @@
 import type { AutopilotDecision } from "../types";
-import {
-  actionPillClass,
-  confidenceClass,
-  formatMoney,
-} from "../utils";
+import { actionPillClass, confidenceClass, formatMoney } from "../utils";
 
 interface LastAutopilotDecisionsProps {
   latestDecisions: AutopilotDecision[];
-  actionableCount: number;
+  signalReadyCount: number;
 }
 
 export function LastAutopilotDecisions({
   latestDecisions,
-  actionableCount,
+  signalReadyCount,
 }: LastAutopilotDecisionsProps) {
   return (
     <div className="bg-slate-900/60 rounded-2xl border border-slate-800 p-4 flex flex-col min-h-[360px]">
@@ -21,7 +17,7 @@ export function LastAutopilotDecisions({
           LAST AUTOPILOT DECISIONS
         </h2>
         <span className="text-[10px] text-slate-500">
-          actionable {actionableCount}
+          signal ready {signalReadyCount}
         </span>
       </div>
 

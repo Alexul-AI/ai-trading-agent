@@ -155,8 +155,16 @@ function isSignalReady(
   decision: AutopilotDecision,
   minConfidence: number,
 ): boolean {
-  if (typeof decision.isActionable === "boolean") {
-    return decision.isActionable;
+  const legacyDecision = decision as AutopilotDecision & {
+    isActionable?: boolean;
+  };
+
+  if (typeof decision.isSignalReady === "boolean") {
+    return decision.isSignalReady;
+  }
+
+  if (typeof legacyDecision.isActionable === "boolean") {
+    return legacyDecision.isActionable;
   }
 
   const signalBlockReason = fallbackSignalBlockReason(decision, minConfidence);

@@ -58,11 +58,23 @@ function isSignalReadyDecision(
   decision: JournalRun["decisions"][number],
   minConfidence: number,
 ): boolean {
-  if (decision.signalStatus === "ready" || decision.isActionable === true) {
+  const legacyDecision = decision as JournalRun["decisions"][number] & {
+    isActionable?: boolean;
+  };
+
+  if (
+    decision.signalStatus === "ready" ||
+    decision.isSignalReady === true ||
+    legacyDecision.isActionable === true
+  ) {
     return true;
   }
 
-  if (decision.signalStatus === "blocked" || decision.isActionable === false) {
+  if (
+    decision.signalStatus === "blocked" ||
+    decision.isSignalReady === false ||
+    legacyDecision.isActionable === false
+  ) {
     return false;
   }
 

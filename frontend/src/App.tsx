@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { ActionableSignalDebugPanel } from "./components/ActionableSignalDebugPanel";
 import { AutopilotControlCenter } from "./components/AutopilotControlCenter";
 import { AutopilotLogs } from "./components/AutopilotLogs";
 import { ChatTerminal } from "./components/ChatTerminal";
@@ -9,7 +10,6 @@ import { StrategyConfigPanel } from "./components/StrategyConfigPanel";
 import { StrategyQualityPanel } from "./components/StrategyQualityPanel";
 import { SystemHealthBanner } from "./components/SystemHealthBanner";
 import { TickerChartPanel } from "./components/TickerChartPanel";
-import { ActionableSignalDebugPanel } from "./components/ActionableSignalDebugPanel";
 import type {
   AutopilotRunResponse,
   AutopilotStatus,
@@ -66,6 +66,60 @@ const EMPTY_AUTOPILOT_STATUS: AutopilotStatus = {
   lastDecisions: [],
 };
 
+function isExecutionOnlySkippedReason(
+  skippedReason: string | undefined,
+): boolean {
+  if (!skippedReason) return false;
+  const reason = skippedReason.toLowerCase();
+
+  return (
+    reason.includes("dry-run") ||
+    reason.includes("dry run") ||
+    reason.includes("execution blocked") ||
+    reason.includes("allow_autopilot") ||
+    reason.includes("allow_buy") ||
+    reason.includes("allow_sell") ||
+    reason.includes("outside paper mode")
+  );
+}
+
+function isSignalReadyDecision(
+  decision: {
+    action: string;
+    confidence: number;
+    suggestedShares: number;
+    skippedReason?: string;
+    signalStatus?: string;
+    isSignalReady?: boolean;
+    isActionable?: boolean;
+  },
+  minConfidence: number,
+): boolean {
+  if (
+    decision.signalStatus === "ready" ||
+    decision.isSignalReady === true ||
+    decision.isActionable === true
+  ) {
+    return true;
+  }
+
+  if (
+    decision.signalStatus === "blocked" ||
+    decision.isSignalReady === false ||
+    decision.isActionable === false
+  ) {
+    return false;
+  }
+
+  return (
+    decision.action !== "HOLD" &&
+    decision.suggestedShares > 0 &&
+    decision.confidence >= minConfidence &&
+    (!decision.skippedReason ||
+      isExecutionOnlySkippedReason(decision.skippedReason))
+  );
+}
+
 export default function App() {
   const [tradeMode, setTradeMode] = useState<TradeMode>("paper");
   const [portfolio, setPortfolio] = useState<Portfolio>(EMPTY_PORTFOLIO);
@@ -115,10 +169,8 @@ export default function App() {
 
   const autopilotEnabled = autopilotStatus.enabled;
   const latestDecisions = autopilotStatus.lastDecisions;
-  const actionableDecisions = latestDecisions.filter(
-    (decision) =>
-      decision.action !== "HOLD" &&
-      decision.confidence >= autopilotStatus.minConfidence,
+  const signalReadyDecisions = latestDecisions.filter((decision) =>
+    isSignalReadyDecision(decision, autopilotStatus.minConfidence),
   );
 
   const addAutopilotLog = useCallback((message: string) => {
@@ -271,7 +323,7 @@ export default function App() {
 
         if (data.type === "autopilot_worker_finished") {
           addAutopilotLog(
-            `Worker finished. Actionable signals: ${data.actionableCount ?? 0}.`,
+            `Worker finished. Signal-ready signals: ${data.signalReadyCount ?? 0}.`,
           );
           if (data.decisions) {
             setAutopilotStatus((prev) => ({
@@ -353,13 +405,14 @@ export default function App() {
       } else if (data.error) {
         addAutopilotLog(`Run failed: ${data.error}`);
       } else {
-        const actionableCount = (data.decisions ?? []).filter(
-          (decision) =>
-            decision.action !== "HOLD" &&
-            decision.confidence >= data.status.minConfidence,
-        ).length;
+        const signalReadyCount =
+          data.signalReadyCount ??
+          (data.decisions ?? []).filter((decision) =>
+            isSignalReadyDecision(decision, data.status.minConfidence),
+          ).length;
+
         addAutopilotLog(
-          `Manual dry-run completed. Actionable signals: ${actionableCount}.`,
+          `Manual dry-run completed. Signal-ready signals: ${signalReadyCount}.`,
         );
       }
     } catch (error) {
@@ -948,7 +1001,7 @@ export default function App() {
 
           <LastAutopilotDecisions
             latestDecisions={latestDecisions}
-            actionableCount={actionableDecisions.length}
+            signalReadyCount={signalReadyDecisions.length}
           />
 
           <ChatTerminal

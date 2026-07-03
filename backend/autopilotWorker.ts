@@ -116,7 +116,7 @@ export interface AutopilotDecisionLog {
   finalStatus?: DecisionFinalStatus;
   signalStatus?: SignalStatus;
   executionStatus?: ExecutionStatus;
-  isActionable?: boolean;
+  isSignalReady?: boolean;
   blockReasonCategory?: BlockReasonCategory;
   blockReasonCode?: string;
   blockReasonDetail?: string;
@@ -292,9 +292,9 @@ function appendSafetyNote(
   return `${existingNote} | ${nextNote}`;
 }
 
-function isActionableDecision(decision: AutopilotDecisionLog): boolean {
-  if (typeof decision.isActionable === "boolean") {
-    return decision.isActionable;
+function isSignalReadyDecision(decision: AutopilotDecisionLog): boolean {
+  if (typeof decision.isSignalReady === "boolean") {
+    return decision.isSignalReady;
   }
 
   return (
@@ -481,7 +481,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       finalStatus: decision.action === "HOLD" ? "hold" : "blocked",
       signalStatus: decision.action === "HOLD" ? "hold" : "blocked",
       executionStatus: "not_attempted",
-      isActionable: false,
+      isSignalReady: false,
       executed: false,
     };
 
@@ -489,7 +489,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       log.finalStatus = "hold";
       log.signalStatus = "hold";
       log.executionStatus = "not_attempted";
-      log.isActionable = false;
+      log.isSignalReady = false;
       log.skippedReason = "HOLD decision.";
       return log;
     }
@@ -513,7 +513,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       log.finalStatus = "blocked";
       log.signalStatus = "blocked";
       log.executionStatus = "not_attempted";
-      log.isActionable = false;
+      log.isSignalReady = false;
       log.blockReasonCategory = "position_guard";
       log.blockReasonCode = "SELL_BELOW_AVG_ENTRY";
       log.blockReasonDetail = guardNote;
@@ -528,7 +528,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       log.finalStatus = "blocked";
       log.signalStatus = "blocked";
       log.executionStatus = "not_attempted";
-      log.isActionable = false;
+      log.isSignalReady = false;
       log.blockReasonCategory = "confidence";
       log.blockReasonCode = "CONFIDENCE_BELOW_MIN";
       log.blockReasonDetail = confidenceNote;
@@ -540,7 +540,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       log.finalStatus = "blocked";
       log.signalStatus = "blocked";
       log.executionStatus = "not_attempted";
-      log.isActionable = false;
+      log.isSignalReady = false;
       log.blockReasonCategory = "quantity";
       log.blockReasonCode = "NO_SAFE_QUANTITY";
       log.blockReasonDetail = "No positive safe share quantity suggested.";
@@ -551,7 +551,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     log.finalStatus = "signal_ready";
     log.signalStatus = "ready";
     log.executionStatus = "not_attempted";
-    log.isActionable = true;
+    log.isSignalReady = true;
 
     if (!AUTOPILOT_EXECUTE_TRADES) {
       log.executionStatus = "dry_run";
@@ -595,18 +595,12 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
 
     const stopLoss =
       decision.action === "BUY"
-        ? Number(
-            (price * (1 - DEFAULT_STRATEGY_CONFIG.stopLossPercent)).toFixed(2),
-          )
+        ? Number((price * (1 - DEFAULT_STRATEGY_CONFIG.stopLossPercent)).toFixed(2))
         : undefined;
 
     const takeProfit =
       decision.action === "BUY"
-        ? Number(
-            (price * (1 + DEFAULT_STRATEGY_CONFIG.takeProfitPercent)).toFixed(
-              2,
-            ),
-          )
+        ? Number((price * (1 + DEFAULT_STRATEGY_CONFIG.takeProfitPercent)).toFixed(2))
         : undefined;
 
     const result = await options.executeSafeTrade(
@@ -644,7 +638,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     return log;
   }
 
-  async function sendTelegramForNewActionableSignals(
+  async function sendTelegramForNewSignalReadyDecisions(
     actionable: AutopilotDecisionLog[],
   ) {
     if (!options.sendTelegramAlert || actionable.length === 0) return;
@@ -687,6 +681,11 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       return {
         skipped: true,
         reason: "Autopilot worker is already running.",
+        decisions: [],
+        signalReadyCount: 0,
+        signalBlockedCount: 0,
+        dryRunCount: 0,
+        executedCount: 0,
         status: getStatus(),
       };
     }
@@ -702,6 +701,10 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     });
 
     let decisions: AutopilotDecisionLog[] = [];
+    let runSignalReadyCount = 0;
+    let runSignalBlockedCount = 0;
+    let runDryRunCount = 0;
+    let runExecutedCount = 0;
     let topLevelError: string | null = null;
 
     try {
@@ -744,7 +747,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
             finalStatus: "error",
             signalStatus: "blocked",
             executionStatus: "not_attempted",
-            isActionable: false,
+            isSignalReady: false,
             blockReasonCategory: "error",
             blockReasonCode: "ANALYSIS_ERROR",
             blockReasonDetail: message,
@@ -764,7 +767,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       lastDecisions = decisions;
       lastRunAt = new Date().toISOString();
 
-      const signalReady = decisions.filter(isActionableDecision);
+      const signalReady = decisions.filter(isSignalReadyDecision);
       const signalCandidates = decisions.filter(
         (decision) => decision.action === "BUY" || decision.action === "SELL",
       );
@@ -772,9 +775,13 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         (decision) => decision.executionStatus === "dry_run",
       );
       const executedSignals = signalReady.filter(
-        (decision) =>
-          decision.executed || decision.executionStatus === "executed",
+        (decision) => decision.executed || decision.executionStatus === "executed",
       );
+
+      runSignalReadyCount = signalReady.length;
+      runSignalBlockedCount = signalCandidates.length - signalReady.length;
+      runDryRunCount = dryRunSignals.length;
+      runExecutedCount = executedSignals.length;
 
       try {
         const journalRun = await appendAutopilotRun({
@@ -784,17 +791,13 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           tradeMode: options.tradeMode,
           enabled,
           tickers,
-          actionableCount: signalReady.length,
-          signalReadyCount: signalReady.length,
-          signalBlockedCount: signalCandidates.length - signalReady.length,
-          dryRunCount: dryRunSignals.length,
-          executedCount: executedSignals.length,
+          signalReadyCount: runSignalReadyCount,
+          signalBlockedCount: runSignalBlockedCount,
+          dryRunCount: runDryRunCount,
+          executedCount: runExecutedCount,
           strategyVersion: STRATEGY_VERSION,
           strategyConfigHash: STRATEGY_CONFIG_HASH,
-          strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<
-            string,
-            unknown
-          >,
+          strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<string, unknown>,
           decisions,
         });
 
@@ -816,14 +819,13 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         timestamp: lastRunAt,
         journalRunId: lastJournalRunId,
         decisions,
-        actionableCount: signalReady.length,
-        signalReadyCount: signalReady.length,
-        signalBlockedCount: signalCandidates.length - signalReady.length,
-        dryRunCount: dryRunSignals.length,
-        executedCount: executedSignals.length,
+        signalReadyCount: runSignalReadyCount,
+        signalBlockedCount: runSignalBlockedCount,
+        dryRunCount: runDryRunCount,
+        executedCount: runExecutedCount,
       });
 
-      await sendTelegramForNewActionableSignals(signalReady);
+      await sendTelegramForNewSignalReadyDecisions(signalReady);
     } catch (error) {
       topLevelError = getErrorMessage(error);
       lastError = topLevelError;
@@ -841,6 +843,11 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       return {
         skipped: false,
         error: topLevelError,
+        decisions,
+        signalReadyCount: runSignalReadyCount,
+        signalBlockedCount: runSignalBlockedCount,
+        dryRunCount: runDryRunCount,
+        executedCount: runExecutedCount,
         status: getStatus(),
       };
     }
@@ -848,6 +855,10 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     return {
       skipped: false,
       decisions,
+      signalReadyCount: runSignalReadyCount,
+      signalBlockedCount: runSignalBlockedCount,
+      dryRunCount: runDryRunCount,
+      executedCount: runExecutedCount,
       status: getStatus(),
     };
   }
@@ -891,10 +902,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       tradeMode: options.tradeMode,
       strategyVersion: STRATEGY_VERSION,
       strategyConfigHash: STRATEGY_CONFIG_HASH,
-      strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<
-        string,
-        unknown
-      >,
+      strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<string, unknown>,
       running,
       intervalMs: AUTOPILOT_INTERVAL_MS,
       tickers: AUTOPILOT_TICKERS,

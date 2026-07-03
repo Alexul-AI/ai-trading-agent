@@ -61,7 +61,7 @@ export interface JournalDecision {
   finalStatus?: DecisionFinalStatus;
   signalStatus?: SignalStatus;
   executionStatus?: ExecutionStatus;
-  isActionable?: boolean;
+  isSignalReady?: boolean;
   blockReasonCategory?: BlockReasonCategory;
   blockReasonCode?: string;
   blockReasonDetail?: string;
@@ -81,13 +81,6 @@ export interface JournalRun {
   tradeMode: "paper" | "live";
   enabled: boolean;
   tickers: string[];
-
-  /**
-   * Deprecated compatibility alias.
-   * Use signalReadyCount for new code.
-   */
-  actionableCount: number;
-
   signalReadyCount?: number;
   signalBlockedCount?: number;
   dryRunCount?: number;
@@ -107,13 +100,6 @@ export interface JournalRun {
 export interface JournalSummary {
   totalRuns: number;
   totalDecisions: number;
-
-  /**
-   * Deprecated compatibility alias.
-   * Use signalReadySignals for new code.
-   */
-  actionableSignals: number;
-
   signalReadySignals: number;
   signalBlockedSignals: number;
   dryRunSignals: number;
@@ -167,7 +153,6 @@ function isExecutionOnlySkippedReason(
   skippedReason: string | undefined,
 ): boolean {
   if (!skippedReason) return false;
-
   const reason = skippedReason.toLowerCase();
 
   return (
@@ -183,18 +168,28 @@ function isExecutionOnlySkippedReason(
 
 function isDryRunDecision(decision: JournalDecision): boolean {
   if (decision.executionStatus === "dry_run") return true;
-
   const reason = decision.skippedReason?.toLowerCase() ?? "";
-
   return reason.includes("dry-run") || reason.includes("dry run");
 }
 
 function isSignalReadyDecision(decision: JournalDecision): boolean {
-  if (decision.signalStatus === "ready" || decision.isActionable === true) {
+  const legacyDecision = decision as JournalDecision & {
+    isActionable?: boolean;
+  };
+
+  if (
+    decision.signalStatus === "ready" ||
+    decision.isSignalReady === true ||
+    legacyDecision.isActionable === true
+  ) {
     return true;
   }
 
-  if (decision.signalStatus === "blocked" || decision.isActionable === false) {
+  if (
+    decision.signalStatus === "blocked" ||
+    decision.isSignalReady === false ||
+    legacyDecision.isActionable === false
+  ) {
     return false;
   }
 
@@ -236,13 +231,13 @@ export async function appendAutopilotRun(
       ? createStrategyConfigHash(run.strategyConfig)
       : undefined);
 
-  const signalCounts = calculateRunSignalCounts(run.decisions);
+  const calculatedCounts = calculateRunSignalCounts(run.decisions);
   const signalReadyCount =
-    run.signalReadyCount ?? signalCounts.signalReadyCount;
+    run.signalReadyCount ?? calculatedCounts.signalReadyCount;
   const signalBlockedCount =
-    run.signalBlockedCount ?? signalCounts.signalBlockedCount;
-  const dryRunCount = run.dryRunCount ?? signalCounts.dryRunCount;
-  const executedCount = run.executedCount ?? signalCounts.executedCount;
+    run.signalBlockedCount ?? calculatedCounts.signalBlockedCount;
+  const dryRunCount = run.dryRunCount ?? calculatedCounts.dryRunCount;
+  const executedCount = run.executedCount ?? calculatedCounts.executedCount;
 
   const runWithId: JournalRun = {
     ...run,
@@ -252,7 +247,6 @@ export async function appendAutopilotRun(
     signalBlockedCount,
     dryRunCount,
     executedCount,
-    actionableCount: run.actionableCount ?? signalReadyCount,
   };
 
   await fs.appendFile(JOURNAL_FILE, `${JSON.stringify(runWithId)}\n`, "utf-8");
@@ -297,7 +291,6 @@ export async function summarizeAutopilotRuns(
   const summary: JournalSummary = {
     totalRuns: chronologicalRuns.length,
     totalDecisions: 0,
-    actionableSignals: 0,
     signalReadySignals: 0,
     signalBlockedSignals: 0,
     dryRunSignals: 0,
@@ -338,8 +331,6 @@ export async function summarizeAutopilotRuns(
       }
     }
   }
-
-  summary.actionableSignals = summary.signalReadySignals;
 
   return summary;
 }
