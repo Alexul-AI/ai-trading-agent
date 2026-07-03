@@ -1,5 +1,9 @@
 import { useMemo, useState } from "react";
 import type { JournalRun } from "../types";
+import {
+  isBuySellSignal,
+  isSignalReadyDecision,
+} from "../utils/signalReadiness";
 
 interface StrategyComparisonPanelProps {
   journalRuns: JournalRun[];
@@ -18,8 +22,8 @@ interface StrategyVariantStats {
   sell: number;
   hold: number;
   buySell: number;
-  actionable: number;
-  blocked: number;
+  signalReady: number;
+  signalBlocked: number;
   confidenceSum: number;
   confidenceCount: number;
   firstRunAt: string;
@@ -75,57 +79,6 @@ function isLegacy(stats: StrategyVariantStats): boolean {
   return stats.version === "legacy" || stats.hash === "no-hash";
 }
 
-function isExecutionOnlySkippedReason(
-  skippedReason: string | undefined,
-): boolean {
-  if (!skippedReason) return false;
-
-  const reason = skippedReason.toLowerCase();
-
-  return (
-    reason.includes("dry-run") ||
-    reason.includes("dry run") ||
-    reason.includes("execution blocked") ||
-    reason.includes("allow_autopilot") ||
-    reason.includes("allow_buy") ||
-    reason.includes("allow_sell") ||
-    reason.includes("outside paper mode")
-  );
-}
-
-function isSignalReadyDecision(
-  decision: JournalRun["decisions"][number],
-  minConfidence: number,
-): boolean {
-  const legacyDecision = decision as JournalRun["decisions"][number] & {
-    isActionable?: boolean;
-  };
-
-  if (
-    decision.signalStatus === "ready" ||
-    decision.isSignalReady === true ||
-    legacyDecision.isActionable === true
-  ) {
-    return true;
-  }
-
-  if (
-    decision.signalStatus === "blocked" ||
-    decision.isSignalReady === false ||
-    legacyDecision.isActionable === false
-  ) {
-    return false;
-  }
-
-  return (
-    decision.action !== "HOLD" &&
-    decision.confidence >= minConfidence &&
-    decision.suggestedShares > 0 &&
-    (!decision.skippedReason ||
-      isExecutionOnlySkippedReason(decision.skippedReason))
-  );
-}
-
 function createVariantStats(run: JournalRun): StrategyVariantStats {
   const version = versionOf(run);
   const hash = hashOf(run);
@@ -140,8 +93,8 @@ function createVariantStats(run: JournalRun): StrategyVariantStats {
     sell: 0,
     hold: 0,
     buySell: 0,
-    actionable: 0,
-    blocked: 0,
+    signalReady: 0,
+    signalBlocked: 0,
     confidenceSum: 0,
     confidenceCount: 0,
     firstRunAt: run.timestamp,
@@ -187,14 +140,14 @@ function buildStats(
         stats.hold += 1;
       }
 
-      if (decision.action !== "HOLD") {
+      if (isBuySellSignal(decision.action)) {
         stats.confidenceSum += decision.confidence;
         stats.confidenceCount += 1;
 
         if (isSignalReadyDecision(decision, minConfidence)) {
-          stats.actionable += 1;
+          stats.signalReady += 1;
         } else {
-          stats.blocked += 1;
+          stats.signalBlocked += 1;
         }
       }
     }
@@ -217,7 +170,7 @@ function isWinnerEligible(
 ): boolean {
   if (stats.runs < WINNER_MIN_RUNS) return false;
   if (stats.buySell <= 0) return false;
-  if (stats.actionable <= 0) return false;
+  if (stats.signalReady <= 0) return false;
   if (!options.allowLegacyWinner && isLegacy(stats)) return false;
 
   return true;
@@ -234,10 +187,10 @@ function chooseWinner(
   if (eligible.length === 0) return null;
 
   return [...eligible].sort((a, b) => {
-    const actionableDiff =
-      ratio(b.actionable, b.buySell) - ratio(a.actionable, a.buySell);
+    const signalReadyDiff =
+      ratio(b.signalReady, b.buySell) - ratio(a.signalReady, a.buySell);
 
-    if (actionableDiff !== 0) return actionableDiff;
+    if (signalReadyDiff !== 0) return signalReadyDiff;
 
     const confidenceDiff = avgConfidenceValue(b) - avgConfidenceValue(a);
 
@@ -323,10 +276,11 @@ function WinnerSummary({
       <div className="mt-1 text-[10px] text-amber-100">
         hash {shortHash(winner.hash)} · signal-ready ratio{" "}
         <span className="font-black">
-          {formatPercent(winner.actionable, winner.buySell)}
+          {formatPercent(winner.signalReady, winner.buySell)}
         </span>{" "}
         · signal-ready decisions{" "}
-        <span className="font-black">{winner.actionable}</span> · avg confidence{" "}
+        <span className="font-black">{winner.signalReady}</span> · avg
+        confidence{" "}
         <span className="font-black">
           {formatConfidence(winner.confidenceSum, winner.confidenceCount)}
         </span>{" "}
@@ -353,7 +307,7 @@ function EligibilityNote({
     reasons.push("needs BUY/SELL candidates");
   }
 
-  if (stats.actionable <= 0) {
+  if (stats.signalReady <= 0) {
     reasons.push("needs signal-ready decision");
   }
 
@@ -388,7 +342,7 @@ function VariantRow({
   allowLegacyWinner: boolean;
 }) {
   const holdRatio = formatPercent(stats.hold, stats.decisions);
-  const actionableRatio = formatPercent(stats.actionable, stats.buySell);
+  const signalReadyRatio = formatPercent(stats.signalReady, stats.buySell);
   const avgConfidence = formatConfidence(
     stats.confidenceSum,
     stats.confidenceCount,
@@ -446,14 +400,14 @@ function VariantRow({
         <StatPill label="BUY" value={stats.buy} tone="good" />
         <StatPill label="SELL" value={stats.sell} tone="warn" />
         <StatPill label="BUY/SELL" value={stats.buySell} tone="info" />
-        <StatPill label="Signal Ready" value={stats.actionable} tone="good" />
-        <StatPill label="Blocked" value={stats.blocked} tone="warn" />
+        <StatPill label="Signal Ready" value={stats.signalReady} tone="good" />
+        <StatPill label="Blocked" value={stats.signalBlocked} tone="warn" />
         <StatPill label="Avg conf" value={avgConfidence} tone="info" />
       </div>
 
       <div className="mt-3 rounded-xl border border-slate-800 bg-slate-950/40 p-2 text-[10px] text-slate-400">
         Signal-ready ratio among BUY/SELL candidates:{" "}
-        <span className="font-black text-slate-200">{actionableRatio}</span>
+        <span className="font-black text-slate-200">{signalReadyRatio}</span>
       </div>
     </div>
   );
