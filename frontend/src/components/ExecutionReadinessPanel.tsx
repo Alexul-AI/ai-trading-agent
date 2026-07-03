@@ -1,3 +1,8 @@
+import type {
+  AutopilotDecision,
+  AutopilotStatus,
+  DashboardHealthSummary,
+} from "../types";
 import { useNowMs } from "../hooks/useNowMs";
 import {
   formatAge,
@@ -7,11 +12,6 @@ import {
   getStaleThresholdMs,
   isSignalStale,
 } from "../utils/dateTime";
-import type {
-  AutopilotDecision,
-  AutopilotStatus,
-  DashboardHealthSummary,
-} from "../types";
 
 interface ExecutionReadinessPanelProps {
   autopilotStatus: AutopilotStatus;
@@ -353,7 +353,7 @@ export function ExecutionReadinessPanel({
   const signalTimestamp = latestSignalReadyDecision?.timestamp ?? null;
   const signalTimestampMs =
     signalTimestamp !== null ? getSignalTimestampMs(signalTimestamp) : null;
-  const nowMs = useNowMs(signalTimestamp !== null, 30_000);
+  const nowMs = useNowMs(signalTimestamp !== null, 10_000);
   const signalAgeMs = getSignalAgeMs(signalTimestampMs, nowMs);
   const signalIsStale =
     signalTimestamp !== null &&
