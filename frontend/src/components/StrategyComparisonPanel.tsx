@@ -75,14 +75,42 @@ function isLegacy(stats: StrategyVariantStats): boolean {
   return stats.version === "legacy" || stats.hash === "no-hash";
 }
 
-function isActionableDecision(
+function isExecutionOnlySkippedReason(
+  skippedReason: string | undefined,
+): boolean {
+  if (!skippedReason) return false;
+
+  const reason = skippedReason.toLowerCase();
+
+  return (
+    reason.includes("dry-run") ||
+    reason.includes("dry run") ||
+    reason.includes("execution blocked") ||
+    reason.includes("allow_autopilot") ||
+    reason.includes("allow_buy") ||
+    reason.includes("allow_sell") ||
+    reason.includes("outside paper mode")
+  );
+}
+
+function isSignalReadyDecision(
   decision: JournalRun["decisions"][number],
   minConfidence: number,
 ): boolean {
+  if (decision.signalStatus === "ready" || decision.isActionable === true) {
+    return true;
+  }
+
+  if (decision.signalStatus === "blocked" || decision.isActionable === false) {
+    return false;
+  }
+
   return (
     decision.action !== "HOLD" &&
     decision.confidence >= minConfidence &&
-    !decision.skippedReason
+    decision.suggestedShares > 0 &&
+    (!decision.skippedReason ||
+      isExecutionOnlySkippedReason(decision.skippedReason))
   );
 }
 
@@ -123,7 +151,6 @@ function buildStats(
 
     stats.runs += 1;
     stats.decisions += run.decisions.length;
-    stats.actionable += run.actionableCount ?? 0;
 
     if (
       new Date(run.timestamp).getTime() < new Date(stats.firstRunAt).getTime()
@@ -152,7 +179,9 @@ function buildStats(
         stats.confidenceSum += decision.confidence;
         stats.confidenceCount += 1;
 
-        if (!isActionableDecision(decision, minConfidence)) {
+        if (isSignalReadyDecision(decision, minConfidence)) {
+          stats.actionable += 1;
+        } else {
           stats.blocked += 1;
         }
       }
@@ -267,7 +296,7 @@ function WinnerSummary({
     return (
       <div className="mb-4 rounded-xl border border-slate-800 bg-slate-950/40 p-3 text-xs text-slate-400">
         🏆 No winner yet. A winner needs at least {WINNER_MIN_RUNS} runs, at
-        least one BUY/SELL candidate, and at least one real actionable signal.
+        least one BUY/SELL candidate, and at least one signal-ready decision.
         {!allowLegacyWinner &&
           " Legacy is excluded from winner ranking by default."}
       </div>
@@ -280,11 +309,11 @@ function WinnerSummary({
         🏆 Current winner: {winner.version}
       </div>
       <div className="mt-1 text-[10px] text-amber-100">
-        hash {shortHash(winner.hash)} · actionable ratio{" "}
+        hash {shortHash(winner.hash)} · signal-ready ratio{" "}
         <span className="font-black">
           {formatPercent(winner.actionable, winner.buySell)}
         </span>{" "}
-        · actionable signals{" "}
+        · signal-ready decisions{" "}
         <span className="font-black">{winner.actionable}</span> · avg confidence{" "}
         <span className="font-black">
           {formatConfidence(winner.confidenceSum, winner.confidenceCount)}
@@ -313,7 +342,7 @@ function EligibilityNote({
   }
 
   if (stats.actionable <= 0) {
-    reasons.push("needs actionable signal");
+    reasons.push("needs signal-ready decision");
   }
 
   if (!allowLegacyWinner && isLegacy(stats)) {
@@ -405,13 +434,13 @@ function VariantRow({
         <StatPill label="BUY" value={stats.buy} tone="good" />
         <StatPill label="SELL" value={stats.sell} tone="warn" />
         <StatPill label="BUY/SELL" value={stats.buySell} tone="info" />
-        <StatPill label="Actionable" value={stats.actionable} tone="good" />
+        <StatPill label="Signal Ready" value={stats.actionable} tone="good" />
         <StatPill label="Blocked" value={stats.blocked} tone="warn" />
         <StatPill label="Avg conf" value={avgConfidence} tone="info" />
       </div>
 
       <div className="mt-3 rounded-xl border border-slate-800 bg-slate-950/40 p-2 text-[10px] text-slate-400">
-        Actionable ratio among BUY/SELL candidates:{" "}
+        Signal-ready ratio among BUY/SELL candidates:{" "}
         <span className="font-black text-slate-200">{actionableRatio}</span>
       </div>
     </div>

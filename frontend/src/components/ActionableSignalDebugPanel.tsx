@@ -202,6 +202,8 @@ function buildCandidates(
           const executionBlockReason =
             decision.executionBlockReasonCategory ??
             fallbackExecutionReason(decision);
+          const executionStatus =
+            decision.executionStatus ?? executionBlockReason ?? "legacy";
 
           return {
             runId: run.id,
@@ -214,7 +216,7 @@ function buildCandidates(
             skippedReason: decision.skippedReason,
             isSignalReady: ready,
             signalBlockReason: ready ? null : signalBlockReason,
-            executionStatus: decision.executionStatus ?? "legacy",
+            executionStatus,
             executionBlockReason,
             signalDetail: decision.blockReasonDetail,
             executionDetail: decision.executionBlockReasonDetail,

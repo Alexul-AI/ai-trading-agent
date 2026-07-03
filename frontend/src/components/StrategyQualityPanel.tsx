@@ -62,6 +62,52 @@ function isBuySellSignal(action: string): boolean {
   return action === "BUY" || action === "SELL";
 }
 
+function isExecutionOnlySkippedReason(
+  skippedReason: string | undefined,
+): boolean {
+  if (!skippedReason) return false;
+
+  const reason = skippedReason.toLowerCase();
+
+  return (
+    reason.includes("dry-run") ||
+    reason.includes("dry run") ||
+    reason.includes("execution blocked") ||
+    reason.includes("allow_autopilot") ||
+    reason.includes("allow_buy") ||
+    reason.includes("allow_sell") ||
+    reason.includes("outside paper mode")
+  );
+}
+
+function isSignalReadyDecision(
+  decision: {
+    action: string;
+    confidence: number;
+    suggestedShares: number;
+    skippedReason?: string;
+    signalStatus?: string;
+    isActionable?: boolean;
+  },
+  minConfidence: number,
+): boolean {
+  if (decision.signalStatus === "ready" || decision.isActionable === true) {
+    return true;
+  }
+
+  if (decision.signalStatus === "blocked" || decision.isActionable === false) {
+    return false;
+  }
+
+  return (
+    isBuySellSignal(decision.action) &&
+    decision.suggestedShares > 0 &&
+    decision.confidence >= minConfidence &&
+    (!decision.skippedReason ||
+      isExecutionOnlySkippedReason(decision.skippedReason))
+  );
+}
+
 function includesAny(text: string, patterns: string[]): boolean {
   const normalized = text.toLowerCase();
   return patterns.some((pattern) => normalized.includes(pattern));
@@ -140,17 +186,12 @@ function classifyPrimaryOutcome(
     skippedReason?: string;
     safetyNote?: string;
     reason?: string;
+    signalStatus?: string;
+    isActionable?: boolean;
   },
   minConfidence: number,
 ): PrimaryOutcome {
-  const hasSkippedReason = Boolean(decision.skippedReason);
-
-  if (
-    isBuySellSignal(decision.action) &&
-    decision.suggestedShares > 0 &&
-    decision.confidence >= minConfidence &&
-    !hasSkippedReason
-  ) {
+  if (isSignalReadyDecision(decision, minConfidence)) {
     return "ACTIONABLE";
   }
 
@@ -749,7 +790,7 @@ export function StrategyQualityPanel({
       <div className="grid grid-cols-4 gap-2 mb-4">
         <StatCard label="BUY/SELL" value={stats.buySellTotal} tone="info" />
         <StatCard
-          label="Actionable"
+          label="Signal Ready"
           value={stats.actionableSignals}
           tone={stats.actionableSignals > 0 ? "good" : "neutral"}
         />
@@ -776,7 +817,8 @@ export function StrategyQualityPanel({
               Primary outcome waterfall
             </div>
             <div className="text-[9px] text-slate-500">
-              Mutually exclusive. These rows should sum to total BUY/SELL.
+              Mutually exclusive. Signal Ready means the strategy signal passed;
+              dry-run execution does not make it blocked.
             </div>
           </div>
           <div
@@ -796,7 +838,7 @@ export function StrategyQualityPanel({
         ) : (
           <div className="space-y-3">
             <BarRow
-              label="Actionable"
+              label="Signal Ready"
               value={stats.actionableSignals}
               total={stats.buySellTotal}
               tone="good"
@@ -951,7 +993,7 @@ export function StrategyQualityPanel({
 
                   <div className="mt-3">
                     <div className="flex items-center justify-between text-[10px] mb-1">
-                      <span className="text-slate-500">Actionable ratio</span>
+                      <span className="text-slate-500">Signal-ready ratio</span>
                       <span className="text-slate-500 font-mono">
                         {ticker.actionable} / {ticker.buySellTotal} ·{" "}
                         {actionablePercent}%
