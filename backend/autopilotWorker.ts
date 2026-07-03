@@ -764,7 +764,17 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       lastDecisions = decisions;
       lastRunAt = new Date().toISOString();
 
-      const actionable = decisions.filter(isActionableDecision);
+      const signalReady = decisions.filter(isActionableDecision);
+      const signalCandidates = decisions.filter(
+        (decision) => decision.action === "BUY" || decision.action === "SELL",
+      );
+      const dryRunSignals = signalReady.filter(
+        (decision) => decision.executionStatus === "dry_run",
+      );
+      const executedSignals = signalReady.filter(
+        (decision) =>
+          decision.executed || decision.executionStatus === "executed",
+      );
 
       try {
         const journalRun = await appendAutopilotRun({
@@ -774,7 +784,11 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           tradeMode: options.tradeMode,
           enabled,
           tickers,
-          actionableCount: actionable.length,
+          actionableCount: signalReady.length,
+          signalReadyCount: signalReady.length,
+          signalBlockedCount: signalCandidates.length - signalReady.length,
+          dryRunCount: dryRunSignals.length,
+          executedCount: executedSignals.length,
           strategyVersion: STRATEGY_VERSION,
           strategyConfigHash: STRATEGY_CONFIG_HASH,
           strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<
@@ -802,10 +816,14 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         timestamp: lastRunAt,
         journalRunId: lastJournalRunId,
         decisions,
-        actionableCount: actionable.length,
+        actionableCount: signalReady.length,
+        signalReadyCount: signalReady.length,
+        signalBlockedCount: signalCandidates.length - signalReady.length,
+        dryRunCount: dryRunSignals.length,
+        executedCount: executedSignals.length,
       });
 
-      await sendTelegramForNewActionableSignals(actionable);
+      await sendTelegramForNewActionableSignals(signalReady);
     } catch (error) {
       topLevelError = getErrorMessage(error);
       lastError = topLevelError;

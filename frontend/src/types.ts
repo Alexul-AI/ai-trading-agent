@@ -138,7 +138,18 @@ export interface JournalRun {
   tradeMode: TradeMode;
   enabled: boolean;
   tickers: string[];
+
+  /**
+   * Deprecated compatibility alias.
+   * Use signalReadyCount for new code.
+   */
   actionableCount: number;
+
+  signalReadyCount?: number;
+  signalBlockedCount?: number;
+  dryRunCount?: number;
+  executedCount?: number;
+
   strategyVersion?: string;
   strategyConfigHash?: string;
   strategyConfig?: Record<string, unknown>;
@@ -153,7 +164,16 @@ export interface JournalResponse {
 export interface JournalSummary {
   totalRuns: number;
   totalDecisions: number;
+
+  /**
+   * Deprecated compatibility alias.
+   * Use signalReadySignals for new code.
+   */
   actionableSignals: number;
+
+  signalReadySignals?: number;
+  signalBlockedSignals?: number;
+  dryRunSignals?: number;
   executedSignals: number;
   byAction: Record<string, number>;
   byTicker: Record<string, number>;
@@ -205,6 +225,10 @@ export interface SseEvent {
   data?: AutopilotDecision;
   decisions?: AutopilotDecision[];
   actionableCount?: number;
+  signalReadyCount?: number;
+  signalBlockedCount?: number;
+  dryRunCount?: number;
+  executedCount?: number;
   timestamp?: string;
 }
 

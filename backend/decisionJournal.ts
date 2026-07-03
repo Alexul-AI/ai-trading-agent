@@ -81,7 +81,17 @@ export interface JournalRun {
   tradeMode: "paper" | "live";
   enabled: boolean;
   tickers: string[];
+
+  /**
+   * Deprecated compatibility alias.
+   * Use signalReadyCount for new code.
+   */
   actionableCount: number;
+
+  signalReadyCount?: number;
+  signalBlockedCount?: number;
+  dryRunCount?: number;
+  executedCount?: number;
 
   /**
    * Strategy metadata enables clean comparisons after algorithm changes.
@@ -97,7 +107,16 @@ export interface JournalRun {
 export interface JournalSummary {
   totalRuns: number;
   totalDecisions: number;
+
+  /**
+   * Deprecated compatibility alias.
+   * Use signalReadySignals for new code.
+   */
   actionableSignals: number;
+
+  signalReadySignals: number;
+  signalBlockedSignals: number;
+  dryRunSignals: number;
   executedSignals: number;
   byAction: Record<string, number>;
   byTicker: Record<string, number>;
@@ -140,6 +159,72 @@ function createRunId(timestamp: string): string {
   return `run_${timestamp.replace(/[:.]/g, "-")}`;
 }
 
+function isBuySellSignal(action: string): boolean {
+  return action === "BUY" || action === "SELL";
+}
+
+function isExecutionOnlySkippedReason(
+  skippedReason: string | undefined,
+): boolean {
+  if (!skippedReason) return false;
+
+  const reason = skippedReason.toLowerCase();
+
+  return (
+    reason.includes("dry-run") ||
+    reason.includes("dry run") ||
+    reason.includes("execution blocked") ||
+    reason.includes("allow_autopilot") ||
+    reason.includes("allow_buy") ||
+    reason.includes("allow_sell") ||
+    reason.includes("outside paper mode")
+  );
+}
+
+function isDryRunDecision(decision: JournalDecision): boolean {
+  if (decision.executionStatus === "dry_run") return true;
+
+  const reason = decision.skippedReason?.toLowerCase() ?? "";
+
+  return reason.includes("dry-run") || reason.includes("dry run");
+}
+
+function isSignalReadyDecision(decision: JournalDecision): boolean {
+  if (decision.signalStatus === "ready" || decision.isActionable === true) {
+    return true;
+  }
+
+  if (decision.signalStatus === "blocked" || decision.isActionable === false) {
+    return false;
+  }
+
+  return (
+    isBuySellSignal(decision.action) &&
+    decision.suggestedShares > 0 &&
+    decision.confidence >= 0.75 &&
+    (!decision.skippedReason ||
+      isExecutionOnlySkippedReason(decision.skippedReason))
+  );
+}
+
+function calculateRunSignalCounts(decisions: JournalDecision[]) {
+  const candidates = decisions.filter((decision) =>
+    isBuySellSignal(decision.action),
+  );
+  const signalReady = candidates.filter(isSignalReadyDecision);
+  const executed = candidates.filter(
+    (decision) => decision.executed || decision.executionStatus === "executed",
+  );
+  const dryRun = signalReady.filter(isDryRunDecision);
+
+  return {
+    signalReadyCount: signalReady.length,
+    signalBlockedCount: candidates.length - signalReady.length,
+    dryRunCount: dryRun.length,
+    executedCount: executed.length,
+  };
+}
+
 export async function appendAutopilotRun(
   run: Omit<JournalRun, "id">,
 ): Promise<JournalRun> {
@@ -151,10 +236,23 @@ export async function appendAutopilotRun(
       ? createStrategyConfigHash(run.strategyConfig)
       : undefined);
 
+  const signalCounts = calculateRunSignalCounts(run.decisions);
+  const signalReadyCount =
+    run.signalReadyCount ?? signalCounts.signalReadyCount;
+  const signalBlockedCount =
+    run.signalBlockedCount ?? signalCounts.signalBlockedCount;
+  const dryRunCount = run.dryRunCount ?? signalCounts.dryRunCount;
+  const executedCount = run.executedCount ?? signalCounts.executedCount;
+
   const runWithId: JournalRun = {
     ...run,
     id: createRunId(run.timestamp),
     strategyConfigHash,
+    signalReadyCount,
+    signalBlockedCount,
+    dryRunCount,
+    executedCount,
+    actionableCount: run.actionableCount ?? signalReadyCount,
   };
 
   await fs.appendFile(JOURNAL_FILE, `${JSON.stringify(runWithId)}\n`, "utf-8");
@@ -200,6 +298,9 @@ export async function summarizeAutopilotRuns(
     totalRuns: chronologicalRuns.length,
     totalDecisions: 0,
     actionableSignals: 0,
+    signalReadySignals: 0,
+    signalBlockedSignals: 0,
+    dryRunSignals: 0,
     executedSignals: 0,
     byAction: {},
     byTicker: {},
@@ -220,15 +321,25 @@ export async function summarizeAutopilotRuns(
       summary.byReasonType[decision.reasonType] =
         (summary.byReasonType[decision.reasonType] ?? 0) + 1;
 
-      if (decision.action !== "HOLD" && decision.confidence >= 0.75) {
-        summary.actionableSignals += 1;
-      }
+      if (isBuySellSignal(decision.action)) {
+        if (isSignalReadyDecision(decision)) {
+          summary.signalReadySignals += 1;
+        } else {
+          summary.signalBlockedSignals += 1;
+        }
 
-      if (decision.executed) {
-        summary.executedSignals += 1;
+        if (isDryRunDecision(decision)) {
+          summary.dryRunSignals += 1;
+        }
+
+        if (decision.executed || decision.executionStatus === "executed") {
+          summary.executedSignals += 1;
+        }
       }
     }
   }
+
+  summary.actionableSignals = summary.signalReadySignals;
 
   return summary;
 }
