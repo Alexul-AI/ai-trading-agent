@@ -1,3 +1,12 @@
+import { useNowMs } from "../hooks/useNowMs";
+import {
+  formatAge,
+  formatSignalTimestamp,
+  getSignalAgeMs,
+  getSignalTimestampMs,
+  getStaleThresholdMs,
+  isSignalStale,
+} from "../utils/dateTime";
 import type {
   AutopilotDecision,
   AutopilotStatus,
@@ -82,59 +91,98 @@ function formatMoney(value: number): string {
   return `$${value.toFixed(2)}`;
 }
 
-function formatSignalTimestamp(timestamp: string): string {
-  const date = new Date(timestamp);
+function readConfigNumber(
+  config: Record<string, unknown> | undefined,
+  key: string,
+  fallback: number,
+): number {
+  const value = config?.[key];
 
-  if (Number.isNaN(date.getTime())) {
-    return "Invalid timestamp";
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function toBrokerSide(
+  action: AutopilotDecision["action"],
+): "buy" | "sell" | null {
+  if (action === "BUY") return "buy";
+  if (action === "SELL") return "sell";
+
+  return null;
+}
+
+function buildOrderPreviewPlan(
+  decision: AutopilotDecision | null,
+  status: AutopilotStatus,
+  signalIsStale: boolean,
+) {
+  if (!decision) return null;
+
+  const side = toBrokerSide(decision.action);
+  const stopLossPercent = readConfigNumber(
+    status.strategyConfig,
+    "stopLossPercent",
+    0.08,
+  );
+  const takeProfitPercent = readConfigNumber(
+    status.strategyConfig,
+    "takeProfitPercent",
+    0.15,
+  );
+  const stopLoss =
+    decision.action === "BUY"
+      ? Number((decision.price * (1 - stopLossPercent)).toFixed(2))
+      : null;
+  const takeProfit =
+    decision.action === "BUY"
+      ? Number((decision.price * (1 + takeProfitPercent)).toFixed(2))
+      : null;
+
+  const blockedBy: string[] = [];
+
+  if (signalIsStale) blockedBy.push("STALE_SIGNAL");
+  if (status.tradeMode !== "paper") blockedBy.push("NOT_PAPER_MODE");
+  if (!status.executeTrades) blockedBy.push("DRY_RUN");
+  if (decision.action === "BUY" && !status.allowBuy)
+    blockedBy.push("BUY_DISABLED");
+  if (decision.action === "SELL" && !status.allowSell) {
+    blockedBy.push("SELL_DISABLED");
   }
+  if (side === null) blockedBy.push("NOT_BUY_OR_SELL");
+  if (decision.suggestedShares <= 0) blockedBy.push("NO_SHARES");
 
-  return date.toLocaleString();
+  const estimatedNotional = Number(
+    (decision.price * decision.suggestedShares).toFixed(2),
+  );
+
+  return {
+    gate: blockedBy.length === 0 ? "WOULD_SUBMIT_PAPER_ORDER" : "BLOCKED",
+    willSubmit: blockedBy.length === 0,
+    blockedBy,
+    estimatedNotional,
+    safeTradeCall: {
+      function: "executeSafeTrade",
+      ticker: decision.ticker,
+      action: decision.action,
+      requestedShares: decision.suggestedShares,
+      orderType: "market",
+      limitPrice: null,
+      stopLoss,
+      takeProfit,
+    },
+    brokerStylePayload: {
+      symbol: decision.ticker,
+      side,
+      qty: decision.suggestedShares,
+      type: "market",
+      time_in_force: "day",
+      extended_hours: false,
+    },
+  };
 }
 
-function getSignalAgeMs(timestamp: string, nowMs: number): number | null {
-  const signalMs = new Date(timestamp).getTime();
-
-  if (Number.isNaN(signalMs)) {
-    return null;
-  }
-
-  return Math.max(0, nowMs - signalMs);
-}
-
-function formatAge(ageMs: number | null): string {
-  if (ageMs === null) return "Unknown";
-
-  const totalMinutes = Math.floor(ageMs / 60000);
-
-  if (totalMinutes < 1) return "< 1 min";
-
-  const days = Math.floor(totalMinutes / 1440);
-  const hours = Math.floor((totalMinutes % 1440) / 60);
-  const minutes = totalMinutes % 60;
-
-  if (days > 0) {
-    return `${days}d ${hours}h`;
-  }
-
-  if (hours > 0) {
-    return `${hours}h ${minutes}m`;
-  }
-
-  return `${minutes}m`;
-}
-
-function getStaleThresholdMs(intervalMs: number): number {
-  return Math.max(15 * 60 * 1000, intervalMs * 3);
-}
-
-function isSignalStale(ageMs: number | null, thresholdMs: number): boolean {
-  if (ageMs === null) return true;
-
-  return ageMs > thresholdMs;
-}
-
-function isExecutionOnlySkippedReason(skippedReason: string | undefined): boolean {
+function isExecutionOnlySkippedReason(
+  skippedReason: string | undefined,
+): boolean {
   if (!skippedReason) return false;
 
   const reason = skippedReason.toLowerCase();
@@ -211,7 +259,7 @@ function getExecutionPreview(
     };
   }
 
-  if (isSignalStale(signalAgeMs, staleThresholdMs)) {
+  if (signalAgeMs !== null && isSignalStale(signalAgeMs, staleThresholdMs)) {
     return {
       tone: "blocked",
       title: "Stale signal risk",
@@ -301,19 +349,26 @@ export function ExecutionReadinessPanel({
     latestDecisions,
     autopilotStatus.minConfidence,
   );
-  const nowMs = Date.now();
   const staleThresholdMs = getStaleThresholdMs(autopilotStatus.intervalMs);
-  const signalAgeMs = latestSignalReadyDecision
-    ? getSignalAgeMs(latestSignalReadyDecision.timestamp, nowMs)
-    : null;
+  const signalTimestamp = latestSignalReadyDecision?.timestamp ?? null;
+  const signalTimestampMs =
+    signalTimestamp !== null ? getSignalTimestampMs(signalTimestamp) : null;
+  const nowMs = useNowMs(signalTimestamp !== null, 30_000);
+  const signalAgeMs = getSignalAgeMs(signalTimestampMs, nowMs);
   const signalIsStale =
-    latestSignalReadyDecision !== null &&
+    signalTimestamp !== null &&
+    nowMs !== null &&
     isSignalStale(signalAgeMs, staleThresholdMs);
   const executionPreview = getExecutionPreview(
     latestSignalReadyDecision,
     autopilotStatus,
     signalAgeMs,
     staleThresholdMs,
+  );
+  const orderPreviewPlan = buildOrderPreviewPlan(
+    latestSignalReadyDecision,
+    autopilotStatus,
+    signalIsStale,
   );
 
   const telegramWarnings =
@@ -336,9 +391,11 @@ export function ExecutionReadinessPanel({
     {
       label: "Signal freshness",
       value: latestSignalReadyDecision
-        ? signalIsStale
-          ? "Stale"
-          : "Fresh"
+        ? nowMs === null
+          ? "Checking"
+          : signalIsStale
+            ? "Stale"
+            : "Fresh"
         : "No candidate",
       detail: latestSignalReadyDecision
         ? `Signal age is ${formatAge(
@@ -346,9 +403,11 @@ export function ExecutionReadinessPanel({
           )}. Freshness threshold is ${formatAge(staleThresholdMs)}.`
         : "No signal-ready BUY/SELL candidate in the latest run.",
       tone: latestSignalReadyDecision
-        ? signalIsStale
-          ? "blocked"
-          : "ok"
+        ? nowMs === null
+          ? "unknown"
+          : signalIsStale
+            ? "blocked"
+            : "ok"
         : "info",
     },
     {
@@ -406,7 +465,8 @@ export function ExecutionReadinessPanel({
     {
       label: "Min confidence",
       value: autopilotStatus.minConfidence.toFixed(2),
-      detail: "Signal must pass this confidence threshold before execution checks.",
+      detail:
+        "Signal must pass this confidence threshold before execution checks.",
       tone: autopilotStatus.minConfidence >= 0.75 ? "ok" : "warn",
     },
     {
@@ -474,7 +534,9 @@ export function ExecutionReadinessPanel({
         </span>
       </div>
 
-      <div className={`rounded-xl border p-3 mb-4 ${toneClass(executionPreview.tone)}`}>
+      <div
+        className={`rounded-xl border p-3 mb-4 ${toneClass(executionPreview.tone)}`}
+      >
         <div className="text-[10px] font-black uppercase tracking-wider opacity-70">
           Order preview
         </div>
@@ -510,7 +572,9 @@ export function ExecutionReadinessPanel({
               </div>
             </div>
             <div className="rounded-lg bg-slate-950/40 border border-slate-700 p-2 sm:col-span-2">
-              <div className="text-slate-500 font-black uppercase">Signal time</div>
+              <div className="text-slate-500 font-black uppercase">
+                Signal time
+              </div>
               <div className="font-mono font-black text-white">
                 {formatSignalTimestamp(latestSignalReadyDecision.timestamp)}
               </div>
@@ -522,13 +586,75 @@ export function ExecutionReadinessPanel({
               </div>
             </div>
             <div className="rounded-lg bg-slate-950/40 border border-slate-700 p-2">
-              <div className="text-slate-500 font-black uppercase">Freshness</div>
+              <div className="text-slate-500 font-black uppercase">
+                Freshness
+              </div>
               <div
                 className={`font-black ${
                   signalIsStale ? "text-rose-300" : "text-emerald-300"
                 }`}
               >
                 {signalIsStale ? "STALE" : "FRESH"}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {orderPreviewPlan && (
+          <div className="mt-3 rounded-xl border border-slate-700 bg-slate-950/50 p-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">
+                  Execution plan
+                </div>
+                <div className="mt-1 text-sm font-black text-white">
+                  {orderPreviewPlan.gate}
+                </div>
+              </div>
+              <span
+                className={`rounded-full border px-2 py-0.5 text-[9px] font-black ${
+                  orderPreviewPlan.willSubmit
+                    ? "border-amber-400/30 bg-amber-500/20 text-amber-200"
+                    : "border-blue-400/30 bg-blue-500/20 text-blue-200"
+                }`}
+              >
+                {orderPreviewPlan.willSubmit ? "WOULD SUBMIT" : "BLOCKED"}
+              </span>
+            </div>
+
+            <div className="mt-2 text-[10px] leading-relaxed text-slate-400">
+              Estimated notional:{" "}
+              <span className="font-mono font-black text-slate-200">
+                {formatMoney(orderPreviewPlan.estimatedNotional)}
+              </span>
+              {orderPreviewPlan.blockedBy.length > 0 && (
+                <>
+                  {" "}
+                  · blocked by{" "}
+                  <span className="font-mono font-black text-blue-200">
+                    {orderPreviewPlan.blockedBy.join(", ")}
+                  </span>
+                </>
+              )}
+            </div>
+
+            <div className="mt-3 grid grid-cols-1 lg:grid-cols-2 gap-2">
+              <div>
+                <div className="mb-1 text-[9px] font-black uppercase tracking-wider text-slate-500">
+                  Safe trade call
+                </div>
+                <pre className="max-h-52 overflow-auto rounded-lg border border-slate-800 bg-slate-950 p-2 text-[10px] leading-relaxed text-slate-300">
+                  {JSON.stringify(orderPreviewPlan.safeTradeCall, null, 2)}
+                </pre>
+              </div>
+
+              <div>
+                <div className="mb-1 text-[9px] font-black uppercase tracking-wider text-slate-500">
+                  Broker-style payload preview
+                </div>
+                <pre className="max-h-52 overflow-auto rounded-lg border border-slate-800 bg-slate-950 p-2 text-[10px] leading-relaxed text-slate-300">
+                  {JSON.stringify(orderPreviewPlan.brokerStylePayload, null, 2)}
+                </pre>
               </div>
             </div>
           </div>

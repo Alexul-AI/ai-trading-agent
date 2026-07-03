@@ -12,13 +12,6 @@ function toneClass(status: string): string {
   return "border-amber-500/30 bg-amber-500/10 text-amber-100";
 }
 
-function titleForStatus(status: string): string {
-  if (status === "error" || status === "missing") {
-    return "System degraded";
-  }
-
-  return "System warning";
-}
 
 export function SystemHealthBanner({ health }: SystemHealthBannerProps) {
   const warnings = health?.warnings ?? [];
