@@ -4,6 +4,7 @@ import { AutopilotControlCenter } from "./components/AutopilotControlCenter";
 import { AutopilotLogs } from "./components/AutopilotLogs";
 import { ChatTerminal } from "./components/ChatTerminal";
 import { DecisionJournalPanel } from "./components/DecisionJournalPanel";
+import { ExecutionReadinessPanel } from "./components/ExecutionReadinessPanel";
 import { LastAutopilotDecisions } from "./components/LastAutopilotDecisions";
 import { StrategyComparisonPanel } from "./components/StrategyComparisonPanel";
 import { StrategyConfigPanel } from "./components/StrategyConfigPanel";
@@ -973,6 +974,12 @@ export default function App() {
             journalSummary={journalSummary}
             isLoadingJournal={isLoadingJournal}
             onRefresh={refreshAutopilotJournal}
+          />
+
+          <ExecutionReadinessPanel
+            autopilotStatus={autopilotStatus}
+            dashboardHealth={dashboardHealth}
+            latestDecisions={latestDecisions}
           />
 
           <StrategyQualityPanel
