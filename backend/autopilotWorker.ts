@@ -66,6 +66,37 @@ export interface AutopilotWorkerOptions {
   sendTelegramAlert?: (message: string) => Promise<void>;
 }
 
+export type SignalStatus = "hold" | "blocked" | "ready";
+export type ExecutionStatus =
+  | "not_attempted"
+  | "dry_run"
+  | "blocked"
+  | "executed"
+  | "failed";
+
+export type DecisionFinalStatus =
+  | "hold"
+  | "blocked"
+  | "signal_ready"
+  | "executed"
+  | "execution_failed"
+  | "error";
+
+export type BlockReasonCategory =
+  | "confidence"
+  | "position_guard"
+  | "safety_cap"
+  | "quantity"
+  | "error"
+  | "other";
+
+export type ExecutionBlockReasonCategory =
+  | "dry_run"
+  | "trade_mode"
+  | "permission"
+  | "broker"
+  | "other";
+
 export interface AutopilotDecisionLog {
   ticker: string;
   timestamp: string;
@@ -82,6 +113,16 @@ export interface AutopilotDecisionLog {
   reasonType: StrategyDecision["reasonType"];
   reason: string;
   safetyNote?: string;
+  finalStatus?: DecisionFinalStatus;
+  signalStatus?: SignalStatus;
+  executionStatus?: ExecutionStatus;
+  isActionable?: boolean;
+  blockReasonCategory?: BlockReasonCategory;
+  blockReasonCode?: string;
+  blockReasonDetail?: string;
+  executionBlockReasonCategory?: ExecutionBlockReasonCategory;
+  executionBlockReasonCode?: string;
+  executionBlockReasonDetail?: string;
   executed: boolean;
   skippedReason?: string;
   result?: ExecuteSafeTradeResult;
@@ -252,6 +293,10 @@ function appendSafetyNote(
 }
 
 function isActionableDecision(decision: AutopilotDecisionLog): boolean {
+  if (typeof decision.isActionable === "boolean") {
+    return decision.isActionable;
+  }
+
   return (
     decision.action !== "HOLD" &&
     decision.confidence >= AUTOPILOT_MIN_CONFIDENCE &&
@@ -433,10 +478,18 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       reasonType: decision.reasonType,
       reason: decision.reason,
       safetyNote,
+      finalStatus: decision.action === "HOLD" ? "hold" : "blocked",
+      signalStatus: decision.action === "HOLD" ? "hold" : "blocked",
+      executionStatus: "not_attempted",
+      isActionable: false,
       executed: false,
     };
 
     if (decision.action === "HOLD") {
+      log.finalStatus = "hold";
+      log.signalStatus = "hold";
+      log.executionStatus = "not_attempted";
+      log.isActionable = false;
       log.skippedReason = "HOLD decision.";
       return log;
     }
@@ -457,52 +510,103 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       )}. STOP_LOSS can still sell below average entry.`;
 
       log.safetyNote = appendSafetyNote(log.safetyNote, guardNote);
+      log.finalStatus = "blocked";
+      log.signalStatus = "blocked";
+      log.executionStatus = "not_attempted";
+      log.isActionable = false;
+      log.blockReasonCategory = "position_guard";
+      log.blockReasonCode = "SELL_BELOW_AVG_ENTRY";
+      log.blockReasonDetail = guardNote;
       log.skippedReason =
         "Position guard blocked SELL_SIGNAL below average entry.";
       return log;
     }
 
     if (decision.confidence < AUTOPILOT_MIN_CONFIDENCE) {
-      log.skippedReason = `Confidence ${decision.confidence} is below min ${AUTOPILOT_MIN_CONFIDENCE}.`;
-      return log;
-    }
+      const confidenceNote = `Confidence ${decision.confidence} is below min ${AUTOPILOT_MIN_CONFIDENCE}.`;
 
-    if (!AUTOPILOT_EXECUTE_TRADES) {
-      log.skippedReason =
-        "Dry-run mode. Set AUTOPILOT_EXECUTE_TRADES=true to allow paper-trading execution.";
-      return log;
-    }
-
-    if (options.tradeMode !== "paper") {
-      log.skippedReason = "Autopilot execution is blocked outside paper mode.";
-      return log;
-    }
-
-    if (decision.action === "BUY" && !AUTOPILOT_ALLOW_BUY) {
-      log.skippedReason =
-        "BUY execution blocked. Set AUTOPILOT_ALLOW_BUY=true to allow autopilot buys.";
-      return log;
-    }
-
-    if (decision.action === "SELL" && !AUTOPILOT_ALLOW_SELL) {
-      log.skippedReason =
-        "SELL execution blocked. Set AUTOPILOT_ALLOW_SELL=true to allow autopilot sells.";
+      log.finalStatus = "blocked";
+      log.signalStatus = "blocked";
+      log.executionStatus = "not_attempted";
+      log.isActionable = false;
+      log.blockReasonCategory = "confidence";
+      log.blockReasonCode = "CONFIDENCE_BELOW_MIN";
+      log.blockReasonDetail = confidenceNote;
+      log.skippedReason = confidenceNote;
       return log;
     }
 
     if (safeSuggestedShares <= 0) {
+      log.finalStatus = "blocked";
+      log.signalStatus = "blocked";
+      log.executionStatus = "not_attempted";
+      log.isActionable = false;
+      log.blockReasonCategory = "quantity";
+      log.blockReasonCode = "NO_SAFE_QUANTITY";
+      log.blockReasonDetail = "No positive safe share quantity suggested.";
       log.skippedReason = "No positive safe share quantity suggested.";
+      return log;
+    }
+
+    log.finalStatus = "signal_ready";
+    log.signalStatus = "ready";
+    log.executionStatus = "not_attempted";
+    log.isActionable = true;
+
+    if (!AUTOPILOT_EXECUTE_TRADES) {
+      log.executionStatus = "dry_run";
+      log.executionBlockReasonCategory = "dry_run";
+      log.executionBlockReasonCode = "DRY_RUN";
+      log.executionBlockReasonDetail =
+        "Dry-run mode. Set AUTOPILOT_EXECUTE_TRADES=true to allow paper-trading execution.";
+      log.skippedReason = log.executionBlockReasonDetail;
+      return log;
+    }
+
+    if (options.tradeMode !== "paper") {
+      log.executionStatus = "blocked";
+      log.executionBlockReasonCategory = "trade_mode";
+      log.executionBlockReasonCode = "NOT_PAPER_MODE";
+      log.executionBlockReasonDetail =
+        "Autopilot execution is blocked outside paper mode.";
+      log.skippedReason = log.executionBlockReasonDetail;
+      return log;
+    }
+
+    if (decision.action === "BUY" && !AUTOPILOT_ALLOW_BUY) {
+      log.executionStatus = "blocked";
+      log.executionBlockReasonCategory = "permission";
+      log.executionBlockReasonCode = "BUY_DISABLED";
+      log.executionBlockReasonDetail =
+        "BUY execution blocked. Set AUTOPILOT_ALLOW_BUY=true to allow autopilot buys.";
+      log.skippedReason = log.executionBlockReasonDetail;
+      return log;
+    }
+
+    if (decision.action === "SELL" && !AUTOPILOT_ALLOW_SELL) {
+      log.executionStatus = "blocked";
+      log.executionBlockReasonCategory = "permission";
+      log.executionBlockReasonCode = "SELL_DISABLED";
+      log.executionBlockReasonDetail =
+        "SELL execution blocked. Set AUTOPILOT_ALLOW_SELL=true to allow autopilot sells.";
+      log.skippedReason = log.executionBlockReasonDetail;
       return log;
     }
 
     const stopLoss =
       decision.action === "BUY"
-        ? Number((price * (1 - DEFAULT_STRATEGY_CONFIG.stopLossPercent)).toFixed(2))
+        ? Number(
+            (price * (1 - DEFAULT_STRATEGY_CONFIG.stopLossPercent)).toFixed(2),
+          )
         : undefined;
 
     const takeProfit =
       decision.action === "BUY"
-        ? Number((price * (1 + DEFAULT_STRATEGY_CONFIG.takeProfitPercent)).toFixed(2))
+        ? Number(
+            (price * (1 + DEFAULT_STRATEGY_CONFIG.takeProfitPercent)).toFixed(
+              2,
+            ),
+          )
         : undefined;
 
     const result = await options.executeSafeTrade(
@@ -518,13 +622,23 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     log.result = result;
 
     if (result.status === "success") {
+      log.finalStatus = "executed";
+      log.executionStatus = "executed";
       log.executed = true;
 
       if (decision.action === "BUY") {
         lastBuyAtByTicker.set(ticker, Date.now());
       }
     } else {
-      log.skippedReason = result.reason || "Trade execution did not succeed.";
+      const executionFailure =
+        result.reason || "Trade execution did not succeed.";
+
+      log.finalStatus = "execution_failed";
+      log.executionStatus = "failed";
+      log.executionBlockReasonCategory = "broker";
+      log.executionBlockReasonCode = "EXECUTION_FAILED";
+      log.executionBlockReasonDetail = executionFailure;
+      log.skippedReason = executionFailure;
     }
 
     return log;
@@ -627,6 +741,13 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
             suggestedShares: 0,
             reasonType: "NO_SIGNAL",
             reason: `Autopilot analysis failed for ${ticker}: ${message}`,
+            finalStatus: "error",
+            signalStatus: "blocked",
+            executionStatus: "not_attempted",
+            isActionable: false,
+            blockReasonCategory: "error",
+            blockReasonCode: "ANALYSIS_ERROR",
+            blockReasonDetail: message,
             executed: false,
             skippedReason: message,
           };
@@ -656,7 +777,10 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           actionableCount: actionable.length,
           strategyVersion: STRATEGY_VERSION,
           strategyConfigHash: STRATEGY_CONFIG_HASH,
-          strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<string, unknown>,
+          strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<
+            string,
+            unknown
+          >,
           decisions,
         });
 
@@ -749,7 +873,10 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       tradeMode: options.tradeMode,
       strategyVersion: STRATEGY_VERSION,
       strategyConfigHash: STRATEGY_CONFIG_HASH,
-      strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<string, unknown>,
+      strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<
+        string,
+        unknown
+      >,
       running,
       intervalMs: AUTOPILOT_INTERVAL_MS,
       tickers: AUTOPILOT_TICKERS,

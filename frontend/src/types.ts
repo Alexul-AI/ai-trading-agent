@@ -48,6 +48,37 @@ export interface ChatMessage {
   timestamp: string;
 }
 
+export type SignalStatus = "hold" | "blocked" | "ready";
+export type ExecutionStatus =
+  | "not_attempted"
+  | "dry_run"
+  | "blocked"
+  | "executed"
+  | "failed";
+
+export type DecisionFinalStatus =
+  | "hold"
+  | "blocked"
+  | "signal_ready"
+  | "executed"
+  | "execution_failed"
+  | "error";
+
+export type BlockReasonCategory =
+  | "confidence"
+  | "position_guard"
+  | "safety_cap"
+  | "quantity"
+  | "error"
+  | "other";
+
+export type ExecutionBlockReasonCategory =
+  | "dry_run"
+  | "trade_mode"
+  | "permission"
+  | "broker"
+  | "other";
+
 export interface AutopilotDecision {
   ticker: string;
   timestamp: string;
@@ -64,6 +95,16 @@ export interface AutopilotDecision {
   reasonType: ReasonType;
   reason: string;
   safetyNote?: string;
+  finalStatus?: DecisionFinalStatus;
+  signalStatus?: SignalStatus;
+  executionStatus?: ExecutionStatus;
+  isActionable?: boolean;
+  blockReasonCategory?: BlockReasonCategory;
+  blockReasonCode?: string;
+  blockReasonDetail?: string;
+  executionBlockReasonCategory?: ExecutionBlockReasonCategory;
+  executionBlockReasonCode?: string;
+  executionBlockReasonDetail?: string;
   executed: boolean;
   skippedReason?: string;
 }
@@ -167,7 +208,6 @@ export interface SseEvent {
   timestamp?: string;
 }
 
-
 export interface MarketChartPoint {
   date: string;
   open: number;
@@ -188,7 +228,6 @@ export interface MarketChartResponse {
   feed: string;
   points: MarketChartPoint[];
 }
-
 
 export interface DashboardHealthWarning {
   service: string;

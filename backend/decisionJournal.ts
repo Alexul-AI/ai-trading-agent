@@ -2,6 +2,37 @@ import { createHash } from "crypto";
 import { promises as fs } from "fs";
 import path from "path";
 
+export type SignalStatus = "hold" | "blocked" | "ready";
+export type ExecutionStatus =
+  | "not_attempted"
+  | "dry_run"
+  | "blocked"
+  | "executed"
+  | "failed";
+
+export type DecisionFinalStatus =
+  | "hold"
+  | "blocked"
+  | "signal_ready"
+  | "executed"
+  | "execution_failed"
+  | "error";
+
+export type BlockReasonCategory =
+  | "confidence"
+  | "position_guard"
+  | "safety_cap"
+  | "quantity"
+  | "error"
+  | "other";
+
+export type ExecutionBlockReasonCategory =
+  | "dry_run"
+  | "trade_mode"
+  | "permission"
+  | "broker"
+  | "other";
+
 export interface JournalDecision {
   ticker: string;
   timestamp: string;
@@ -18,6 +49,26 @@ export interface JournalDecision {
   reasonType: string;
   reason: string;
   safetyNote?: string;
+
+  /**
+   * Structured decision state.
+   *
+   * Signal status answers: "Was this a real strategy/safety-ready signal?"
+   * Execution status answers: "Was it executed, dry-run skipped, or blocked?"
+   *
+   * This avoids treating DRY-RUN as a bad strategy signal.
+   */
+  finalStatus?: DecisionFinalStatus;
+  signalStatus?: SignalStatus;
+  executionStatus?: ExecutionStatus;
+  isActionable?: boolean;
+  blockReasonCategory?: BlockReasonCategory;
+  blockReasonCode?: string;
+  blockReasonDetail?: string;
+  executionBlockReasonCategory?: ExecutionBlockReasonCategory;
+  executionBlockReasonCode?: string;
+  executionBlockReasonDetail?: string;
+
   executed: boolean;
   skippedReason?: string;
 }

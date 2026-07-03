@@ -9,6 +9,7 @@ import { StrategyConfigPanel } from "./components/StrategyConfigPanel";
 import { StrategyQualityPanel } from "./components/StrategyQualityPanel";
 import { SystemHealthBanner } from "./components/SystemHealthBanner";
 import { TickerChartPanel } from "./components/TickerChartPanel";
+import { ActionableSignalDebugPanel } from "./components/ActionableSignalDebugPanel";
 import type {
   AutopilotRunResponse,
   AutopilotStatus,
@@ -927,6 +928,13 @@ export default function App() {
           />
 
           <StrategyComparisonPanel
+            journalRuns={journalRuns}
+            minConfidence={autopilotStatus.minConfidence}
+            liveStrategyVersion={autopilotStatus.strategyVersion}
+            liveStrategyConfigHash={autopilotStatus.strategyConfigHash}
+          />
+
+          <ActionableSignalDebugPanel
             journalRuns={journalRuns}
             minConfidence={autopilotStatus.minConfidence}
             liveStrategyVersion={autopilotStatus.strategyVersion}
