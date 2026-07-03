@@ -1,5 +1,9 @@
 import { useMemo, useState } from "react";
 import type { AutopilotDecision, JournalRun } from "../types";
+import {
+  isBuySellSignal,
+  isSignalReadyDecision,
+} from "../utils/signalReadiness";
 
 interface StrategyQualityPanelProps {
   journalRuns: JournalRun[];
@@ -10,7 +14,7 @@ type QualityWindow = "LAST_RUN" | "LAST_5" | "LAST_10" | "ALL";
 type StrategyFilter = "LATEST" | "ALL" | string;
 
 type PrimaryOutcome =
-  | "ACTIONABLE"
+  | "SIGNAL_READY"
   | "CONFIDENCE"
   | "POSITION_GUARD"
   | "EXECUTION_POLICY"
@@ -47,7 +51,7 @@ interface TickerQualityStats {
   sell: number;
   hold: number;
   buySellTotal: number;
-  actionable: number;
+  signalReady: number;
   blockedByConfidence: number;
   blockedByPositionGuard: number;
   blockedByExecutionPolicy: number;
@@ -56,63 +60,6 @@ interface TickerQualityStats {
   averageConfidence: number;
   lastDecision: AutopilotDecision | null;
   lastRunAt: string | null;
-}
-
-function isBuySellSignal(action: string): boolean {
-  return action === "BUY" || action === "SELL";
-}
-
-function isExecutionOnlySkippedReason(skippedReason: string | undefined): boolean {
-  if (!skippedReason) return false;
-
-  const reason = skippedReason.toLowerCase();
-
-  return (
-    reason.includes("dry-run") ||
-    reason.includes("dry run") ||
-    reason.includes("execution blocked") ||
-    reason.includes("allow_autopilot") ||
-    reason.includes("allow_buy") ||
-    reason.includes("allow_sell") ||
-    reason.includes("outside paper mode")
-  );
-}
-
-function isSignalReadyDecision(
-  decision: {
-    action: string;
-    confidence: number;
-    suggestedShares: number;
-    skippedReason?: string;
-    signalStatus?: string;
-    isSignalReady?: boolean;
-    isActionable?: boolean;
-  },
-  minConfidence: number,
-): boolean {
-  if (
-    decision.signalStatus === "ready" ||
-    decision.isSignalReady === true ||
-    decision.isActionable === true
-  ) {
-    return true;
-  }
-
-  if (
-    decision.signalStatus === "blocked" ||
-    decision.isSignalReady === false ||
-    decision.isActionable === false
-  ) {
-    return false;
-  }
-
-  return (
-    isBuySellSignal(decision.action) &&
-    decision.suggestedShares > 0 &&
-    decision.confidence >= minConfidence &&
-    (!decision.skippedReason ||
-      isExecutionOnlySkippedReason(decision.skippedReason))
-  );
 }
 
 function includesAny(text: string, patterns: string[]): boolean {
@@ -186,21 +133,11 @@ function hasConfidenceBlock(
 }
 
 function classifyPrimaryOutcome(
-  decision: {
-    action: string;
-    confidence: number;
-    suggestedShares: number;
-    skippedReason?: string;
-    safetyNote?: string;
-    reason?: string;
-    signalStatus?: string;
-    isSignalReady?: boolean;
-    isActionable?: boolean;
-  },
+  decision: AutopilotDecision,
   minConfidence: number,
 ): PrimaryOutcome {
   if (isSignalReadyDecision(decision, minConfidence)) {
-    return "ACTIONABLE";
+    return "SIGNAL_READY";
   }
 
   // Waterfall rule:
@@ -245,7 +182,7 @@ function calculateStats(
         confidenceValues.length;
 
   const signalReadySignals = outcomes.filter(
-    (outcome) => outcome === "ACTIONABLE",
+    (outcome) => outcome === "SIGNAL_READY",
   ).length;
   const blockedByConfidence = outcomes.filter(
     (outcome) => outcome === "CONFIDENCE",
@@ -263,7 +200,8 @@ function calculateStats(
   return {
     totalRuns: journalRuns.length,
     totalDecisions: decisions.length,
-    buySignals: decisions.filter((decision) => decision.action === "BUY").length,
+    buySignals: decisions.filter((decision) => decision.action === "BUY")
+      .length,
     sellSignals: decisions.filter((decision) => decision.action === "SELL")
       .length,
     holdSignals: decisions.filter((decision) => decision.action === "HOLD")
@@ -348,7 +286,7 @@ function calculateTickerStats(
         sell: decisions.filter((decision) => decision.action === "SELL").length,
         hold: decisions.filter((decision) => decision.action === "HOLD").length,
         buySellTotal: buySellDecisions.length,
-        actionable: outcomes.filter((outcome) => outcome === "ACTIONABLE")
+        signalReady: outcomes.filter((outcome) => outcome === "SIGNAL_READY")
           .length,
         blockedByConfidence: outcomes.filter(
           (outcome) => outcome === "CONFIDENCE",
@@ -509,7 +447,8 @@ function getStrategyFilterLabel(
   latestVersion: string | null,
 ): string {
   if (filter === "ALL") return "All strategies";
-  if (filter === "LATEST") return latestVersion ? `Latest: ${latestVersion}` : "Latest";
+  if (filter === "LATEST")
+    return latestVersion ? `Latest: ${latestVersion}` : "Latest";
   return filter;
 }
 
@@ -528,7 +467,9 @@ function filterRunsByStrategy(
 
   if (!versionToUse) return journalRuns;
 
-  return journalRuns.filter((run) => getRunStrategyVersion(run) === versionToUse);
+  return journalRuns.filter(
+    (run) => getRunStrategyVersion(run) === versionToUse,
+  );
 }
 
 function formatCoverageDuration(journalRuns: JournalRun[]): string {
@@ -536,7 +477,9 @@ function formatCoverageDuration(journalRuns: JournalRun[]): string {
   if (journalRuns.length === 1) return "Single run";
 
   const latest = new Date(journalRuns[0]?.timestamp ?? "").getTime();
-  const oldest = new Date(journalRuns[journalRuns.length - 1]?.timestamp ?? "").getTime();
+  const oldest = new Date(
+    journalRuns[journalRuns.length - 1]?.timestamp ?? "",
+  ).getTime();
 
   if (!Number.isFinite(latest) || !Number.isFinite(oldest)) {
     return "Coverage unavailable";
@@ -546,11 +489,13 @@ function formatCoverageDuration(journalRuns: JournalRun[]): string {
   const diffMinutes = Math.round(diffMs / 60000);
 
   if (diffMinutes < 1) return "Covers <1 minute";
-  if (diffMinutes < 60) return `Covers ${diffMinutes} minute${diffMinutes === 1 ? "" : "s"}`;
+  if (diffMinutes < 60)
+    return `Covers ${diffMinutes} minute${diffMinutes === 1 ? "" : "s"}`;
 
   const diffHours = Math.round(diffMinutes / 60);
 
-  if (diffHours < 48) return `Covers ${diffHours} hour${diffHours === 1 ? "" : "s"}`;
+  if (diffHours < 48)
+    return `Covers ${diffHours} hour${diffHours === 1 ? "" : "s"}`;
 
   const diffDays = Math.round(diffHours / 24);
   return `Covers ${diffDays} day${diffDays === 1 ? "" : "s"}`;
@@ -578,8 +523,7 @@ export function StrategyQualityPanel({
   journalRuns,
   minConfidence,
 }: StrategyQualityPanelProps) {
-  const [qualityWindow, setQualityWindow] =
-    useState<QualityWindow>("LAST_10");
+  const [qualityWindow, setQualityWindow] = useState<QualityWindow>("LAST_10");
   const [strategyFilter, setStrategyFilter] =
     useState<StrategyFilter>("LATEST");
 
@@ -593,7 +537,8 @@ export function StrategyQualityPanel({
   );
 
   const strategyFilteredRuns = useMemo(
-    () => filterRunsByStrategy(journalRuns, strategyFilter, latestStrategyVersion),
+    () =>
+      filterRunsByStrategy(journalRuns, strategyFilter, latestStrategyVersion),
     [journalRuns, latestStrategyVersion, strategyFilter],
   );
 
@@ -615,7 +560,7 @@ export function StrategyQualityPanel({
 
   const stats = calculateStats(filteredJournalRuns, minConfidence);
   const tickerStats = calculateTickerStats(filteredJournalRuns, minConfidence);
-  const actionableRatio = qualityRatio(
+  const signalReadyRatio = qualityRatio(
     stats.signalReadySignals,
     stats.buySellTotal,
   );
@@ -625,18 +570,19 @@ export function StrategyQualityPanel({
   );
   const waterfallMatchesTotal = stats.waterfallTotal === stats.buySellTotal;
   const isHoldOnlyWindow =
-    stats.totalDecisions > 0 && stats.buySellTotal === 0 && stats.holdSignals > 0;
+    stats.totalDecisions > 0 &&
+    stats.buySellTotal === 0 &&
+    stats.holdSignals > 0;
 
-  const verdict =
-    isHoldOnlyWindow
-      ? "Latest analysis window is HOLD-only: the strategy filtered out weak BUY/SELL setups."
-      : stats.buySellTotal === 0
-        ? "No BUY/SELL signal history yet."
-        : stats.signalReadySignals === 0
-          ? "Strategy is still observational: signals exist, but none are actionable."
-        : actionableRatio < 20
+  const verdict = isHoldOnlyWindow
+    ? "Latest analysis window is HOLD-only: the strategy filtered out weak BUY/SELL setups."
+    : stats.buySellTotal === 0
+      ? "No BUY/SELL signal history yet."
+      : stats.signalReadySignals === 0
+        ? "Strategy is still observational: signals exist, but none are signal-ready."
+        : signalReadyRatio < 20
           ? "Strategy is conservative: most signals are filtered before execution."
-          : "Strategy is producing actionable candidates. Review them carefully before execution.";
+          : "Strategy is producing signal-ready candidates. Review them carefully before execution.";
 
   return (
     <div className="bg-slate-900/60 rounded-2xl border border-slate-800 p-4">
@@ -673,7 +619,9 @@ export function StrategyQualityPanel({
                   <>
                     {" "}
                     · latest version:{" "}
-                    <span className="text-blue-300">{latestStrategyVersion}</span>
+                    <span className="text-blue-300">
+                      {latestStrategyVersion}
+                    </span>
                   </>
                 )}
               </div>
@@ -706,21 +654,21 @@ export function StrategyQualityPanel({
             </div>
 
             <div className="grid grid-cols-4 gap-1">
-              {(["LAST_RUN", "LAST_5", "LAST_10", "ALL"] as QualityWindow[]).map(
-                (window) => (
-                  <button
-                    key={window}
-                    onClick={() => setQualityWindow(window)}
-                    className={`rounded-lg px-2 py-1 text-[10px] font-black transition-colors ${
-                      qualityWindow === window
-                        ? "bg-blue-600 text-white"
-                        : "bg-slate-900 text-slate-400 hover:bg-slate-800"
-                    }`}
-                  >
-                    {getWindowLabel(window)}
-                  </button>
-                ),
-              )}
+              {(
+                ["LAST_RUN", "LAST_5", "LAST_10", "ALL"] as QualityWindow[]
+              ).map((window) => (
+                <button
+                  key={window}
+                  onClick={() => setQualityWindow(window)}
+                  className={`rounded-lg px-2 py-1 text-[10px] font-black transition-colors ${
+                    qualityWindow === window
+                      ? "bg-blue-600 text-white"
+                      : "bg-slate-900 text-slate-400 hover:bg-slate-800"
+                  }`}
+                >
+                  {getWindowLabel(window)}
+                </button>
+              ))}
             </div>
           </div>
         </div>
@@ -771,8 +719,8 @@ export function StrategyQualityPanel({
           </div>
           <div className="mt-1 text-xs leading-relaxed text-emerald-100">
             This window has {stats.holdSignals} HOLD decisions and no BUY/SELL
-            candidates. That usually means the confluence filter is doing its job:
-            weak setups are watched, not traded.
+            candidates. That usually means the confluence filter is doing its
+            job: weak setups are watched, not traded.
           </div>
         </div>
       )}
@@ -794,11 +742,15 @@ export function StrategyQualityPanel({
         <StatCard
           label="Blocked"
           value={stats.buySellTotal - stats.signalReadySignals}
-          tone={stats.buySellTotal > stats.signalReadySignals ? "warn" : "neutral"}
+          tone={
+            stats.buySellTotal > stats.signalReadySignals ? "warn" : "neutral"
+          }
         />
         <StatCard
           label="Avg conf"
-          value={stats.buySellTotal > 0 ? stats.averageConfidence.toFixed(2) : "N/A"}
+          value={
+            stats.buySellTotal > 0 ? stats.averageConfidence.toFixed(2) : "N/A"
+          }
           tone="info"
         />
       </div>
@@ -810,7 +762,8 @@ export function StrategyQualityPanel({
               Primary outcome waterfall
             </div>
             <div className="text-[9px] text-slate-500">
-              Mutually exclusive. Signal Ready means the strategy signal passed; dry-run execution does not make it blocked.
+              Mutually exclusive. Signal Ready means the strategy signal passed;
+              dry-run execution does not make it blocked.
             </div>
           </div>
           <div
@@ -824,8 +777,8 @@ export function StrategyQualityPanel({
 
         {stats.buySellTotal === 0 ? (
           <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-xs text-slate-400">
-            No BUY/SELL candidates in this window. The waterfall is empty because
-            every ticker ended as HOLD.
+            No BUY/SELL candidates in this window. The waterfall is empty
+            because every ticker ended as HOLD.
           </div>
         ) : (
           <div className="space-y-3">
@@ -874,8 +827,8 @@ export function StrategyQualityPanel({
 
         {stats.buySellTotal === 0 ? (
           <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-xs text-slate-400">
-            No safety modifier flags in this window because there were no BUY/SELL
-            candidates.
+            No safety modifier flags in this window because there were no
+            BUY/SELL candidates.
           </div>
         ) : (
           <div className="space-y-2">
@@ -915,8 +868,8 @@ export function StrategyQualityPanel({
             </div>
           ) : (
             tickerStats.map((ticker) => {
-              const actionablePercent = qualityRatio(
-                ticker.actionable,
+              const signalReadyPercent = qualityRatio(
+                ticker.signalReady,
                 ticker.buySellTotal,
               );
 
@@ -931,13 +884,16 @@ export function StrategyQualityPanel({
                         {ticker.ticker}
                       </div>
                       <div className="mt-1 text-[10px] text-slate-500">
-                        BUY {ticker.buy} · SELL {ticker.sell} · HOLD {ticker.hold}
+                        BUY {ticker.buy} · SELL {ticker.sell} · HOLD{" "}
+                        {ticker.hold}
                       </div>
                     </div>
 
                     <div className="text-right">
                       <div className="text-xs font-black text-blue-300">
-                        {ticker.buySellTotal > 0 ? ticker.averageConfidence.toFixed(2) : "N/A"}
+                        {ticker.buySellTotal > 0
+                          ? ticker.averageConfidence.toFixed(2)
+                          : "N/A"}
                       </div>
                       <div className="text-[9px] text-slate-500 uppercase">
                         avg conf
@@ -959,7 +915,7 @@ export function StrategyQualityPanel({
                         Action
                       </div>
                       <div className="font-mono text-emerald-300">
-                        {ticker.actionable}
+                        {ticker.signalReady}
                       </div>
                     </div>
                     <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-2">
@@ -984,21 +940,22 @@ export function StrategyQualityPanel({
                     <div className="flex items-center justify-between text-[10px] mb-1">
                       <span className="text-slate-500">Signal-ready ratio</span>
                       <span className="text-slate-500 font-mono">
-                        {ticker.actionable} / {ticker.buySellTotal} ·{" "}
-                        {actionablePercent}%
+                        {ticker.signalReady} / {ticker.buySellTotal} ·{" "}
+                        {signalReadyPercent}%
                       </span>
                     </div>
                     <div className="h-1.5 rounded-full bg-slate-800 overflow-hidden">
                       <div
                         className="h-full rounded-full bg-emerald-400"
-                        style={{ width: `${actionablePercent}%` }}
+                        style={{ width: `${signalReadyPercent}%` }}
                       />
                     </div>
                   </div>
 
                   {ticker.buySellTotal === 0 && ticker.hold > 0 && (
                     <div className="mt-2 text-[10px] text-emerald-300">
-                      HOLD-only in this window. No BUY/SELL candidate was emitted.
+                      HOLD-only in this window. No BUY/SELL candidate was
+                      emitted.
                     </div>
                   )}
 
