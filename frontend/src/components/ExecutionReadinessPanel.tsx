@@ -82,9 +82,59 @@ function formatMoney(value: number): string {
   return `$${value.toFixed(2)}`;
 }
 
-function isExecutionOnlySkippedReason(
-  skippedReason: string | undefined,
-): boolean {
+function formatSignalTimestamp(timestamp: string): string {
+  const date = new Date(timestamp);
+
+  if (Number.isNaN(date.getTime())) {
+    return "Invalid timestamp";
+  }
+
+  return date.toLocaleString();
+}
+
+function getSignalAgeMs(timestamp: string, nowMs: number): number | null {
+  const signalMs = new Date(timestamp).getTime();
+
+  if (Number.isNaN(signalMs)) {
+    return null;
+  }
+
+  return Math.max(0, nowMs - signalMs);
+}
+
+function formatAge(ageMs: number | null): string {
+  if (ageMs === null) return "Unknown";
+
+  const totalMinutes = Math.floor(ageMs / 60000);
+
+  if (totalMinutes < 1) return "< 1 min";
+
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+
+  if (days > 0) {
+    return `${days}d ${hours}h`;
+  }
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+
+  return `${minutes}m`;
+}
+
+function getStaleThresholdMs(intervalMs: number): number {
+  return Math.max(15 * 60 * 1000, intervalMs * 3);
+}
+
+function isSignalStale(ageMs: number | null, thresholdMs: number): boolean {
+  if (ageMs === null) return true;
+
+  return ageMs > thresholdMs;
+}
+
+function isExecutionOnlySkippedReason(skippedReason: string | undefined): boolean {
   if (!skippedReason) return false;
 
   const reason = skippedReason.toLowerCase();
@@ -149,6 +199,8 @@ function getLatestSignalReadyDecision(
 function getExecutionPreview(
   decision: AutopilotDecision | null,
   status: AutopilotStatus,
+  signalAgeMs: number | null,
+  staleThresholdMs: number,
 ): { tone: ReadinessTone; title: string; detail: string } {
   if (!decision) {
     return {
@@ -156,6 +208,18 @@ function getExecutionPreview(
       title: "No signal-ready order candidate",
       detail:
         "Latest run has no BUY/SELL signal ready for execution. Nothing would be submitted.",
+    };
+  }
+
+  if (isSignalStale(signalAgeMs, staleThresholdMs)) {
+    return {
+      tone: "blocked",
+      title: "Stale signal risk",
+      detail: `${decision.action} ${decision.suggestedShares} ${
+        decision.ticker
+      } was signal-ready, but the signal age is ${formatAge(
+        signalAgeMs,
+      )}. Rerun Autopilot before enabling execution.`,
     };
   }
 
@@ -237,9 +301,19 @@ export function ExecutionReadinessPanel({
     latestDecisions,
     autopilotStatus.minConfidence,
   );
+  const nowMs = Date.now();
+  const staleThresholdMs = getStaleThresholdMs(autopilotStatus.intervalMs);
+  const signalAgeMs = latestSignalReadyDecision
+    ? getSignalAgeMs(latestSignalReadyDecision.timestamp, nowMs)
+    : null;
+  const signalIsStale =
+    latestSignalReadyDecision !== null &&
+    isSignalStale(signalAgeMs, staleThresholdMs);
   const executionPreview = getExecutionPreview(
     latestSignalReadyDecision,
     autopilotStatus,
+    signalAgeMs,
+    staleThresholdMs,
   );
 
   const telegramWarnings =
@@ -258,6 +332,24 @@ export function ExecutionReadinessPanel({
         ? "Autopilot is allowed to submit orders if all other policies pass."
         : "Autopilot can generate decisions, but will not submit broker orders.",
       tone: autopilotStatus.executeTrades ? "warn" : "safe",
+    },
+    {
+      label: "Signal freshness",
+      value: latestSignalReadyDecision
+        ? signalIsStale
+          ? "Stale"
+          : "Fresh"
+        : "No candidate",
+      detail: latestSignalReadyDecision
+        ? `Signal age is ${formatAge(
+            signalAgeMs,
+          )}. Freshness threshold is ${formatAge(staleThresholdMs)}.`
+        : "No signal-ready BUY/SELL candidate in the latest run.",
+      tone: latestSignalReadyDecision
+        ? signalIsStale
+          ? "blocked"
+          : "ok"
+        : "info",
     },
     {
       label: "Trade mode",
@@ -314,8 +406,7 @@ export function ExecutionReadinessPanel({
     {
       label: "Min confidence",
       value: autopilotStatus.minConfidence.toFixed(2),
-      detail:
-        "Signal must pass this confidence threshold before execution checks.",
+      detail: "Signal must pass this confidence threshold before execution checks.",
       tone: autopilotStatus.minConfidence >= 0.75 ? "ok" : "warn",
     },
     {
@@ -383,9 +474,7 @@ export function ExecutionReadinessPanel({
         </span>
       </div>
 
-      <div
-        className={`rounded-xl border p-3 mb-4 ${toneClass(executionPreview.tone)}`}
-      >
+      <div className={`rounded-xl border p-3 mb-4 ${toneClass(executionPreview.tone)}`}>
         <div className="text-[10px] font-black uppercase tracking-wider opacity-70">
           Order preview
         </div>
@@ -395,7 +484,7 @@ export function ExecutionReadinessPanel({
         </div>
 
         {latestSignalReadyDecision && (
-          <div className="mt-3 grid grid-cols-4 gap-2 text-[10px]">
+          <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2 text-[10px]">
             <div className="rounded-lg bg-slate-950/40 border border-slate-700 p-2">
               <div className="text-slate-500 font-black uppercase">Ticker</div>
               <div className="font-mono font-black text-white">
@@ -418,6 +507,28 @@ export function ExecutionReadinessPanel({
               <div className="text-slate-500 font-black uppercase">Conf</div>
               <div className="font-mono font-black text-white">
                 {latestSignalReadyDecision.confidence.toFixed(2)}
+              </div>
+            </div>
+            <div className="rounded-lg bg-slate-950/40 border border-slate-700 p-2 sm:col-span-2">
+              <div className="text-slate-500 font-black uppercase">Signal time</div>
+              <div className="font-mono font-black text-white">
+                {formatSignalTimestamp(latestSignalReadyDecision.timestamp)}
+              </div>
+            </div>
+            <div className="rounded-lg bg-slate-950/40 border border-slate-700 p-2">
+              <div className="text-slate-500 font-black uppercase">Age</div>
+              <div className="font-mono font-black text-white">
+                {formatAge(signalAgeMs)}
+              </div>
+            </div>
+            <div className="rounded-lg bg-slate-950/40 border border-slate-700 p-2">
+              <div className="text-slate-500 font-black uppercase">Freshness</div>
+              <div
+                className={`font-black ${
+                  signalIsStale ? "text-rose-300" : "text-emerald-300"
+                }`}
+              >
+                {signalIsStale ? "STALE" : "FRESH"}
               </div>
             </div>
           </div>
