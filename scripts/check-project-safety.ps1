@@ -1,6 +1,7 @@
 param(
   [string]$BaseUrl = "http://localhost:3000",
   [switch]$SkipFrontendBuild,
+  [switch]$SkipBackendBuild,
   [switch]$SkipBackendHttpChecks
 )
 
@@ -13,6 +14,7 @@ Write-Host "Base URL: $BaseUrl"
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptPath "..")
 $frontendRoot = Join-Path $repoRoot "frontend"
+$backendRoot = Join-Path $repoRoot "backend"
 
 function Section {
   param([string]$Title)
@@ -57,23 +59,15 @@ function Invoke-JsonGet {
   }
 }
 
-function Invoke-JsonPost {
-  param([string]$Path)
-
-  $uri = "$BaseUrl$Path"
-  try {
-    return Invoke-RestMethod -Uri $uri -Method Post -TimeoutSec 30
-  } catch {
-    Fail "POST $uri failed: $($_.Exception.Message)"
-  }
-}
-
 Section "Required files"
 
 Require-File (Join-Path $frontendRoot "src\utils\signalReadiness.ts")
 Require-File (Join-Path $frontendRoot "src\utils\orderPreview.ts")
 Require-File (Join-Path $frontendRoot "src\utils\dateTime.ts")
 Require-File (Join-Path $frontendRoot "src\hooks\useNowMs.ts")
+Require-File (Join-Path $backendRoot "server.ts")
+Require-File (Join-Path $backendRoot "envHealth.ts")
+Require-File (Join-Path $backendRoot "tsconfig.json")
 Require-File (Join-Path $scriptPath "check-frontend-signal-readiness.ps1")
 Require-File (Join-Path $scriptPath "check-signal-schema.ps1")
 
@@ -101,6 +95,24 @@ if (!$SkipFrontendBuild) {
   Pass "Frontend build passed."
 } else {
   Warn "Skipping frontend build by request."
+}
+
+if (!$SkipBackendBuild) {
+  Section "Backend TypeScript build"
+
+  Push-Location $backendRoot
+  try {
+    npm run build
+    if ($LASTEXITCODE -ne 0) {
+      Fail "Backend build failed."
+    }
+  } finally {
+    Pop-Location
+  }
+
+  Pass "Backend build passed."
+} else {
+  Warn "Skipping backend build by request."
 }
 
 if ($SkipBackendHttpChecks) {

@@ -1,4 +1,20 @@
-import Alpaca from "@alpacahq/alpaca-trade-api";
+﻿import * as AlpacaModule from "@alpacahq/alpaca-trade-api";
+
+interface AlpacaLike {
+  getAccount(): Promise<unknown>;
+}
+
+type AlpacaConstructor = new (config: {
+  keyId: string;
+  secretKey: string;
+  paper: boolean;
+  baseUrl?: string;
+}) => AlpacaLike;
+
+const AlpacaClient = ((AlpacaModule as { default?: unknown; Alpaca?: unknown })
+  .default ??
+  (AlpacaModule as { default?: unknown; Alpaca?: unknown }).Alpaca ??
+  AlpacaModule) as AlpacaConstructor;
 
 export type HealthStatus = "ok" | "missing" | "warning" | "error";
 
@@ -94,12 +110,13 @@ function getAlpacaCredentials() {
   };
 }
 
-async function checkAlpaca(
-  checkConnectivity: boolean,
-): Promise<ServiceHealth> {
+async function checkAlpaca(checkConnectivity: boolean): Promise<ServiceHealth> {
   const credentials = getAlpacaCredentials();
 
-  if (!maskConfigured(credentials.keyId) || !maskConfigured(credentials.secretKey)) {
+  if (
+    !maskConfigured(credentials.keyId) ||
+    !maskConfigured(credentials.secretKey)
+  ) {
     return makeService(
       "alpaca",
       "missing",
@@ -116,7 +133,7 @@ async function checkAlpaca(
   }
 
   try {
-    const alpaca = new Alpaca({
+    const alpaca = new AlpacaClient({
       keyId: credentials.keyId!,
       secretKey: credentials.secretKey!,
       paper: credentials.paper,

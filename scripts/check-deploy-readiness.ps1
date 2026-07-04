@@ -131,6 +131,41 @@ if (Test-Path $serverTsPath) {
   }
 }
 
+Section "Backend admin token safety"
+
+if (Test-Path $serverTsPath) {
+  $serverTs = Get-Content -Path $serverTsPath -Raw
+
+  if (!$serverTs.Contains("ADMIN_API_TOKEN")) {
+    Add-Failure "backend/server.ts does not define ADMIN_API_TOKEN. Protect POST routes before deploy."
+  } else {
+    Pass "ADMIN_API_TOKEN schema/config detected"
+  }
+
+  if (!$serverTs.Contains("function requireAdminToken")) {
+    Add-Failure "backend/server.ts does not define requireAdminToken middleware."
+  } else {
+    Pass "requireAdminToken middleware detected"
+  }
+
+  $protectedRoutes = @(
+    'app.post("/api/autopilot/run-once", requireAdminToken',
+    'app.post("/api/trade", requireAdminToken',
+    'app.post("/api/chat", requireAdminToken',
+    'app.post("/api/autopilot", requireAdminToken'
+  )
+
+  foreach ($route in $protectedRoutes) {
+    if (!$serverTs.Contains($route)) {
+      Add-Failure "Missing admin token protection for route: $route"
+    }
+  }
+
+  if (($protectedRoutes | Where-Object { $serverTs.Contains($_) }).Count -eq $protectedRoutes.Count) {
+    Pass "All expected POST routes are protected by requireAdminToken"
+  }
+}
+
 Section "Git and tracked secret files"
 
 $gitAvailable = Command-Exists "git"
@@ -188,13 +223,19 @@ if (!$gitAvailable) {
         } else {
           Warn ".gitignore does not clearly ignore .env files"
         }
+
+        if ($gitignore.Contains("backend/*.bak-*")) {
+          Pass ".gitignore ignores generated backend backup files"
+        } else {
+          Warn ".gitignore does not ignore generated backend backup files: backend/*.bak-*"
+        }
       } else {
         Warn "Missing .gitignore"
       }
 
       Section "Hardcoded secret scan"
 
-      $secretNamePattern = "(?i)\b(ALPACA_API_KEY|ALPACA_SECRET_KEY|OPENAI_API_KEY|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|JWT_SECRET|DATABASE_URL|PRIVATE_KEY|API_SECRET|ACCESS_TOKEN)\b\s*[:=]\s*['""]?([^'""\s,]+)"
+      $secretNamePattern = "(?i)\b(ALPACA_API_KEY|ALPACA_SECRET_KEY|OPENAI_API_KEY|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|ADMIN_API_TOKEN|JWT_SECRET|DATABASE_URL|PRIVATE_KEY|API_SECRET|ACCESS_TOKEN)\b\s*[:=]\s*['""]?([^'""\s,]+)"
       $skippedFilePattern = "(?i)(^|/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$|(\.safe-template$|\.example$|\.sample$|README|NOTES|docs/)"
 
       foreach ($trackedFile in $trackedFiles) {
@@ -237,10 +278,6 @@ if (!$gitAvailable) {
             }
           }
         }
-      }
-
-      if ($warnings.Count -eq 0) {
-        Pass "No hardcoded secret warnings detected"
       }
     }
   } finally {

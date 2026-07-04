@@ -175,6 +175,8 @@ const envSchema = z.object({
 
   TELEGRAM_BOT_TOKEN: z.string().optional(),
   TELEGRAM_CHAT_ID: z.string().optional(),
+
+  ADMIN_API_TOKEN: z.string().optional(),
 });
 
 const envParse = envSchema.safeParse(process.env);
@@ -251,6 +253,38 @@ app.use(
 );
 
 app.use(express.json({ limit: "1mb" }));
+
+function requireAdminToken(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+) {
+  if (!ENV.ADMIN_API_TOKEN) {
+    if (ENV.TRADE_MODE === "live") {
+      res.status(503).json({
+        error: "Admin token is required in live mode.",
+      });
+      return;
+    }
+
+    next();
+    return;
+  }
+
+  const providedToken =
+    typeof req.headers["x-admin-token"] === "string"
+      ? req.headers["x-admin-token"]
+      : "";
+
+  if (providedToken !== ENV.ADMIN_API_TOKEN) {
+    res.status(401).json({
+      error: "Unauthorized",
+    });
+    return;
+  }
+
+  next();
+}
 
 app.use((req, res, next) => {
   console.log(`[HTTP-IN] ${req.method} ${req.originalUrl}`);
@@ -1131,12 +1165,12 @@ app.get("/api/autopilot/journal/summary", async (req, res) => {
   }
 });
 
-app.post("/api/autopilot/run-once", async (_req, res) => {
+app.post("/api/autopilot/run-once", requireAdminToken, async (_req, res) => {
   const result = await autopilotWorker.runOnce("manual");
   res.json(result);
 });
 
-app.post("/api/trade", async (req, res) => {
+app.post("/api/trade", requireAdminToken, async (req, res) => {
   const tradeSchema = z.object({
     ticker: z.string().trim().min(1),
     action: z.enum(["BUY", "SELL"]),
@@ -1183,7 +1217,7 @@ app.post("/api/trade", async (req, res) => {
   });
 });
 
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", requireAdminToken, async (req, res) => {
   try {
     const chatSchema = z.object({
       message: z.string().min(1),
@@ -1224,7 +1258,7 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-app.post("/api/autopilot", (req, res) => {
+app.post("/api/autopilot", requireAdminToken, (req, res) => {
   const parsed = z.object({ enabled: z.boolean() }).safeParse(req.body);
 
   if (!parsed.success) {
@@ -1252,6 +1286,9 @@ app.listen(ENV.PORT, () => {
   console.log(`[SERVER] Mode: ${ENV.TRADE_MODE}`);
   console.log(`[SERVER] Frontend origin: ${ENV.FRONTEND_ORIGIN}`);
   console.log(
+    `[SERVER] Admin token protection: ${ENV.ADMIN_API_TOKEN ? "enabled" : "disabled"}`,
+  );
+  console.log(
     `[SERVER] Allowed CORS origins: ${allowedCorsOrigins.join(", ")}`,
   );
   console.log("[SERVER] Yahoo Finance: removed");
@@ -1262,4 +1299,3 @@ app.listen(ENV.PORT, () => {
   );
   console.log("");
 });
-
