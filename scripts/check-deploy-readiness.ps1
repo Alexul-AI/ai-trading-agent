@@ -16,6 +16,7 @@ $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptPath "..")
 $frontendRoot = Join-Path $repoRoot "frontend"
 $backendRoot = Join-Path $repoRoot "backend"
+$isCi = ![string]::IsNullOrWhiteSpace($env:CI)
 
 $failures = New-Object System.Collections.Generic.List[string]
 $warnings = New-Object System.Collections.Generic.List[string]
@@ -81,6 +82,7 @@ $requiredFiles = @(
   "frontend\src\utils\orderPreview.ts",
   "frontend\src\utils\dateTime.ts",
   "frontend\src\hooks\useNowMs.ts",
+  "backend\server.ts",
   "scripts\check-project-safety.ps1",
   "scripts\check-frontend-signal-readiness.ps1",
   "scripts\check-signal-schema.ps1"
@@ -93,6 +95,39 @@ foreach ($relativePath in $requiredFiles) {
     Pass "Found $relativePath"
   } else {
     Add-Failure "Missing required file: $relativePath"
+  }
+}
+
+Section "Backend CORS safety"
+
+$serverTsPath = Join-Path $backendRoot "server.ts"
+if (Test-Path $serverTsPath) {
+  $serverTs = Get-Content -Path $serverTsPath -Raw
+
+  if ($serverTs -match 'origin\s*:\s*["'']\*["'']') {
+    Add-Failure "backend/server.ts still allows wildcard CORS origin '*'. Use FRONTEND_ORIGIN allowlist before deploy."
+  } else {
+    Pass "No wildcard CORS middleware origin detected"
+  }
+
+  if ($serverTs -match 'Access-Control-Allow-Origin["'']\s*,\s*["'']\*["'']') {
+    Add-Failure "backend/server.ts still sets wildcard Access-Control-Allow-Origin '*'. SSE/routes must use the allowlist."
+  } else {
+    Pass "No wildcard Access-Control-Allow-Origin header detected"
+  }
+
+  if ($serverTs.Contains("parseCorsOrigins") -and $serverTs.Contains("allowedCorsOrigins")) {
+    Pass "CORS allowlist helper detected"
+  } else {
+    Warn "CORS allowlist helper was not detected. Confirm backend CORS is restricted before deploy."
+  }
+
+  if ($serverTs.Contains('app.get("/api/stream"')) {
+    if ($serverTs.Contains("resolveAllowedCorsOrigin")) {
+      Pass "SSE CORS allowlist helper detected"
+    } else {
+      Warn "SSE route detected, but resolveAllowedCorsOrigin helper was not found."
+    }
   }
 }
 
@@ -186,11 +221,18 @@ if (!$gitAvailable) {
             $keyName = $Matches[1]
             $value = $Matches[2]
 
+            $looksLikeSchemaOrEnvRead =
+              $line -match "\bz\." -or
+              $line -match "process\.env" -or
+              $line -match "\bimport\b" -or
+              $line -match "\btype\b" -or
+              $line -match "\binterface\b"
+
             $looksPlaceholder =
               $value -match "(?i)^(change_me|replace_me|your_|example|placeholder|xxx|false|true|null|undefined|0)$" -or
               $value -match "^<.*>$"
 
-            if (!$looksPlaceholder) {
+            if (!$looksPlaceholder -and !$looksLikeSchemaOrEnvRead) {
               Warn "Possible hardcoded secret assignment found: ${trackedFile}:$($i + 1) key=$keyName. Value not printed."
             }
           }
@@ -217,11 +259,15 @@ $localEnvFiles = @(
   "frontend\.env.local"
 )
 
-foreach ($relativePath in $localEnvFiles) {
-  $path = Join-Path $repoRoot $relativePath
+if ($isCi) {
+  Pass "CI detected via env:CI. Skipping local .env file existence warnings."
+} else {
+  foreach ($relativePath in $localEnvFiles) {
+    $path = Join-Path $repoRoot $relativePath
 
-  if (Test-Path $path) {
-    Warn "Local env file exists: $relativePath. Keep it out of git and deploy via platform secrets."
+    if (Test-Path $path) {
+      Warn "Local env file exists: $relativePath. Keep it out of git and deploy via platform secrets."
+    }
   }
 }
 
@@ -235,11 +281,21 @@ if ($SkipProjectSafetyCheck) {
   if (!(Test-Path $projectSafetyScript)) {
     Add-Failure "Missing scripts/check-project-safety.ps1"
   } else {
-    & $projectSafetyScript -BaseUrl $BaseUrl
-    if ($LASTEXITCODE -ne 0) {
-      Add-Failure "check-project-safety.ps1 failed"
-    } else {
-      Pass "Project safety check passed"
+    try {
+      if ($SkipHttpChecks) {
+        Warn "Running project safety check with backend HTTP checks skipped because -SkipHttpChecks was provided."
+        & $projectSafetyScript -BaseUrl $BaseUrl -SkipBackendHttpChecks
+      } else {
+        & $projectSafetyScript -BaseUrl $BaseUrl
+      }
+
+      if ($LASTEXITCODE -ne 0) {
+        Add-Failure "check-project-safety.ps1 failed"
+      } else {
+        Pass "Project safety check passed"
+      }
+    } catch {
+      Add-Failure "check-project-safety.ps1 failed: $($_.Exception.Message)"
     }
   }
 }

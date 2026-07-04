@@ -1,4 +1,4 @@
-import express, { type Response } from "express";
+﻿import express, { type Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import * as AlpacaModule from "@alpacahq/alpaca-trade-api";
@@ -187,6 +187,25 @@ if (!envParse.success) {
 
 const ENV = envParse.data;
 
+function normalizeCorsOrigin(origin: string): string {
+  return origin.trim().replace(/\/+$/, "");
+}
+
+function parseCorsOrigins(value: string): string[] {
+  return value.split(",").map(normalizeCorsOrigin).filter(Boolean);
+}
+
+function resolveAllowedCorsOrigin(
+  origin: string | undefined,
+  allowedOrigins: string[],
+): string | null {
+  if (!origin) return null;
+
+  const normalizedOrigin = normalizeCorsOrigin(origin);
+
+  return allowedOrigins.includes(normalizedOrigin) ? normalizedOrigin : null;
+}
+
 if (ENV.TRADE_MODE === "live") {
   if (!ENV.APCA_API_KEY_ID_LIVE || !ENV.APCA_API_SECRET_KEY_LIVE) {
     console.error("[ENV] TRADE_MODE=live but live Alpaca keys are missing.");
@@ -198,9 +217,34 @@ const app = express();
 
 app.disable("etag");
 
+const allowedCorsOrigins = parseCorsOrigins(ENV.FRONTEND_ORIGIN);
+
+if (allowedCorsOrigins.length === 0) {
+  console.error("[ENV] FRONTEND_ORIGIN must contain at least one origin.");
+  process.exit(1);
+}
+
 app.use(
   cors({
-    origin: "*",
+    origin(
+      origin: string | undefined,
+      callback: (err: Error | null, allow?: boolean) => void,
+    ) {
+      if (!origin) {
+        callback(null, true);
+        return;
+      }
+
+      const normalizedOrigin = normalizeCorsOrigin(origin);
+
+      if (allowedCorsOrigins.includes(normalizedOrigin)) {
+        callback(null, true);
+        return;
+      }
+
+      console.warn(`[CORS] Blocked origin: ${origin}`);
+      callback(null, false);
+    },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type"],
   }),
@@ -883,7 +927,15 @@ app.get("/api/stream", (req, res) => {
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  const sseAllowedOrigin = resolveAllowedCorsOrigin(
+    typeof req.headers.origin === "string" ? req.headers.origin : undefined,
+    allowedCorsOrigins,
+  );
+
+  if (sseAllowedOrigin) {
+    res.setHeader("Access-Control-Allow-Origin", sseAllowedOrigin);
+    res.setHeader("Vary", "Origin");
+  }
 
   (res as unknown as { flushHeaders?: () => void }).flushHeaders?.();
 
@@ -1199,6 +1251,9 @@ app.listen(ENV.PORT, () => {
   console.log(`[SERVER] URL: http://localhost:${ENV.PORT}`);
   console.log(`[SERVER] Mode: ${ENV.TRADE_MODE}`);
   console.log(`[SERVER] Frontend origin: ${ENV.FRONTEND_ORIGIN}`);
+  console.log(
+    `[SERVER] Allowed CORS origins: ${allowedCorsOrigins.join(", ")}`,
+  );
   console.log("[SERVER] Yahoo Finance: removed");
   console.log(
     `[SERVER] Autopilot: ${autopilotWorker.getStatus().enabled ? "enabled" : "disabled"} / ${
@@ -1207,3 +1262,4 @@ app.listen(ENV.PORT, () => {
   );
   console.log("");
 });
+

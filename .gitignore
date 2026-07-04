@@ -39,3 +39,5 @@ Autopilot output dumps & Journals
 autopilot-run-once.json
 data/
 *.jsonl
+
+backend/*.bak-*
