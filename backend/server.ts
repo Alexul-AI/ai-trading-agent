@@ -1,4 +1,5 @@
-﻿import express, { type Response } from "express";
+﻿import crypto from "node:crypto";
+import express, { type Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import * as AlpacaModule from "@alpacahq/alpaca-trade-api";
@@ -177,6 +178,8 @@ const envSchema = z.object({
   TELEGRAM_CHAT_ID: z.string().optional(),
 
   ADMIN_API_TOKEN: z.string().optional(),
+  ADMIN_PASSWORD: z.string().optional(),
+  ADMIN_SESSION_SECRET: z.string().optional(),
 });
 
 const envParse = envSchema.safeParse(process.env);
@@ -248,17 +251,132 @@ app.use(
       callback(null, false);
     },
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
+    allowedHeaders: ["Content-Type", "x-admin-token"],
+    credentials: true,
   }),
 );
 
 app.use(express.json({ limit: "1mb" }));
+
+const ADMIN_SESSION_COOKIE = "alexul_admin_session";
+const ADMIN_SESSION_TTL_SECONDS = 12 * 60 * 60;
+
+function getCookieValue(req: express.Request, name: string): string | null {
+  const header = req.headers.cookie;
+  if (!header) return null;
+
+  const cookies = header.split(";").map((part) => part.trim());
+
+  for (const cookie of cookies) {
+    const separatorIndex = cookie.indexOf("=");
+    if (separatorIndex <= 0) continue;
+
+    const cookieName = cookie.slice(0, separatorIndex);
+    const cookieValue = cookie.slice(separatorIndex + 1);
+
+    if (cookieName === name) {
+      try {
+        return decodeURIComponent(cookieValue);
+      } catch {
+        return cookieValue;
+      }
+    }
+  }
+
+  return null;
+}
+
+function getAdminSessionSecret(): string | null {
+  return ENV.ADMIN_SESSION_SECRET || ENV.ADMIN_API_TOKEN || null;
+}
+
+function timingSafeEqualString(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+
+  if (leftBuffer.length !== rightBuffer.length) return false;
+
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function signAdminSession(expiresAtMs: number): string {
+  const secret = getAdminSessionSecret();
+
+  if (!secret) {
+    throw new Error("Missing admin session secret.");
+  }
+
+  return crypto
+    .createHmac("sha256", secret)
+    .update(String(expiresAtMs))
+    .digest("hex");
+}
+
+function createAdminSessionToken(): string {
+  const expiresAtMs = Date.now() + ADMIN_SESSION_TTL_SECONDS * 1000;
+  const signature = signAdminSession(expiresAtMs);
+
+  return `${expiresAtMs}.${signature}`;
+}
+
+function isAdminSessionValid(token: string | null): boolean {
+  if (!token) return false;
+
+  const [expiresAtText, signature] = token.split(".");
+  if (!expiresAtText || !signature) return false;
+
+  const expiresAtMs = Number.parseInt(expiresAtText, 10);
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return false;
+
+  const expectedSignature = signAdminSession(expiresAtMs);
+
+  return timingSafeEqualString(signature, expectedSignature);
+}
+
+function hasValidAdminSession(req: express.Request): boolean {
+  return isAdminSessionValid(getCookieValue(req, ADMIN_SESSION_COOKIE));
+}
+
+function getAdminCookieAttributes(req: express.Request): string {
+  const origin =
+    typeof req.headers.origin === "string" ? req.headers.origin : "";
+
+  const requiresCrossSiteCookie =
+    origin.startsWith("https://") && !origin.includes("localhost");
+
+  if (requiresCrossSiteCookie || process.env.NODE_ENV === "production") {
+    return "HttpOnly; Secure; SameSite=None; Path=/";
+  }
+
+  return "HttpOnly; SameSite=Lax; Path=/";
+}
+
+function setAdminSessionCookie(req: express.Request, res: express.Response) {
+  const token = createAdminSessionToken();
+
+  res.setHeader(
+    "Set-Cookie",
+    `${ADMIN_SESSION_COOKIE}=${encodeURIComponent(token)}; Max-Age=${ADMIN_SESSION_TTL_SECONDS}; ${getAdminCookieAttributes(req)}`,
+  );
+}
+
+function clearAdminSessionCookie(req: express.Request, res: express.Response) {
+  res.setHeader(
+    "Set-Cookie",
+    `${ADMIN_SESSION_COOKIE}=; Max-Age=0; ${getAdminCookieAttributes(req)}`,
+  );
+}
 
 function requireAdminToken(
   req: express.Request,
   res: express.Response,
   next: express.NextFunction,
 ) {
+  if (hasValidAdminSession(req)) {
+    next();
+    return;
+  }
+
   if (!ENV.ADMIN_API_TOKEN) {
     if (ENV.TRADE_MODE === "live") {
       res.status(503).json({
@@ -929,6 +1047,51 @@ function createMarketContext(
 }
 
 // -----------------------------------------------------------------------------
+// ADMIN AUTH ROUTES
+// -----------------------------------------------------------------------------
+
+app.get("/api/admin/session", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  res.json({
+    authenticated: hasValidAdminSession(req),
+    loginEnabled: Boolean(ENV.ADMIN_PASSWORD),
+    sessionConfigured: Boolean(getAdminSessionSecret()),
+  });
+});
+
+app.post("/api/admin/login", (req, res) => {
+  const parsed = z.object({ password: z.string().min(1) }).safeParse(req.body);
+
+  if (!parsed.success) {
+    res.status(400).json({
+      error: "Invalid login request",
+      details: parsed.error.flatten(),
+    });
+    return;
+  }
+
+  if (!ENV.ADMIN_PASSWORD || !getAdminSessionSecret()) {
+    res.status(503).json({
+      error: "Admin session login is not configured.",
+    });
+    return;
+  }
+
+  if (!timingSafeEqualString(parsed.data.password, ENV.ADMIN_PASSWORD)) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+
+  setAdminSessionCookie(req, res);
+  res.json({ success: true, authenticated: true });
+});
+
+app.post("/api/admin/logout", (req, res) => {
+  clearAdminSessionCookie(req, res);
+  res.json({ success: true, authenticated: false });
+});
+// -----------------------------------------------------------------------------
 // ROUTES
 // -----------------------------------------------------------------------------
 
@@ -1287,6 +1450,9 @@ app.listen(ENV.PORT, () => {
   console.log(`[SERVER] Frontend origin: ${ENV.FRONTEND_ORIGIN}`);
   console.log(
     `[SERVER] Admin token protection: ${ENV.ADMIN_API_TOKEN ? "enabled" : "disabled"}`,
+  );
+  console.log(
+    `[SERVER] Admin session login: ${ENV.ADMIN_PASSWORD ? "enabled" : "disabled"}`,
   );
   console.log(
     `[SERVER] Allowed CORS origins: ${allowedCorsOrigins.join(", ")}`,

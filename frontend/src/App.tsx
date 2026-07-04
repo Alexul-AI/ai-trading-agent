@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+﻿import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ActionableSignalDebugPanel } from "./components/ActionableSignalDebugPanel";
 import { AutopilotControlCenter } from "./components/AutopilotControlCenter";
 import { AutopilotLogs } from "./components/AutopilotLogs";
@@ -318,10 +318,64 @@ export default function App() {
     refreshDashboard,
   ]);
 
+  async function loginWithPrompt(): Promise<boolean> {
+    const password = window.prompt("Admin password");
+
+    if (!password) {
+      addAutopilotLog("Admin login cancelled.");
+      return false;
+    }
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/admin/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ password }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Admin login failed: ${response.status}`);
+      }
+
+      addAutopilotLog("Admin session established.");
+      return true;
+    } catch (error) {
+      addAutopilotLog(`Admin login failed: ${getErrorMessage(error)}`);
+      return false;
+    }
+  }
+
+  async function fetchWithAdminSession(
+    path: string,
+    init: RequestInit = {},
+  ): Promise<Response> {
+    const requestInit: RequestInit = {
+      ...init,
+      credentials: "include",
+    };
+
+    let response = await fetch(`${API_BASE_URL}${path}`, requestInit);
+
+    if (response.status !== 401) {
+      return response;
+    }
+
+    addAutopilotLog("Admin session required.");
+    const loggedIn = await loginWithPrompt();
+
+    if (!loggedIn) {
+      return response;
+    }
+
+    response = await fetch(`${API_BASE_URL}${path}`, requestInit);
+
+    return response;
+  }
   async function handleAutopilotToggle() {
     const targetState = !autopilotStatus.enabled;
     try {
-      const response = await fetch(`${API_BASE_URL}/api/autopilot`, {
+      const response = await fetchWithAdminSession("/api/autopilot", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: targetState }),
@@ -340,7 +394,7 @@ export default function App() {
   async function handleRunAutopilotOnce() {
     setIsRunningAutopilot(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/api/autopilot/run-once`, {
+      const response = await fetchWithAdminSession("/api/autopilot/run-once", {
         method: "POST",
       });
       if (!response.ok) throw new Error(`Run once failed: ${response.status}`);
@@ -386,7 +440,7 @@ export default function App() {
     setIsWaitingOnAI(true);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/chat`, {
+      const response = await fetchWithAdminSession("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -430,7 +484,7 @@ export default function App() {
     if (!tradeTicker.trim()) return;
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/trade`, {
+      const response = await fetchWithAdminSession("/api/trade", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -466,12 +520,12 @@ export default function App() {
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
       {tradeMode === "live" ? (
         <div className="bg-gradient-to-r from-red-700 via-rose-700 to-red-700 text-white font-black text-center py-2 px-4 shadow-xl flex items-center justify-center gap-3 animate-pulse">
-          WARNING: LIVE TRADING ENVIRONMENT — REAL CAPITAL RISK
+          WARNING: LIVE TRADING ENVIRONMENT â€” REAL CAPITAL RISK
         </div>
       ) : (
         <div className="bg-emerald-950/80 border-b border-emerald-500/30 text-emerald-300 font-medium text-center py-1 px-4 text-xs tracking-wider flex items-center justify-center gap-2">
           <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-          PAPER MODE — ALPACA SIMULATED TRADING
+          PAPER MODE â€” ALPACA SIMULATED TRADING
         </div>
       )}
 
@@ -557,7 +611,7 @@ export default function App() {
               Last Update
             </div>
             <div className="text-slate-300 font-bold">
-              {lastDashboardUpdate ?? "—"}
+              {lastDashboardUpdate ?? "â€”"}
             </div>
           </div>
         </div>
@@ -609,7 +663,8 @@ export default function App() {
                           <div
                             className={`text-[10px] font-bold ${item.isUp ? "text-emerald-400" : "text-rose-400"}`}
                           >
-                            {item.isUp ? "▲" : "▼"} {formatPercent(item.change)}
+                            {item.isUp ? "â–²" : "â–¼"}{" "}
+                            {formatPercent(item.change)}
                           </div>
                         </div>
                       </div>
@@ -835,7 +890,8 @@ export default function App() {
                           <div
                             className={`text-[10px] font-black ${isGain ? "text-emerald-400" : "text-rose-400"}`}
                           >
-                            {isGain ? "▲" : "▼"} {formatMoney(Math.abs(pnl))} (
+                            {isGain ? "â–²" : "â–¼"}{" "}
+                            {formatMoney(Math.abs(pnl))} (
                             {formatPercent(pnlPct)})
                           </div>
                         </div>
