@@ -14,6 +14,10 @@ import {
   formatMoney,
   getErrorMessage,
 } from "../utils";
+import {
+  isBuySellSignal,
+  isSignalReadyDecision,
+} from "../utils/signalReadiness";
 
 interface TickerChartPanelProps {
   apiBaseUrl: string;
@@ -35,6 +39,8 @@ interface ChartSignalMarker {
   reasonType: string;
   executed: boolean;
   skippedReason?: string;
+  signalStatus?: AutopilotDecision["signalStatus"];
+  isSignalReady?: boolean;
   runTimestamp: string;
 }
 
@@ -42,8 +48,8 @@ interface ChartSignalCluster {
   date: string;
   markers: ChartSignalMarker[];
   primaryMarker: ChartSignalMarker;
-  actionableCount: number;
-  skippedCount: number;
+  signalReadyCount: number;
+  signalBlockedCount: number;
   buyCount: number;
   sellCount: number;
 }
@@ -120,26 +126,15 @@ function markerLabel(action: SignalAction): string {
   return "H";
 }
 
-function isActionableMarker(
-  marker: ChartSignalMarker,
-  minConfidence: number,
-): boolean {
-  return (
-    marker.action !== "HOLD" &&
-    marker.confidence >= minConfidence &&
-    !marker.skippedReason
-  );
-}
-
 function getPrimaryMarker(
   markers: ChartSignalMarker[],
   minConfidence: number,
 ): ChartSignalMarker {
   return [...markers].sort((a, b) => {
-    const aActionable = isActionableMarker(a, minConfidence) ? 1 : 0;
-    const bActionable = isActionableMarker(b, minConfidence) ? 1 : 0;
+    const aSignalReady = isSignalReadyDecision(a, minConfidence) ? 1 : 0;
+    const bSignalReady = isSignalReadyDecision(b, minConfidence) ? 1 : 0;
 
-    if (aActionable !== bActionable) return bActionable - aActionable;
+    if (aSignalReady !== bSignalReady) return bSignalReady - aSignalReady;
 
     return b.confidence - a.confidence;
   })[0];
@@ -156,27 +151,15 @@ function summarizeCluster(
     date,
     markers,
     primaryMarker,
-    actionableCount: markers.filter((marker) =>
-      isActionableMarker(marker, minConfidence),
+    signalReadyCount: markers.filter((marker) =>
+      isSignalReadyDecision(marker, minConfidence),
     ).length,
-    skippedCount: markers.filter(
-      (marker) => !isActionableMarker(marker, minConfidence),
+    signalBlockedCount: markers.filter(
+      (marker) => !isSignalReadyDecision(marker, minConfidence),
     ).length,
     buyCount: markers.filter((marker) => marker.action === "BUY").length,
     sellCount: markers.filter((marker) => marker.action === "SELL").length,
   };
-}
-
-function isDecisionActionable(
-  decision: AutopilotDecision,
-  minConfidence: number,
-): boolean {
-  return (
-    decision.action !== "HOLD" &&
-    decision.confidence >= minConfidence &&
-    decision.suggestedShares > 0 &&
-    !decision.skippedReason
-  );
 }
 
 export function TickerChartPanel({
@@ -252,8 +235,8 @@ export function TickerChartPanel({
   const selectedDecision = latestDecisions.find(
     (decision) => decision.ticker === selectedTicker,
   );
-  const selectedDecisionActionable = selectedDecision
-    ? isDecisionActionable(selectedDecision, minConfidence)
+  const selectedDecisionSignalReady = selectedDecision
+    ? isSignalReadyDecision(selectedDecision, minConfidence)
     : false;
   const selectedPosition = positions[selectedTicker];
   const activePoint =
@@ -277,13 +260,15 @@ export function TickerChartPanel({
           reasonType: decision.reasonType,
           executed: decision.executed,
           skippedReason: decision.skippedReason,
+          signalStatus: decision.signalStatus,
+          isSignalReady: decision.isSignalReady,
           runTimestamp: run.timestamp,
         })),
       )
       .filter(
         (marker) =>
           marker.ticker === selectedTicker &&
-          marker.action !== "HOLD" &&
+          isBuySellSignal(marker.action) &&
           chartDates.has(marker.date),
       )
       .sort(
@@ -312,10 +297,10 @@ export function TickerChartPanel({
     return clusters;
   }, [chartSignalMarkers, minConfidence]);
 
-  const totalActionableMarkers = useMemo(
+  const totalSignalReadyMarkers = useMemo(
     () =>
       chartSignalMarkers.filter((marker) =>
-        isActionableMarker(marker, minConfidence),
+        isSignalReadyDecision(marker, minConfidence),
       ).length,
     [chartSignalMarkers, minConfidence],
   );
@@ -459,12 +444,12 @@ export function TickerChartPanel({
               </span>
               <span
                 className={`px-2 py-0.5 rounded-full border text-[10px] font-black ${
-                  selectedDecisionActionable
+                  selectedDecisionSignalReady
                     ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/30"
                     : "bg-slate-800 text-slate-400 border-slate-700"
                 }`}
               >
-                {selectedDecisionActionable ? "ACTIONABLE" : "NOT ACTIONABLE"}
+                {selectedDecisionSignalReady ? "ACTIONABLE" : "NOT ACTIONABLE"}
               </span>
             </div>
 
@@ -654,8 +639,8 @@ export function TickerChartPanel({
                 const marker = cluster.primaryMarker;
                 const x = xForIndex(index);
                 const y = yForValue(point.close);
-                const actionable = cluster.actionableCount > 0;
-                const radius = actionable ? 9 : 7;
+                const signalReady = cluster.signalReadyCount > 0;
+                const radius = signalReady ? 9 : 7;
 
                 return (
                   <g
@@ -668,8 +653,8 @@ export function TickerChartPanel({
                       cx={x}
                       cy={y}
                       r={radius}
-                      strokeWidth={actionable ? 3 : 2}
-                      strokeDasharray={actionable ? undefined : "3 3"}
+                      strokeWidth={signalReady ? 3 : 2}
+                      strokeDasharray={signalReady ? undefined : "3 3"}
                       className={`${markerClass(marker.action)} ${markerStrokeClass(
                         marker.action,
                       )}`}
@@ -737,8 +722,8 @@ export function TickerChartPanel({
             Journal markers
           </div>
           <div className="text-slate-300 font-mono">
-            {chartSignalMarkers.length} BUY/SELL · {totalActionableMarkers}{" "}
-            actionable
+            {chartSignalMarkers.length} BUY/SELL · {totalSignalReadyMarkers}{" "}
+            signal-ready
           </div>
         </div>
 
@@ -751,22 +736,25 @@ export function TickerChartPanel({
                 {hoveredCluster.markers.length === 1 ? "" : "s"}
               </span>
               <span className="text-emerald-300">
-                {hoveredCluster.actionableCount} actionable
+                {hoveredCluster.signalReadyCount} signal-ready
               </span>
               <span className="text-slate-500">
-                {hoveredCluster.skippedCount} skipped
+                {hoveredCluster.signalBlockedCount} skipped
               </span>
             </div>
 
             <div className="space-y-1.5">
               {hoveredCluster.markers.map((marker) => {
-                const actionable = isActionableMarker(marker, minConfidence);
+                const signalReady = isSignalReadyDecision(
+                  marker,
+                  minConfidence,
+                );
 
                 return (
                   <div
                     key={marker.id}
                     className={`rounded-lg border p-2 ${
-                      actionable
+                      signalReady
                         ? "border-emerald-500/30 bg-emerald-500/10"
                         : "border-slate-800 bg-slate-900/70"
                     }`}
@@ -790,10 +778,10 @@ export function TickerChartPanel({
                       </span>
                       <span
                         className={
-                          actionable ? "text-emerald-300" : "text-slate-500"
+                          signalReady ? "text-emerald-300" : "text-slate-500"
                         }
                       >
-                        {actionable ? "actionable" : "skipped"}
+                        {signalReady ? "signalReady" : "skipped"}
                       </span>
                     </div>
                     {marker.skippedReason && (
@@ -809,7 +797,7 @@ export function TickerChartPanel({
         ) : (
           <div className="mt-2 text-[10px] text-slate-500">
             Hover over B/S markers to inspect clustered Autopilot decisions from
-            journal. Dashed markers are skipped / non-actionable signals.
+            journal. Dashed markers are skipped / non-signalReady signals.
           </div>
         )}
       </div>

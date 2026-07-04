@@ -74,6 +74,25 @@ function Test-ForbiddenPattern {
   }
 }
 
+function Test-ForbiddenRegex {
+  param(
+    [string]$Pattern,
+    [string]$Rule
+  )
+
+  foreach ($file in $files) {
+    $matches = Select-String -Path $file.FullName -Pattern $Pattern -ErrorAction SilentlyContinue
+
+    foreach ($match in $matches) {
+      Add-Failure `
+        -File ($file.FullName.Replace("$repoRoot\", "")) `
+        -LineNumber $match.LineNumber `
+        -Rule $Rule `
+        -Line $match.Line.Trim()
+    }
+  }
+}
+
 Write-Host ""
 Write-Host "Checking forbidden legacy schema fields..." -ForegroundColor Cyan
 
@@ -83,15 +102,15 @@ Test-ForbiddenPattern -Pattern "actionableSignals" -Rule "old actionableSignals 
 
 Write-Host "Checking forbidden local readiness helper definitions..." -ForegroundColor Cyan
 
-Test-ForbiddenPattern -Pattern "function isSignalReadyDecision" -Rule "use central isSignalReadyDecision from utils/signalReadiness.ts"
-Test-ForbiddenPattern -Pattern "function isBuySellSignal" -Rule "use central isBuySellSignal from utils/signalReadiness.ts"
-Test-ForbiddenPattern -Pattern "function isExecutionOnlySkippedReason" -Rule "use central isExecutionOnlySkippedReason from utils/signalReadiness.ts"
-Test-ForbiddenPattern -Pattern "function getLatestSignalReadyDecision" -Rule "use central getLatestSignalReadyDecision from utils/signalReadiness.ts"
+Test-ForbiddenRegex -Pattern "\b(function|const)\s+isSignalReadyDecision\b" -Rule "use central isSignalReadyDecision from utils/signalReadiness.ts"
+Test-ForbiddenRegex -Pattern "\b(function|const)\s+isBuySellSignal\b" -Rule "use central isBuySellSignal from utils/signalReadiness.ts"
+Test-ForbiddenRegex -Pattern "\b(function|const)\s+isExecutionOnlySkippedReason\b" -Rule "use central isExecutionOnlySkippedReason from utils/signalReadiness.ts"
+Test-ForbiddenRegex -Pattern "\b(function|const)\s+getLatestSignalReadyDecision\b" -Rule "use central getLatestSignalReadyDecision from utils/signalReadiness.ts"
 
 Write-Host "Checking forbidden local order-preview helper definitions..." -ForegroundColor Cyan
 
-Test-ForbiddenPattern -Pattern "function buildOrderPreviewPlan" -Rule "use central buildOrderPreviewPlan from utils/orderPreview.ts"
-Test-ForbiddenPattern -Pattern "function toBrokerSide" -Rule "use central toBrokerSide through utils/orderPreview.ts"
+Test-ForbiddenRegex -Pattern "\b(function|const)\s+buildOrderPreviewPlan\b" -Rule "use central buildOrderPreviewPlan from utils/orderPreview.ts"
+Test-ForbiddenRegex -Pattern "\b(function|const)\s+toBrokerSide\b" -Rule "use central toBrokerSide through utils/orderPreview.ts"
 
 Write-Host "Checking expected central utility exports..." -ForegroundColor Cyan
 
@@ -134,7 +153,8 @@ $expectedConsumers = @(
   "components\ActionableSignalDebugPanel.tsx",
   "components\StrategyComparisonPanel.tsx",
   "components\StrategyQualityPanel.tsx",
-  "components\DecisionJournalPanel.tsx"
+  "components\DecisionJournalPanel.tsx",
+  "components\TickerChartPanel.tsx"
 )
 
 foreach ($consumer in $expectedConsumers) {
