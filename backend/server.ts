@@ -44,6 +44,7 @@ import {
   toStringValue,
 } from "./src/utils/values.js";
 import { toIsoDate } from "./src/utils/time.js";
+import { extractAlpacaPrice } from "./src/alpaca/price.js";
 
 dotenv.config();
 
@@ -60,26 +61,6 @@ interface DashboardHealthSummary {
 
 const defaultWatchlist = ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"];
 const ALPACA_DATA_FEED = process.env.ALPACA_DATA_FEED || "iex";
-
-function extractAlpacaPrice(value: unknown): number {
-  const record = asRecord(value);
-
-  const possibleFields = [
-    record.Price,
-    record.price,
-    record.p,
-    record.P,
-    record.close,
-    record.c,
-  ];
-
-  for (const field of possibleFields) {
-    const parsed = toNumber(field, 0);
-    if (parsed > 0) return parsed;
-  }
-
-  return 0;
-}
 
 const AlpacaClient = ((AlpacaModule as { default?: unknown; Alpaca?: unknown })
   .default ??
