@@ -6,6 +6,10 @@ import { ChatTerminal } from "./components/ChatTerminal";
 import { DecisionJournalPanel } from "./components/DecisionJournalPanel";
 import { ExecutionReadinessPanel } from "./components/ExecutionReadinessPanel";
 import { LastAutopilotDecisions } from "./components/LastAutopilotDecisions";
+import {
+  MarketClockPanel,
+  type MarketClockData,
+} from "./components/MarketClockPanel";
 import { StrategyComparisonPanel } from "./components/StrategyComparisonPanel";
 import { StrategyConfigPanel } from "./components/StrategyConfigPanel";
 import { StrategyQualityPanel } from "./components/StrategyQualityPanel";
@@ -91,6 +95,8 @@ export default function App() {
   >("connecting");
   const [dashboardHealth, setDashboardHealth] =
     useState<DashboardHealthSummary | null>(null);
+  const [marketClock, setMarketClock] = useState<MarketClockData | null>(null);
+  const [marketClockError, setMarketClockError] = useState<string | null>(null);
   const [isRunningAutopilot, setIsRunningAutopilot] = useState(false);
   const [lastDashboardUpdate, setLastDashboardUpdate] = useState<string | null>(
     null,
@@ -177,6 +183,25 @@ export default function App() {
     }
   }, []);
 
+  const refreshMarketClock = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/market/clock`, {
+        cache: "no-store",
+      });
+
+      if (!response.ok) {
+        throw new Error(`Market clock failed: ${response.status}`);
+      }
+
+      const data = (await response.json()) as MarketClockData;
+      setMarketClock(data);
+      setMarketClockError(null);
+    } catch (error) {
+      setMarketClockError(getErrorMessage(error));
+      console.warn("Market clock refresh failed:", error);
+    }
+  }, []);
+
   const refreshAutopilotJournal = useCallback(async () => {
     setIsLoadingJournal(true);
     try {
@@ -214,6 +239,7 @@ export default function App() {
   useEffect(() => {
     void refreshDashboard();
     void refreshAutopilotJournal();
+    void refreshMarketClock();
 
     const dashboardTimer = window.setInterval(() => {
       void refreshDashboard();
@@ -222,6 +248,10 @@ export default function App() {
     const journalTimer = window.setInterval(() => {
       void refreshAutopilotJournal();
     }, 15000);
+
+    const marketClockTimer = window.setInterval(() => {
+      void refreshMarketClock();
+    }, 30000);
 
     const eventSource = new EventSource(`${API_BASE_URL}/api/stream`);
 
@@ -312,6 +342,7 @@ export default function App() {
     return () => {
       window.clearInterval(dashboardTimer);
       window.clearInterval(journalTimer);
+      window.clearInterval(marketClockTimer);
       eventSource.close();
     };
   }, [
@@ -319,6 +350,7 @@ export default function App() {
     refreshAutopilotJournal,
     refreshAutopilotStatus,
     refreshDashboard,
+    refreshMarketClock,
   ]);
 
   async function loginWithPrompt(): Promise<boolean> {
@@ -529,12 +561,12 @@ export default function App() {
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
       {tradeMode === "live" ? (
         <div className="bg-gradient-to-r from-red-700 via-rose-700 to-red-700 text-white font-black text-center py-2 px-4 shadow-xl flex items-center justify-center gap-3 animate-pulse">
-          WARNING: LIVE TRADING ENVIRONMENT â€” REAL CAPITAL RISK
+          WARNING: LIVE TRADING ENVIRONMENT — REAL CAPITAL RISK
         </div>
       ) : (
         <div className="bg-emerald-950/80 border-b border-emerald-500/30 text-emerald-300 font-medium text-center py-1 px-4 text-xs tracking-wider flex items-center justify-center gap-2">
           <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-          PAPER MODE â€” ALPACA SIMULATED TRADING
+          PAPER MODE — ALPACA SIMULATED TRADING
         </div>
       )}
 
@@ -574,7 +606,7 @@ export default function App() {
           </div>
         </div>
 
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px]">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-[10px]">
           <div className="rounded-xl border border-slate-800 bg-slate-950/50 px-3 py-2">
             <div className="text-slate-500 font-black uppercase">
               Connection
@@ -615,12 +647,14 @@ export default function App() {
               {autopilotStatus.executeTrades ? "ENABLED" : "DRY-RUN"}
             </div>
           </div>
+          <MarketClockPanel clock={marketClock} error={marketClockError} />
+
           <div className="rounded-xl border border-slate-800 bg-slate-950/50 px-3 py-2">
             <div className="text-slate-500 font-black uppercase">
               Last Update
             </div>
             <div className="text-slate-300 font-bold">
-              {lastDashboardUpdate ?? "â€”"}
+              {lastDashboardUpdate ?? "—"}
             </div>
           </div>
         </div>
@@ -672,8 +706,7 @@ export default function App() {
                           <div
                             className={`text-[10px] font-bold ${item.isUp ? "text-emerald-400" : "text-rose-400"}`}
                           >
-                            {item.isUp ? "â–²" : "â–¼"}{" "}
-                            {formatPercent(item.change)}
+                            {item.isUp ? "▲" : "▼"} {formatPercent(item.change)}
                           </div>
                         </div>
                       </div>
@@ -909,8 +942,7 @@ export default function App() {
                           <div
                             className={`text-[10px] font-black ${isGain ? "text-emerald-400" : "text-rose-400"}`}
                           >
-                            {isGain ? "â–²" : "â–¼"}{" "}
-                            {formatMoney(Math.abs(pnl))} (
+                            {isGain ? "▲" : "▼"} {formatMoney(Math.abs(pnl))} (
                             {formatPercent(pnlPct)})
                           </div>
                         </div>

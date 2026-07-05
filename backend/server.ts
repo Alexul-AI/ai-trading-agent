@@ -87,6 +87,28 @@ interface MarketChartResponse {
   points: MarketChartPoint[];
 }
 
+interface AlpacaClockResponse {
+  timestamp: string;
+  is_open: boolean;
+  next_open: string;
+  next_close: string;
+}
+
+interface MarketClockResponse {
+  isOpen: boolean;
+  timestamp: string;
+  nextOpen: string;
+  nextClose: string;
+  nextOpenIsrael: string;
+  nextCloseIsrael: string;
+  countdownMs: number;
+  countdownLabel: string;
+  statusLabel: string;
+  nextEventLabel: string;
+  timezone: "Asia/Jerusalem";
+  source: "alpaca";
+}
+
 interface DashboardHealthWarning {
   service: string;
   status: ServiceHealth["status"];
@@ -529,6 +551,83 @@ async function getOrdersSnapshot() {
       status: toStringValue(o.status),
     };
   });
+}
+
+function formatCountdownDuration(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+
+  if (days > 0) return `${days}d ${hours}h ${minutes}m`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+
+  return `${minutes}m`;
+}
+
+function formatIsraelMarketTime(isoTimestamp: string): string {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Jerusalem",
+    weekday: "short",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(isoTimestamp));
+}
+
+function getAlpacaTradingBaseUrl(): string {
+  return isLiveMode
+    ? "https://api.alpaca.markets"
+    : "https://paper-api.alpaca.markets";
+}
+
+async function fetchAlpacaMarketClock(): Promise<MarketClockResponse> {
+  const keyId = isLiveMode ? ENV.APCA_API_KEY_ID_LIVE! : ENV.APCA_API_KEY_ID;
+  const secretKey = isLiveMode
+    ? ENV.APCA_API_SECRET_KEY_LIVE!
+    : ENV.APCA_API_SECRET_KEY;
+
+  const response = await fetch(`${getAlpacaTradingBaseUrl()}/v2/clock`, {
+    headers: {
+      "APCA-API-KEY-ID": keyId,
+      "APCA-API-SECRET-KEY": secretKey,
+    },
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+
+    throw new Error(
+      `Alpaca market clock failed: HTTP ${response.status} ${body}`,
+    );
+  }
+
+  const clock = (await response.json()) as AlpacaClockResponse;
+  const marketTimestamp = new Date(clock.timestamp);
+  const nextEventTimestamp = new Date(
+    clock.is_open ? clock.next_close : clock.next_open,
+  );
+  const countdownMs = Math.max(
+    0,
+    nextEventTimestamp.getTime() - marketTimestamp.getTime(),
+  );
+
+  return {
+    isOpen: clock.is_open,
+    timestamp: clock.timestamp,
+    nextOpen: clock.next_open,
+    nextClose: clock.next_close,
+    nextOpenIsrael: formatIsraelMarketTime(clock.next_open),
+    nextCloseIsrael: formatIsraelMarketTime(clock.next_close),
+    countdownMs,
+    countdownLabel: formatCountdownDuration(countdownMs),
+    statusLabel: clock.is_open ? "MARKET OPEN" : "MARKET CLOSED",
+    nextEventLabel: clock.is_open ? "Closes in" : "Opens in",
+    timezone: "Asia/Jerusalem",
+    source: "alpaca",
+  };
 }
 
 async function getPreviousCloseFromAlpaca(ticker: string): Promise<number> {
@@ -1265,6 +1364,20 @@ app.get("/api/watchlist", async (_req, res) => {
   } catch (error) {
     console.error("[API] /api/watchlist failed:", error);
     res.status(500).json({ error: "Failed to fetch watchlist" });
+  }
+});
+
+app.get("/api/market/clock", async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  try {
+    res.json(await fetchAlpacaMarketClock());
+  } catch (error) {
+    console.error("[API] /api/market/clock failed:", error);
+    res.status(500).json({
+      error:
+        error instanceof Error ? error.message : "Failed to load market clock",
+    });
   }
 });
 
