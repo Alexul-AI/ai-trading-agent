@@ -45,6 +45,11 @@ import {
 } from "./src/utils/values.js";
 import { toIsoDate } from "./src/utils/time.js";
 import { extractAlpacaPrice } from "./src/alpaca/price.js";
+import {
+  normalizeCorsOrigin,
+  parseCorsOrigins,
+  resolveAllowedCorsOrigin,
+} from "./src/config/cors.js";
 
 dotenv.config();
 
@@ -99,25 +104,6 @@ if (!envParse.success) {
 }
 
 const ENV = envParse.data;
-
-function normalizeCorsOrigin(origin: string): string {
-  return origin.trim().replace(/\/+$/, "");
-}
-
-function parseCorsOrigins(value: string): string[] {
-  return value.split(",").map(normalizeCorsOrigin).filter(Boolean);
-}
-
-function resolveAllowedCorsOrigin(
-  origin: string | undefined,
-  allowedOrigins: string[],
-): string | null {
-  if (!origin) return null;
-
-  const normalizedOrigin = normalizeCorsOrigin(origin);
-
-  return allowedOrigins.includes(normalizedOrigin) ? normalizedOrigin : null;
-}
 
 if (ENV.TRADE_MODE === "live") {
   if (!ENV.APCA_API_KEY_ID_LIVE || !ENV.APCA_API_SECRET_KEY_LIVE) {
