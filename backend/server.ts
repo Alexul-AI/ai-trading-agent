@@ -45,6 +45,7 @@ import {
 } from "./src/market/clockTime.js";
 import { extractAlpacaPrice } from "./src/alpaca/price.js";
 import { buildMarketChartPoints } from "./src/market/chartPoints.js";
+import { calculateDailyChangePercent } from "./src/market/dailyChange.js";
 import {
   normalizeCorsOrigin,
   parseCorsOrigins,
@@ -528,14 +529,6 @@ async function getPreviousCloseFromAlpaca(ticker: string): Promise<number> {
       : sortedBars[sortedBars.length - 1];
 
   return previousBar?.c ?? 0;
-}
-
-function calculateDailyChangePercent(
-  price: number,
-  previousClose: number,
-): number {
-  if (price <= 0 || previousClose <= 0) return 0;
-  return Number((((price - previousClose) / previousClose) * 100).toFixed(2));
 }
 
 async function getWatchlistQuotesFromAlpaca(
