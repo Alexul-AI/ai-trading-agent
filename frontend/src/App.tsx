@@ -44,6 +44,9 @@ const API_BASE_URL =
     ? "http://localhost:3000"
     : "https://ai-trading-agent-i4nr.onrender.com";
 
+const MANUAL_TRADING_ENABLED =
+  import.meta.env.VITE_ALLOW_MANUAL_TRADES === "true";
+
 const EMPTY_PORTFOLIO: Portfolio = {
   balance: 0,
   currency: "USD",
@@ -481,6 +484,12 @@ export default function App() {
 
   async function executeManualTrade(event: React.SyntheticEvent) {
     event.preventDefault();
+
+    if (!MANUAL_TRADING_ENABLED) {
+      alert("Manual trades are disabled by UI safety lock.");
+      return;
+    }
+
     if (!tradeTicker.trim()) return;
 
     try {
@@ -698,6 +707,13 @@ export default function App() {
               />
             </h2>
 
+            {!MANUAL_TRADING_ENABLED && (
+              <div className="mb-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+                Manual order entry is disabled by default. RUN ONCE and journal
+                analysis stay enabled.
+              </div>
+            )}
+
             <form onSubmit={executeManualTrade} className="space-y-3">
               <div className="grid grid-cols-2 gap-2">
                 <button
@@ -792,13 +808,16 @@ export default function App() {
 
               <button
                 type="submit"
-                className={`w-full py-2 rounded-xl font-bold text-xs tracking-wider transition-all ${
+                disabled={!MANUAL_TRADING_ENABLED}
+                className={`w-full py-2 rounded-xl font-bold text-xs tracking-wider transition-all disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-500 ${
                   tradeMode === "live"
                     ? "bg-red-700 hover:bg-red-600 text-white"
                     : "bg-blue-600 hover:bg-blue-500 text-white"
                 }`}
               >
-                SUBMIT {tradeAction}
+                {MANUAL_TRADING_ENABLED
+                  ? `SUBMIT ${tradeAction}`
+                  : "MANUAL TRADING DISABLED"}
               </button>
             </form>
           </div>

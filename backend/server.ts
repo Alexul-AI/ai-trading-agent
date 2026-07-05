@@ -180,6 +180,8 @@ const envSchema = z.object({
   ADMIN_API_TOKEN: z.string().optional(),
   ADMIN_PASSWORD: z.string().optional(),
   ADMIN_SESSION_SECRET: z.string().optional(),
+
+  ALLOW_MANUAL_TRADES: z.enum(["true", "false"]).default("false"),
 });
 
 const envParse = envSchema.safeParse(process.env);
@@ -419,6 +421,10 @@ app.use((req, res, next) => {
 });
 
 const isLiveMode = ENV.TRADE_MODE === "live";
+
+function areManualTradesAllowed(): boolean {
+  return ENV.ALLOW_MANUAL_TRADES === "true";
+}
 
 const alpaca = new AlpacaClient({
   keyId: isLiveMode ? ENV.APCA_API_KEY_ID_LIVE! : ENV.APCA_API_KEY_ID,
@@ -1334,6 +1340,14 @@ app.post("/api/autopilot/run-once", requireAdminToken, async (_req, res) => {
 });
 
 app.post("/api/trade", requireAdminToken, async (req, res) => {
+  if (!areManualTradesAllowed()) {
+    return res.status(403).json({
+      success: false,
+      code: "MANUAL_TRADES_DISABLED",
+      error: "Manual trades are disabled by backend safety policy.",
+    });
+  }
+
   const tradeSchema = z.object({
     ticker: z.string().trim().min(1),
     action: z.enum(["BUY", "SELL"]),
@@ -1453,6 +1467,9 @@ app.listen(ENV.PORT, () => {
   );
   console.log(
     `[SERVER] Admin session login: ${ENV.ADMIN_PASSWORD ? "enabled" : "disabled"}`,
+  );
+  console.log(
+    `[SERVER] Manual trade protection: ${areManualTradesAllowed() ? "manual trades enabled" : "manual trades disabled"}`,
   );
   console.log(
     `[SERVER] Allowed CORS origins: ${allowedCorsOrigins.join(", ")}`,
