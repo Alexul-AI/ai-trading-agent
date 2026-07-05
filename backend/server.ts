@@ -36,6 +36,14 @@ import type {
   MarketClockResponse,
   AlpacaConstructor,
 } from "./src/types/serverTypes.js";
+import {
+  asArray,
+  asRecord,
+  roundOrNull,
+  toNumber,
+  toStringValue,
+} from "./src/utils/values.js";
+import { toIsoDate } from "./src/utils/time.js";
 
 dotenv.config();
 
@@ -52,35 +60,6 @@ interface DashboardHealthSummary {
 
 const defaultWatchlist = ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"];
 const ALPACA_DATA_FEED = process.env.ALPACA_DATA_FEED || "iex";
-
-function toIsoDate(date: Date): string {
-  return date.toISOString().split("T")[0] ?? date.toISOString();
-}
-
-function asRecord(value: unknown): UnknownRecord {
-  return typeof value === "object" && value !== null
-    ? (value as UnknownRecord)
-    : {};
-}
-
-function asArray(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function toNumber(value: unknown, fallback = 0): number {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-
-  if (typeof value === "string") {
-    const parsed = Number.parseFloat(value);
-    return Number.isFinite(parsed) ? parsed : fallback;
-  }
-
-  return fallback;
-}
-
-function toStringValue(value: unknown, fallback = ""): string {
-  return typeof value === "string" ? value : fallback;
-}
 
 function extractAlpacaPrice(value: unknown): number {
   const record = asRecord(value);
@@ -682,17 +661,6 @@ async function getWatchlistQuotesFromAlpaca(
 
   return items;
 }
-function roundOrNull(
-  value: number | null | undefined,
-  digits = 2,
-): number | null {
-  if (value === null || value === undefined || !Number.isFinite(value)) {
-    return null;
-  }
-
-  return Number(value.toFixed(digits));
-}
-
 async function fetchDailyBarsForChart(
   ticker: string,
   days: number,
