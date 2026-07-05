@@ -23,91 +23,21 @@ import {
   calculateMACD,
   calculateRSI,
 } from "./indicators.js";
+import type {
+  UnknownRecord,
+  AlpacaLike,
+  PositionSnapshot,
+  WatchlistItem,
+  AlpacaBar,
+  AlpacaBarsResponse,
+  MarketChartPoint,
+  MarketChartResponse,
+  AlpacaClockResponse,
+  MarketClockResponse,
+  AlpacaConstructor,
+} from "./src/types/serverTypes.js";
 
 dotenv.config();
-
-type UnknownRecord = Record<string, unknown>;
-
-interface AlpacaLike {
-  getAccount(): Promise<unknown>;
-  getPositions(): Promise<unknown>;
-  getOrders(params?: unknown): Promise<unknown>;
-  getLatestTrade(symbol: string): Promise<unknown>;
-  createOrder(payload: unknown): Promise<unknown>;
-}
-
-interface PositionSnapshot {
-  shares: number;
-  avgPrice: number;
-  currentPrice: number;
-  pnl: number;
-  pnlPercent: number;
-}
-
-interface WatchlistItem {
-  ticker: string;
-  name: string;
-  price: number;
-  change: number;
-  isUp: boolean;
-}
-
-interface AlpacaBar {
-  t: string;
-  o: number;
-  h: number;
-  l: number;
-  c: number;
-  v: number;
-}
-
-interface AlpacaBarsResponse {
-  bars?: AlpacaBar[];
-  next_page_token?: string | null;
-}
-
-interface MarketChartPoint {
-  date: string;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-  rsi: number | null;
-  macdHistogram: number | null;
-  bollingerLower: number | null;
-  bollingerMiddle: number | null;
-  bollingerUpper: number | null;
-}
-
-interface MarketChartResponse {
-  ticker: string;
-  days: number;
-  feed: string;
-  points: MarketChartPoint[];
-}
-
-interface AlpacaClockResponse {
-  timestamp: string;
-  is_open: boolean;
-  next_open: string;
-  next_close: string;
-}
-
-interface MarketClockResponse {
-  isOpen: boolean;
-  timestamp: string;
-  nextOpen: string;
-  nextClose: string;
-  nextOpenIsrael: string;
-  nextCloseIsrael: string;
-  countdownMs: number;
-  countdownLabel: string;
-  statusLabel: string;
-  nextEventLabel: string;
-  timezone: "Asia/Jerusalem";
-  source: "alpaca";
-}
 
 interface DashboardHealthWarning {
   service: string;
@@ -119,12 +49,6 @@ interface DashboardHealthSummary {
   ok: boolean;
   warnings: DashboardHealthWarning[];
 }
-
-type AlpacaConstructor = new (config: {
-  keyId: string;
-  secretKey: string;
-  paper: boolean;
-}) => AlpacaLike;
 
 const defaultWatchlist = ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"];
 const ALPACA_DATA_FEED = process.env.ALPACA_DATA_FEED || "iex";
