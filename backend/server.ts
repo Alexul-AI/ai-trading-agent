@@ -13,11 +13,11 @@ import {
   readAutopilotRuns,
   summarizeAutopilotRuns,
 } from "./decisionJournal.js";
+import { buildHealthReport, getSafeErrorMessage } from "./envHealth.js";
 import {
-  buildHealthReport,
-  getSafeErrorMessage,
-  type ServiceHealth,
-} from "./envHealth.js";
+  buildDashboardHealthSummary,
+  safeCall,
+} from "./src/dashboard/health.js";
 import type {
   UnknownRecord,
   AlpacaLike,
@@ -53,17 +53,6 @@ import {
 } from "./src/config/cors.js";
 
 dotenv.config();
-
-interface DashboardHealthWarning {
-  service: string;
-  status: ServiceHealth["status"];
-  message: string;
-}
-
-interface DashboardHealthSummary {
-  ok: boolean;
-  warnings: DashboardHealthWarning[];
-}
 
 const defaultWatchlist = ["NVDA", "AAPL", "TSLA", "MSFT", "AMD"];
 const ALPACA_DATA_FEED = process.env.ALPACA_DATA_FEED || "iex";
@@ -661,53 +650,6 @@ async function fetchDailyBarsForChart(
   return allBars
     .sort((a, b) => new Date(a.t).getTime() - new Date(b.t).getTime())
     .slice(-safeDays);
-}
-
-function toHealthWarning(
-  service: ServiceHealth,
-): DashboardHealthWarning | null {
-  if (service.status === "ok") return null;
-
-  return {
-    service: service.name,
-    status: service.status,
-    message: service.message,
-  };
-}
-
-async function buildDashboardHealthSummary(): Promise<DashboardHealthSummary> {
-  const report = await buildHealthReport({
-    checkAlpacaConnectivity: false,
-    checkOpenAIConnectivity: false,
-  });
-
-  const warnings = report.services
-    .map(toHealthWarning)
-    .filter((warning): warning is DashboardHealthWarning => warning !== null);
-
-  return {
-    ok: warnings.length === 0,
-    warnings,
-  };
-}
-
-async function safeCall<T>(
-  label: string,
-  operation: () => Promise<T>,
-  fallback: T,
-  warnings: DashboardHealthWarning[],
-): Promise<T> {
-  try {
-    return await operation();
-  } catch (error) {
-    warnings.push({
-      service: label,
-      status: "error",
-      message: getSafeErrorMessage(error),
-    });
-
-    return fallback;
-  }
 }
 
 async function getDashboardSnapshot() {
