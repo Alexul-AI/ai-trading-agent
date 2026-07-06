@@ -1,4 +1,4 @@
-﻿import React, { useCallback, useEffect, useRef, useState } from "react";
+﻿import React, { useCallback, useEffect, useState } from "react";
 import { ActionableSignalDebugPanel } from "./components/ActionableSignalDebugPanel";
 import { AutopilotControlCenter } from "./components/AutopilotControlCenter";
 import { AutopilotLogs } from "./components/AutopilotLogs";
@@ -16,8 +16,6 @@ import type {
   AutopilotRunResponse,
   AutopilotStatus,
   AutopilotToggleResponse,
-  ChatMessage,
-  ChatResponse,
   TradeResponse,
 } from "./types";
 import {
@@ -34,6 +32,7 @@ import { useAutopilotJournal } from "./hooks/useAutopilotJournal";
 import { useMarketClock } from "./hooks/useMarketClock";
 import { useDashboardData } from "./hooks/useDashboardData";
 import { useAutopilotStream } from "./hooks/useAutopilotStream";
+import { useChatTerminal } from "./hooks/useChatTerminal";
 import { API_BASE_URL, MANUAL_TRADING_ENABLED } from "./api/client";
 
 const EMPTY_AUTOPILOT_STATUS: AutopilotStatus = {
@@ -76,18 +75,6 @@ export default function App() {
 
   const [isRunningAutopilot, setIsRunningAutopilot] = useState(false);
 
-  const [chatInput, setChatInput] = useState("");
-  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([
-    {
-      id: "1",
-      role: "agent",
-      content:
-        "Alexul-AI is online. Dashboard uses Alpaca as source of truth. Autopilot starts in dry-run mode and will not execute trades unless explicitly enabled on the backend.",
-      timestamp: new Date().toLocaleTimeString(),
-    },
-  ]);
-  const [isWaitingOnAI, setIsWaitingOnAI] = useState(false);
-
   const [tradeTicker, setTradeTicker] = useState("");
   const [tradeAction, setTradeAction] = useState<"BUY" | "SELL">("BUY");
   const [tradeQty, setTradeQty] = useState(1);
@@ -95,8 +82,6 @@ export default function App() {
   const [tradeLimitPrice, setTradeLimitPrice] = useState("");
   const [tradeSL, setTradeSL] = useState("");
   const [tradeTP, setTradeTP] = useState("");
-
-  const chatEndRef = useRef<HTMLDivElement>(null);
 
   const autopilotEnabled = autopilotStatus.enabled;
   const latestDecisions = autopilotStatus.lastDecisions;
@@ -123,6 +108,15 @@ export default function App() {
 
   const fetchWithAdminSession = useAdminSessionFetch(addAutopilotLog);
 
+  const {
+    chatInput,
+    chatHistory,
+    isWaitingOnAI,
+    chatEndRef,
+    setChatInput,
+    handleSendMessage,
+  } = useChatTerminal(fetchWithAdminSession);
+
   const refreshAutopilotStatus = useCallback(async () => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/autopilot/status`, {
@@ -136,10 +130,6 @@ export default function App() {
       console.warn("Autopilot status refresh failed:", error);
     }
   }, []);
-
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chatHistory]);
 
   useAutopilotStream({
     addAutopilotLog,
@@ -224,61 +214,6 @@ export default function App() {
       addAutopilotLog(`Manual run failed: ${getErrorMessage(error)}`);
     } finally {
       setIsRunningAutopilot(false);
-    }
-  }
-
-  async function handleSendMessage(event: React.SyntheticEvent) {
-    event.preventDefault();
-    if (!chatInput.trim() || isWaitingOnAI) return;
-
-    const userMsg: ChatMessage = {
-      id: Date.now().toString(),
-      role: "user",
-      content: chatInput,
-      timestamp: new Date().toLocaleTimeString(),
-    };
-
-    setChatHistory((prev) => [...prev, userMsg]);
-    setChatInput("");
-    setIsWaitingOnAI(true);
-
-    try {
-      const response = await fetchWithAdminSession("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: userMsg.content,
-          history: chatHistory.map((msg) => ({
-            role: msg.role,
-            content: msg.content,
-          })),
-        }),
-      });
-
-      if (!response.ok) throw new Error(`Chat failed: ${response.status}`);
-      const data = (await response.json()) as ChatResponse;
-
-      setChatHistory((prev) => [
-        ...prev,
-        {
-          id: (Date.now() + 1).toString(),
-          role: "agent",
-          content: data.reply || "Processing complete.",
-          timestamp: new Date().toLocaleTimeString(),
-        },
-      ]);
-    } catch (error) {
-      setChatHistory((prev) => [
-        ...prev,
-        {
-          id: Date.now().toString(),
-          role: "agent",
-          content: `API connection error: ${getErrorMessage(error)}`,
-          timestamp: new Date().toLocaleTimeString(),
-        },
-      ]);
-    } finally {
-      setIsWaitingOnAI(false);
     }
   }
 
