@@ -42,14 +42,12 @@ import {
   getErrorMessage,
 } from "./utils";
 import { isSignalReadyDecision } from "./utils/signalReadiness";
-
-const API_BASE_URL =
-  window.location.hostname === "localhost"
-    ? "http://localhost:3000"
-    : "https://ai-trading-agent-i4nr.onrender.com";
-
-const MANUAL_TRADING_ENABLED =
-  import.meta.env.VITE_ALLOW_MANUAL_TRADES === "true";
+import {
+  API_BASE_URL,
+  MANUAL_TRADING_ENABLED,
+  fetchWithAdminCredentials,
+  loginAdmin,
+} from "./api/client";
 
 const EMPTY_PORTFOLIO: Portfolio = {
   balance: 0,
@@ -362,16 +360,7 @@ export default function App() {
     }
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/admin/login`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ password }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Admin login failed: ${response.status}`);
-      }
+      await loginAdmin(password);
 
       addAutopilotLog("Admin session established.");
       return true;
@@ -385,12 +374,7 @@ export default function App() {
     path: string,
     init: RequestInit = {},
   ): Promise<Response> {
-    const requestInit: RequestInit = {
-      ...init,
-      credentials: "include",
-    };
-
-    let response = await fetch(`${API_BASE_URL}${path}`, requestInit);
+    let response = await fetchWithAdminCredentials(path, init);
 
     if (response.status !== 401) {
       return response;
@@ -403,7 +387,7 @@ export default function App() {
       return response;
     }
 
-    response = await fetch(`${API_BASE_URL}${path}`, requestInit);
+    response = await fetchWithAdminCredentials(path, init);
 
     return response;
   }
