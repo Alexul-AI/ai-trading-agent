@@ -40,4 +40,4 @@ autopilot-run-once.json
 data/
 *.jsonl
 
-backend/*.bak-*
+backend/*.bak-*diagnostics/
