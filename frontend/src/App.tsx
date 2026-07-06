@@ -42,12 +42,8 @@ import {
   getErrorMessage,
 } from "./utils";
 import { isSignalReadyDecision } from "./utils/signalReadiness";
-import {
-  API_BASE_URL,
-  MANUAL_TRADING_ENABLED,
-  fetchWithAdminCredentials,
-  loginAdmin,
-} from "./api/client";
+import { useAdminSessionFetch } from "./hooks/useAdminSessionFetch";
+import { API_BASE_URL, MANUAL_TRADING_ENABLED } from "./api/client";
 
 const EMPTY_PORTFOLIO: Portfolio = {
   balance: 0,
@@ -133,6 +129,8 @@ export default function App() {
       [`[${new Date().toLocaleTimeString()}] ${message}`, ...prev].slice(0, 80),
     );
   }, []);
+
+  const fetchWithAdminSession = useAdminSessionFetch(addAutopilotLog);
 
   const applyDashboardData = useCallback((data: DashboardResponse) => {
     if (data.health) setDashboardHealth(data.health);
@@ -351,46 +349,6 @@ export default function App() {
     refreshMarketClock,
   ]);
 
-  async function loginWithPrompt(): Promise<boolean> {
-    const password = window.prompt("Admin password");
-
-    if (!password) {
-      addAutopilotLog("Admin login cancelled.");
-      return false;
-    }
-
-    try {
-      await loginAdmin(password);
-
-      addAutopilotLog("Admin session established.");
-      return true;
-    } catch (error) {
-      addAutopilotLog(`Admin login failed: ${getErrorMessage(error)}`);
-      return false;
-    }
-  }
-
-  async function fetchWithAdminSession(
-    path: string,
-    init: RequestInit = {},
-  ): Promise<Response> {
-    let response = await fetchWithAdminCredentials(path, init);
-
-    if (response.status !== 401) {
-      return response;
-    }
-
-    addAutopilotLog("Admin session required.");
-    const loggedIn = await loginWithPrompt();
-
-    if (!loggedIn) {
-      return response;
-    }
-
-    response = await fetchWithAdminCredentials(path, init);
-
-    return response;
-  }
   async function handleAutopilotToggle() {
     const targetState = !autopilotStatus.enabled;
     try {
