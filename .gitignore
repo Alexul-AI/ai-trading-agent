@@ -41,3 +41,5 @@ data/
 *.jsonl
 
 backend/*.bak-*diagnostics/
+diagnostics/
+code-snapshots/
