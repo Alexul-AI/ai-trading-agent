@@ -1,5 +1,4 @@
-﻿import crypto from "node:crypto";
-import express, { type Response } from "express";
+﻿import express, { type Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import * as AlpacaModule from "@alpacahq/alpaca-trade-api";
@@ -8,6 +7,7 @@ import { z } from "zod";
 import { runTradingAgentStep } from "./agent.js";
 import { evaluateTrade, type AccountState } from "./riskManager.js";
 import { createAutopilotWorker } from "./autopilotWorker.js";
+import { createAdminAuth } from "./src/auth/adminAuth.js";
 import {
   getAutopilotJournalPath,
   readAutopilotRuns,
@@ -142,151 +142,22 @@ app.use(
 
 app.use(express.json({ limit: "1mb" }));
 
-const ADMIN_SESSION_COOKIE = "alexul_admin_session";
-const ADMIN_SESSION_TTL_SECONDS = 12 * 60 * 60;
+const adminAuth = createAdminAuth({
+  adminApiToken: ENV.ADMIN_API_TOKEN,
+  adminPassword: ENV.ADMIN_PASSWORD,
+  adminSessionSecret: ENV.ADMIN_SESSION_SECRET,
+  tradeMode: ENV.TRADE_MODE,
+  nodeEnv: process.env.NODE_ENV,
+});
 
-function getCookieValue(req: express.Request, name: string): string | null {
-  const header = req.headers.cookie;
-  if (!header) return null;
-
-  const cookies = header.split(";").map((part) => part.trim());
-
-  for (const cookie of cookies) {
-    const separatorIndex = cookie.indexOf("=");
-    if (separatorIndex <= 0) continue;
-
-    const cookieName = cookie.slice(0, separatorIndex);
-    const cookieValue = cookie.slice(separatorIndex + 1);
-
-    if (cookieName === name) {
-      try {
-        return decodeURIComponent(cookieValue);
-      } catch {
-        return cookieValue;
-      }
-    }
-  }
-
-  return null;
-}
-
-function getAdminSessionSecret(): string | null {
-  return ENV.ADMIN_SESSION_SECRET || ENV.ADMIN_API_TOKEN || null;
-}
-
-function timingSafeEqualString(left: string, right: string): boolean {
-  const leftBuffer = Buffer.from(left);
-  const rightBuffer = Buffer.from(right);
-
-  if (leftBuffer.length !== rightBuffer.length) return false;
-
-  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
-}
-
-function signAdminSession(expiresAtMs: number): string {
-  const secret = getAdminSessionSecret();
-
-  if (!secret) {
-    throw new Error("Missing admin session secret.");
-  }
-
-  return crypto
-    .createHmac("sha256", secret)
-    .update(String(expiresAtMs))
-    .digest("hex");
-}
-
-function createAdminSessionToken(): string {
-  const expiresAtMs = Date.now() + ADMIN_SESSION_TTL_SECONDS * 1000;
-  const signature = signAdminSession(expiresAtMs);
-
-  return `${expiresAtMs}.${signature}`;
-}
-
-function isAdminSessionValid(token: string | null): boolean {
-  if (!token) return false;
-
-  const [expiresAtText, signature] = token.split(".");
-  if (!expiresAtText || !signature) return false;
-
-  const expiresAtMs = Number.parseInt(expiresAtText, 10);
-  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return false;
-
-  const expectedSignature = signAdminSession(expiresAtMs);
-
-  return timingSafeEqualString(signature, expectedSignature);
-}
-
-function hasValidAdminSession(req: express.Request): boolean {
-  return isAdminSessionValid(getCookieValue(req, ADMIN_SESSION_COOKIE));
-}
-
-function getAdminCookieAttributes(req: express.Request): string {
-  const origin =
-    typeof req.headers.origin === "string" ? req.headers.origin : "";
-
-  const requiresCrossSiteCookie =
-    origin.startsWith("https://") && !origin.includes("localhost");
-
-  if (requiresCrossSiteCookie || process.env.NODE_ENV === "production") {
-    return "HttpOnly; Secure; SameSite=None; Path=/";
-  }
-
-  return "HttpOnly; SameSite=Lax; Path=/";
-}
-
-function setAdminSessionCookie(req: express.Request, res: express.Response) {
-  const token = createAdminSessionToken();
-
-  res.setHeader(
-    "Set-Cookie",
-    `${ADMIN_SESSION_COOKIE}=${encodeURIComponent(token)}; Max-Age=${ADMIN_SESSION_TTL_SECONDS}; ${getAdminCookieAttributes(req)}`,
-  );
-}
-
-function clearAdminSessionCookie(req: express.Request, res: express.Response) {
-  res.setHeader(
-    "Set-Cookie",
-    `${ADMIN_SESSION_COOKIE}=; Max-Age=0; ${getAdminCookieAttributes(req)}`,
-  );
-}
-
-function requireAdminToken(
-  req: express.Request,
-  res: express.Response,
-  next: express.NextFunction,
-) {
-  if (hasValidAdminSession(req)) {
-    next();
-    return;
-  }
-
-  if (!ENV.ADMIN_API_TOKEN) {
-    if (ENV.TRADE_MODE === "live") {
-      res.status(503).json({
-        error: "Admin token is required in live mode.",
-      });
-      return;
-    }
-
-    next();
-    return;
-  }
-
-  const providedToken =
-    typeof req.headers["x-admin-token"] === "string"
-      ? req.headers["x-admin-token"]
-      : "";
-
-  if (providedToken !== ENV.ADMIN_API_TOKEN) {
-    res.status(401).json({
-      error: "Unauthorized",
-    });
-    return;
-  }
-
-  next();
-}
+const {
+  getAdminSessionSecret,
+  timingSafeEqualString,
+  hasValidAdminSession,
+  setAdminSessionCookie,
+  clearAdminSessionCookie,
+  requireAdminToken,
+} = adminAuth;
 
 app.use((req, res, next) => {
   console.log(`[HTTP-IN] ${req.method} ${req.originalUrl}`);
