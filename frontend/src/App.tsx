@@ -23,9 +23,6 @@ import type {
   ChatResponse,
   DashboardHealthSummary,
   DashboardResponse,
-  JournalResponse,
-  JournalRun,
-  JournalSummary,
   Order,
   Portfolio,
   SseEvent,
@@ -43,6 +40,7 @@ import {
 } from "./utils";
 import { isSignalReadyDecision } from "./utils/signalReadiness";
 import { useAdminSessionFetch } from "./hooks/useAdminSessionFetch";
+import { useAutopilotJournal } from "./hooks/useAutopilotJournal";
 import { API_BASE_URL, MANUAL_TRADING_ENABLED } from "./api/client";
 
 const EMPTY_PORTFOLIO: Portfolio = {
@@ -77,12 +75,7 @@ export default function App() {
   const [autopilotStatus, setAutopilotStatus] = useState<AutopilotStatus>(
     EMPTY_AUTOPILOT_STATUS,
   );
-  const [journalRuns, setJournalRuns] = useState<JournalRun[]>([]);
-  const [journalSummary, setJournalSummary] = useState<JournalSummary | null>(
-    null,
-  );
-  const [journalFile, setJournalFile] = useState<string>("");
-  const [isLoadingJournal, setIsLoadingJournal] = useState(false);
+
   const [autopilotLogs, setAutopilotLogs] = useState<string[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<
     "connecting" | "connected" | "error"
@@ -129,6 +122,14 @@ export default function App() {
       [`[${new Date().toLocaleTimeString()}] ${message}`, ...prev].slice(0, 80),
     );
   }, []);
+
+  const {
+    journalRuns,
+    journalSummary,
+    journalFile,
+    isLoadingJournal,
+    refreshAutopilotJournal,
+  } = useAutopilotJournal(addAutopilotLog);
 
   const fetchWithAdminSession = useAdminSessionFetch(addAutopilotLog);
 
@@ -197,36 +198,6 @@ export default function App() {
       console.warn("Market clock refresh failed:", error);
     }
   }, []);
-
-  const refreshAutopilotJournal = useCallback(async () => {
-    setIsLoadingJournal(true);
-    try {
-      const [journalResponse, summaryResponse] = await Promise.all([
-        fetch(`${API_BASE_URL}/api/autopilot/journal?limit=20`, {
-          cache: "no-store",
-        }),
-        fetch(`${API_BASE_URL}/api/autopilot/journal/summary?limit=200`, {
-          cache: "no-store",
-        }),
-      ]);
-      if (!journalResponse.ok)
-        throw new Error(`Journal request failed: ${journalResponse.status}`);
-      if (!summaryResponse.ok)
-        throw new Error(`Journal summary failed: ${summaryResponse.status}`);
-
-      const journal = (await journalResponse.json()) as JournalResponse;
-      const summary = (await summaryResponse.json()) as JournalSummary;
-
-      setJournalRuns(journal.runs);
-      setJournalFile(journal.file);
-      setJournalSummary(summary);
-    } catch (error) {
-      addAutopilotLog(`Journal refresh failed: ${getErrorMessage(error)}`);
-      console.warn("Autopilot journal refresh failed:", error);
-    } finally {
-      setIsLoadingJournal(false);
-    }
-  }, [addAutopilotLog]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
