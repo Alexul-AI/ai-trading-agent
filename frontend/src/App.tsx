@@ -6,10 +6,7 @@ import { ChatTerminal } from "./components/ChatTerminal";
 import { DecisionJournalPanel } from "./components/DecisionJournalPanel";
 import { ExecutionReadinessPanel } from "./components/ExecutionReadinessPanel";
 import { LastAutopilotDecisions } from "./components/LastAutopilotDecisions";
-import {
-  MarketClockPanel,
-  type MarketClockData,
-} from "./components/MarketClockPanel";
+import { MarketClockPanel } from "./components/MarketClockPanel";
 import { StrategyComparisonPanel } from "./components/StrategyComparisonPanel";
 import { StrategyConfigPanel } from "./components/StrategyConfigPanel";
 import { StrategyQualityPanel } from "./components/StrategyQualityPanel";
@@ -41,6 +38,7 @@ import {
 import { isSignalReadyDecision } from "./utils/signalReadiness";
 import { useAdminSessionFetch } from "./hooks/useAdminSessionFetch";
 import { useAutopilotJournal } from "./hooks/useAutopilotJournal";
+import { useMarketClock } from "./hooks/useMarketClock";
 import { API_BASE_URL, MANUAL_TRADING_ENABLED } from "./api/client";
 
 const EMPTY_PORTFOLIO: Portfolio = {
@@ -82,8 +80,7 @@ export default function App() {
   >("connecting");
   const [dashboardHealth, setDashboardHealth] =
     useState<DashboardHealthSummary | null>(null);
-  const [marketClock, setMarketClock] = useState<MarketClockData | null>(null);
-  const [marketClockError, setMarketClockError] = useState<string | null>(null);
+
   const [isRunningAutopilot, setIsRunningAutopilot] = useState(false);
   const [lastDashboardUpdate, setLastDashboardUpdate] = useState<string | null>(
     null,
@@ -131,6 +128,9 @@ export default function App() {
     refreshAutopilotJournal,
   } = useAutopilotJournal(addAutopilotLog);
 
+  const { marketClock, marketClockError, refreshMarketClock } =
+    useMarketClock();
+
   const fetchWithAdminSession = useAdminSessionFetch(addAutopilotLog);
 
   const applyDashboardData = useCallback((data: DashboardResponse) => {
@@ -177,25 +177,6 @@ export default function App() {
       setAutopilotStatus(data);
     } catch (error) {
       console.warn("Autopilot status refresh failed:", error);
-    }
-  }, []);
-
-  const refreshMarketClock = useCallback(async () => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/market/clock`, {
-        cache: "no-store",
-      });
-
-      if (!response.ok) {
-        throw new Error(`Market clock failed: ${response.status}`);
-      }
-
-      const data = (await response.json()) as MarketClockData;
-      setMarketClock(data);
-      setMarketClockError(null);
-    } catch (error) {
-      setMarketClockError(getErrorMessage(error));
-      console.warn("Market clock refresh failed:", error);
     }
   }, []);
 
