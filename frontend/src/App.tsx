@@ -1,4 +1,4 @@
-﻿import React, { useCallback, useEffect, useState } from "react";
+﻿import { useCallback, useEffect, useState } from "react";
 import { ActionableSignalDebugPanel } from "./components/ActionableSignalDebugPanel";
 import { AutopilotControlCenter } from "./components/AutopilotControlCenter";
 import { AutopilotLogs } from "./components/AutopilotLogs";
@@ -16,7 +16,6 @@ import type {
   AutopilotRunResponse,
   AutopilotStatus,
   AutopilotToggleResponse,
-  TradeResponse,
 } from "./types";
 import {
   actionPillClass,
@@ -33,7 +32,8 @@ import { useMarketClock } from "./hooks/useMarketClock";
 import { useDashboardData } from "./hooks/useDashboardData";
 import { useAutopilotStream } from "./hooks/useAutopilotStream";
 import { useChatTerminal } from "./hooks/useChatTerminal";
-import { API_BASE_URL, MANUAL_TRADING_ENABLED } from "./api/client";
+import { useManualOrder } from "./hooks/useManualOrder";
+import { API_BASE_URL } from "./api/client";
 
 const EMPTY_AUTOPILOT_STATUS: AutopilotStatus = {
   enabled: false,
@@ -75,14 +75,6 @@ export default function App() {
 
   const [isRunningAutopilot, setIsRunningAutopilot] = useState(false);
 
-  const [tradeTicker, setTradeTicker] = useState("");
-  const [tradeAction, setTradeAction] = useState<"BUY" | "SELL">("BUY");
-  const [tradeQty, setTradeQty] = useState(1);
-  const [tradeType, setTradeType] = useState("market");
-  const [tradeLimitPrice, setTradeLimitPrice] = useState("");
-  const [tradeSL, setTradeSL] = useState("");
-  const [tradeTP, setTradeTP] = useState("");
-
   const autopilotEnabled = autopilotStatus.enabled;
   const latestDecisions = autopilotStatus.lastDecisions;
   const signalReadyDecisions = latestDecisions.filter((decision) =>
@@ -116,6 +108,29 @@ export default function App() {
     setChatInput,
     handleSendMessage,
   } = useChatTerminal(fetchWithAdminSession);
+
+  const {
+    manualTradingEnabled,
+    tradeTicker,
+    setTradeTicker,
+    tradeAction,
+    setTradeAction,
+    tradeQty,
+    setTradeQty,
+    tradeType,
+    setTradeType,
+    tradeLimitPrice,
+    setTradeLimitPrice,
+    tradeSL,
+    setTradeSL,
+    tradeTP,
+    setTradeTP,
+    executeManualTrade,
+  } = useManualOrder({
+    addAutopilotLog,
+    fetchWithAdminSession,
+    refreshDashboard,
+  });
 
   const refreshAutopilotStatus = useCallback(async () => {
     try {
@@ -214,49 +229,6 @@ export default function App() {
       addAutopilotLog(`Manual run failed: ${getErrorMessage(error)}`);
     } finally {
       setIsRunningAutopilot(false);
-    }
-  }
-
-  async function executeManualTrade(event: React.SyntheticEvent) {
-    event.preventDefault();
-
-    if (!MANUAL_TRADING_ENABLED) {
-      alert("Manual trades are disabled by UI safety lock.");
-      return;
-    }
-
-    if (!tradeTicker.trim()) return;
-
-    try {
-      const response = await fetchWithAdminSession("/api/trade", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ticker: tradeTicker,
-          action: tradeAction,
-          shares: tradeQty,
-          orderType: tradeType,
-          limitPrice: tradeLimitPrice
-            ? Number.parseFloat(tradeLimitPrice)
-            : undefined,
-          stopLoss: tradeSL ? Number.parseFloat(tradeSL) : undefined,
-          takeProfit: tradeTP ? Number.parseFloat(tradeTP) : undefined,
-        }),
-      });
-
-      const result = (await response.json()) as TradeResponse;
-      if (!response.ok || !result.success)
-        throw new Error(result.error || "Trade rejected.");
-
-      addAutopilotLog(
-        `Manual order accepted: ${tradeAction} ${tradeQty} ${tradeTicker}.`,
-      );
-      setTradeTicker("");
-      setTradeSL("");
-      setTradeTP("");
-      await refreshDashboard();
-    } catch (error) {
-      alert(`Trade failed: ${getErrorMessage(error)}`);
     }
   }
 
@@ -443,7 +415,7 @@ export default function App() {
               />
             </h2>
 
-            {!MANUAL_TRADING_ENABLED && (
+            {!manualTradingEnabled && (
               <div className="mb-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
                 Manual order entry is disabled by default. RUN ONCE and journal
                 analysis stay enabled.
@@ -544,14 +516,14 @@ export default function App() {
 
               <button
                 type="submit"
-                disabled={!MANUAL_TRADING_ENABLED}
+                disabled={!manualTradingEnabled}
                 className={`w-full py-2 rounded-xl font-bold text-xs tracking-wider transition-all disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-500 ${
                   tradeMode === "live"
                     ? "bg-red-700 hover:bg-red-600 text-white"
                     : "bg-blue-600 hover:bg-blue-500 text-white"
                 }`}
               >
-                {MANUAL_TRADING_ENABLED
+                {manualTradingEnabled
                   ? `SUBMIT ${tradeAction}`
                   : "MANUAL TRADING DISABLED"}
               </button>
