@@ -6,13 +6,18 @@
     node .\scripts\collect-diagnostics.cjs --zip
     node .\scripts\collect-diagnostics.cjs --zip-only
     node .\scripts\collect-diagnostics.cjs --limit=500 --zip-only
+
+    - adds a compact human-readable decision report
+    - parses risk-cap numbers from AMD risk HOLD reasons
+    - parses closest BUY/SELL setup and missing reasons
+    - creates latest-decision-summary.csv and decisions.report.md
 */
 
-const fs = require('node:fs');
-const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
 
-const DEFAULT_BASE_URL = 'https://ai-trading-agent-i4nr.onrender.com';
+const DEFAULT_BASE_URL = "https://ai-trading-agent-i4nr.onrender.com";
 
 function parseArgs(argv) {
   const result = {
@@ -23,15 +28,15 @@ function parseArgs(argv) {
   };
 
   for (const arg of argv) {
-    if (arg === '--zip') {
+    if (arg === "--zip") {
       result.zip = true;
-    } else if (arg === '--zip-only' || arg === '--clean') {
+    } else if (arg === "--zip-only" || arg === "--clean") {
       result.zip = true;
       result.zipOnly = true;
-    } else if (arg.startsWith('--base=')) {
-      result.baseUrl = arg.slice('--base='.length).trim() || result.baseUrl;
-    } else if (arg.startsWith('--limit=')) {
-      const parsed = Number(arg.slice('--limit='.length));
+    } else if (arg.startsWith("--base=")) {
+      result.baseUrl = arg.slice("--base=".length).trim() || result.baseUrl;
+    } else if (arg.startsWith("--limit=")) {
+      const parsed = Number(arg.slice("--limit=".length));
       if (Number.isFinite(parsed) && parsed > 0) result.journalLimit = parsed;
     }
   }
@@ -40,29 +45,29 @@ function parseArgs(argv) {
     result.journalLimit = 200;
   }
 
-  result.baseUrl = result.baseUrl.replace(/\/$/, '');
+  result.baseUrl = result.baseUrl.replace(/\/$/, "");
   return result;
 }
 
 function timestampForPath(date = new Date()) {
-  const pad = (value) => String(value).padStart(2, '0');
+  const pad = (value) => String(value).padStart(2, "0");
   return [
     date.getFullYear(),
     pad(date.getMonth() + 1),
     pad(date.getDate()),
-    '-',
+    "-",
     pad(date.getHours()),
     pad(date.getMinutes()),
     pad(date.getSeconds()),
-  ].join('');
+  ].join("");
 }
 
 function writeJson(filePath, value) {
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
 function csvEscape(value) {
-  if (value === null || value === undefined) return '';
+  if (value === null || value === undefined) return "";
   const text = String(value);
   if (/[",\r\n]/.test(text)) {
     return `"${text.replace(/"/g, '""')}"`;
@@ -71,11 +76,11 @@ function csvEscape(value) {
 }
 
 function writeCsv(filePath, rows, columns) {
-  const lines = [columns.map(csvEscape).join(',')];
+  const lines = [columns.map(csvEscape).join(",")];
   for (const row of rows) {
-    lines.push(columns.map((column) => csvEscape(row[column])).join(','));
+    lines.push(columns.map((column) => csvEscape(row[column])).join(","));
   }
-  fs.writeFileSync(filePath, `${lines.join('\n')}\n`, 'utf8');
+  fs.writeFileSync(filePath, `${lines.join("\n")}\n`, "utf8");
 }
 
 function get(obj, pathParts, fallback = null) {
@@ -92,8 +97,30 @@ function toNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function formatMoney(value) {
+  const num = toNumber(value);
+  if (num === null) return "n/a";
+  return num.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+function formatPercentDecimal(value) {
+  const num = toNumber(value);
+  if (num === null) return "n/a";
+  return `${(num * 100).toFixed(1)}%`;
+}
+
+function parseKeyValueNumber(text, key) {
+  const match = String(text || "").match(
+    new RegExp(`${key}=(-?\\d+(?:\\.\\d+)?)`),
+  );
+  return match ? Number(match[1]) : null;
+}
+
 function parseReason(reason) {
-  const text = String(reason || '');
+  const text = String(reason || "");
   const parsed = {
     buyScore: null,
     buyScoreRequired: null,
@@ -103,6 +130,18 @@ function parseReason(reason) {
     nearUpperBand: null,
     macdRising: null,
     macdFalling: null,
+    closestSetup: "",
+    missingReasons: "",
+    riskMaxSharesToBuy: null,
+    riskSharesOwned: null,
+    riskCurrentPositionValue: null,
+    riskPositionCapValue: null,
+    riskRemainingPositionCapacity: null,
+    riskCashAllowedForBuy: null,
+    riskCash: null,
+    riskPrice: null,
+    riskMaxPositionEquityFraction: null,
+    riskMaxBuyCashFraction: null,
   };
 
   const buyMatch = text.match(/buyScore=(\d+)\/(\d+)/);
@@ -117,10 +156,46 @@ function parseReason(reason) {
     parsed.sellScoreRequired = Number(sellMatch[2]);
   }
 
-  for (const key of ['nearLowerBand', 'nearUpperBand', 'macdRising', 'macdFalling']) {
-    const match = text.match(new RegExp(`${key}=(true|false)`, 'i'));
-    if (match) parsed[key] = match[1].toLowerCase() === 'true';
+  const closestMatch = text.match(
+    /closest (BUY|SELL) setup is not actionable: ([^.]+)\./i,
+  );
+  if (closestMatch) {
+    parsed.closestSetup = closestMatch[1].toUpperCase();
+    parsed.missingReasons = closestMatch[2].trim();
   }
+
+  for (const key of [
+    "nearLowerBand",
+    "nearUpperBand",
+    "macdRising",
+    "macdFalling",
+  ]) {
+    const match = text.match(new RegExp(`${key}=(true|false)`, "i"));
+    if (match) parsed[key] = match[1].toLowerCase() === "true";
+  }
+
+  parsed.riskMaxSharesToBuy = parseKeyValueNumber(text, "maxSharesToBuy");
+  parsed.riskSharesOwned = parseKeyValueNumber(text, "sharesOwned");
+  parsed.riskCurrentPositionValue = parseKeyValueNumber(
+    text,
+    "currentPositionValue",
+  );
+  parsed.riskPositionCapValue = parseKeyValueNumber(text, "positionCapValue");
+  parsed.riskRemainingPositionCapacity = parseKeyValueNumber(
+    text,
+    "remainingPositionCapacity",
+  );
+  parsed.riskCashAllowedForBuy = parseKeyValueNumber(text, "cashAllowedForBuy");
+  parsed.riskCash = parseKeyValueNumber(text, "cash");
+  parsed.riskPrice = parseKeyValueNumber(text, "price");
+  parsed.riskMaxPositionEquityFraction = parseKeyValueNumber(
+    text,
+    "maxPositionEquityFraction",
+  );
+  parsed.riskMaxBuyCashFraction = parseKeyValueNumber(
+    text,
+    "maxBuyCashFraction",
+  );
 
   return parsed;
 }
@@ -131,26 +206,63 @@ function scoreCloseness(row) {
   const sellScore = toNumber(row.sellScore);
   const sellRequired = toNumber(row.sellScoreRequired);
 
-  const buyRatio = buyScore !== null && buyRequired ? buyScore / buyRequired : 0;
-  const sellRatio = sellScore !== null && sellRequired ? sellScore / sellRequired : 0;
+  const buyRatio =
+    buyScore !== null && buyRequired ? buyScore / buyRequired : 0;
+  const sellRatio =
+    sellScore !== null && sellRequired ? sellScore / sellRequired : 0;
 
   return Math.max(buyRatio, sellRatio);
 }
 
+function summarizeDecision(row) {
+  if (row.executed === true) {
+    return `${row.action} executed`;
+  }
+
+  if (row.isSignalReady === true) {
+    return `${row.action} signal ready, not executed here`;
+  }
+
+  if (
+    row.riskPositionCapValue !== null ||
+    row.riskCurrentPositionValue !== null
+  ) {
+    const current = toNumber(row.riskCurrentPositionValue);
+    const cap = toNumber(row.riskPositionCapValue);
+    const ratio = current !== null && cap ? current / cap : null;
+    return `Risk cap: position ${formatMoney(current)} / cap ${formatMoney(cap)}${ratio !== null ? ` (${ratio.toFixed(2)}x cap)` : ""}; remaining buy capacity ${formatMoney(row.riskRemainingPositionCapacity)}`;
+  }
+
+  if (row.closestSetup) {
+    return `Closest ${row.closestSetup}: ${row.missingReasons || "missing required setup conditions"}`;
+  }
+
+  if (row.action === "HOLD") {
+    return row.reason || "HOLD";
+  }
+
+  return row.reason || `${row.action}`;
+}
+
 async function fetchJson(baseUrl, endpoint) {
   const url = `${baseUrl}${endpoint}`;
-  const response = await fetch(url, { cache: 'no-store' });
+  const response = await fetch(url, { cache: "no-store" });
   const text = await response.text();
 
   let parsed;
   try {
     parsed = text ? JSON.parse(text) : null;
   } catch (error) {
-    throw new Error(`${endpoint} returned non-JSON (${response.status}): ${text.slice(0, 300)}`);
+    throw new Error(
+      `${endpoint} returned non-JSON (${response.status}): ${text.slice(0, 300)}`,
+    );
   }
 
   if (!response.ok) {
-    const message = parsed && typeof parsed === 'object' && parsed.error ? parsed.error : response.statusText;
+    const message =
+      parsed && typeof parsed === "object" && parsed.error
+        ? parsed.error
+        : response.statusText;
     throw new Error(`${endpoint} failed with ${response.status}: ${message}`);
   }
 
@@ -176,41 +288,44 @@ async function saveEndpoint(baseUrl, rawDir, name, endpoint) {
 
 function flattenJournalDecisions(journalLatest) {
   const rows = [];
-  const runs = Array.isArray(journalLatest && journalLatest.runs) ? journalLatest.runs : [];
+  const runs = Array.isArray(journalLatest && journalLatest.runs)
+    ? journalLatest.runs
+    : [];
 
   for (const run of runs) {
     const decisions = Array.isArray(run.decisions) ? run.decisions : [];
     for (const decision of decisions) {
-      const reason = decision.reason || '';
+      const reason = decision.reason || "";
       const parsedReason = parseReason(reason);
       const row = {
-        runId: run.id || '',
-        runTimestamp: run.timestamp || '',
-        trigger: run.trigger || '',
+        runId: run.id || "",
+        runTimestamp: run.timestamp || "",
+        trigger: run.trigger || "",
         runEnabled: run.enabled,
         executeTrades: run.executeTrades,
-        tradeMode: run.tradeMode || '',
-        ticker: decision.ticker || '',
-        timestamp: decision.timestamp || '',
+        tradeMode: run.tradeMode || "",
+        ticker: decision.ticker || "",
+        timestamp: decision.timestamp || "",
         price: decision.price,
         rsi: decision.rsi,
         macdHistogram: decision.macdHistogram,
         previousMacdHistogram: decision.previousMacdHistogram,
         bollingerLower: decision.bollingerLower,
         bollingerUpper: decision.bollingerUpper,
-        action: decision.action || '',
+        action: decision.action || "",
         confidence: decision.confidence,
         suggestedShares: decision.suggestedShares,
-        reasonType: decision.reasonType || '',
-        finalStatus: decision.finalStatus || '',
-        signalStatus: decision.signalStatus || '',
-        executionStatus: decision.executionStatus || '',
+        reasonType: decision.reasonType || "",
+        finalStatus: decision.finalStatus || "",
+        signalStatus: decision.signalStatus || "",
+        executionStatus: decision.executionStatus || "",
         isSignalReady: decision.isSignalReady,
         executed: decision.executed,
         reason,
         ...parsedReason,
       };
       row.closenessScore = scoreCloseness(row);
+      row.readableSummary = summarizeDecision(row);
       rows.push(row);
     }
   }
@@ -218,58 +333,70 @@ function flattenJournalDecisions(journalLatest) {
   return rows;
 }
 
-function buildCompactSummary({ baseUrl, health, clock, status, dashboard, journalSummary }) {
+function buildCompactSummary({
+  baseUrl,
+  health,
+  clock,
+  status,
+  dashboard,
+  journalSummary,
+}) {
   return {
     collectedAt: new Date().toISOString(),
     baseUrl,
     market: {
-      isOpen: get(clock, ['isOpen']),
-      statusLabel: get(clock, ['statusLabel']),
-      nextCloseIsrael: get(clock, ['nextCloseIsrael']),
-      countdownLabel: get(clock, ['countdownLabel']),
-      source: get(clock, ['source']),
+      isOpen: get(clock, ["isOpen"]),
+      statusLabel: get(clock, ["statusLabel"]),
+      nextCloseIsrael: get(clock, ["nextCloseIsrael"]),
+      countdownLabel: get(clock, ["countdownLabel"]),
+      source: get(clock, ["source"]),
     },
     autopilot: {
-      enabled: get(status, ['enabled']),
-      running: get(status, ['running']),
-      executeTrades: get(status, ['executeTrades']),
-      allowBuy: get(status, ['allowBuy']),
-      allowSell: get(status, ['allowSell']),
-      tradeMode: get(status, ['tradeMode']),
-      strategyVersion: get(status, ['strategyVersion']),
-      strategyConfigHash: get(status, ['strategyConfigHash']),
-      lastRunAt: get(status, ['lastRunAt']),
-      lastError: get(status, ['lastError']),
-      lastJournalRunId: get(status, ['lastJournalRunId']),
-      tickers: get(status, ['tickers'], []),
+      enabled: get(status, ["enabled"]),
+      running: get(status, ["running"]),
+      executeTrades: get(status, ["executeTrades"]),
+      allowBuy: get(status, ["allowBuy"]),
+      allowSell: get(status, ["allowSell"]),
+      tradeMode: get(status, ["tradeMode"]),
+      strategyVersion: get(status, ["strategyVersion"]),
+      strategyConfigHash: get(status, ["strategyConfigHash"]),
+      lastRunAt: get(status, ["lastRunAt"]),
+      lastError: get(status, ["lastError"]),
+      lastJournalRunId: get(status, ["lastJournalRunId"]),
+      tickers: get(status, ["tickers"], []),
     },
     journal: {
-      totalRuns: get(journalSummary, ['totalRuns']),
-      totalDecisions: get(journalSummary, ['totalDecisions']),
-      signalReadySignals: get(journalSummary, ['signalReadySignals']),
-      signalBlockedSignals: get(journalSummary, ['signalBlockedSignals']),
-      dryRunSignals: get(journalSummary, ['dryRunSignals']),
-      executedSignals: get(journalSummary, ['executedSignals']),
-      byAction: get(journalSummary, ['byAction'], {}),
-      byTicker: get(journalSummary, ['byTicker'], {}),
-      byReasonType: get(journalSummary, ['byReasonType'], {}),
-      lastRunAt: get(journalSummary, ['lastRunAt']),
+      totalRuns: get(journalSummary, ["totalRuns"]),
+      totalDecisions: get(journalSummary, ["totalDecisions"]),
+      signalReadySignals: get(journalSummary, ["signalReadySignals"]),
+      signalBlockedSignals: get(journalSummary, ["signalBlockedSignals"]),
+      dryRunSignals: get(journalSummary, ["dryRunSignals"]),
+      executedSignals: get(journalSummary, ["executedSignals"]),
+      byAction: get(journalSummary, ["byAction"], {}),
+      byTicker: get(journalSummary, ["byTicker"], {}),
+      byReasonType: get(journalSummary, ["byReasonType"], {}),
+      lastRunAt: get(journalSummary, ["lastRunAt"]),
     },
     portfolio: {
-      equity: get(dashboard, ['portfolio', 'equity']),
-      cash: get(dashboard, ['portfolio', 'balance']),
-      currency: get(dashboard, ['portfolio', 'currency']),
-      positions: get(dashboard, ['portfolio', 'positions'], {}),
-      ordersCount: Array.isArray(dashboard && dashboard.orders) ? dashboard.orders.length : null,
+      equity: get(dashboard, ["portfolio", "equity"]),
+      cash: get(dashboard, ["portfolio", "balance"]),
+      currency: get(dashboard, ["portfolio", "currency"]),
+      positions: get(dashboard, ["portfolio", "positions"], {}),
+      ordersCount: Array.isArray(dashboard && dashboard.orders)
+        ? dashboard.orders.length
+        : null,
     },
-    health: get(dashboard, ['health'], { ok: get(health, ['ok']), warnings: [] }),
+    health: get(dashboard, ["health"], {
+      ok: get(health, ["ok"]),
+      warnings: [],
+    }),
   };
 }
 
 function groupByTicker(rows) {
   const map = new Map();
   for (const row of rows) {
-    const key = row.ticker || 'UNKNOWN';
+    const key = row.ticker || "UNKNOWN";
     if (!map.has(key)) {
       map.set(key, {
         ticker: key,
@@ -281,53 +408,137 @@ function groupByTicker(rows) {
         executed: 0,
         avgRsi: 0,
         maxClosenessScore: 0,
-        lastReason: '',
+        lastReason: "",
+        lastReadableSummary: "",
       });
     }
     const item = map.get(key);
     item.decisions += 1;
-    if (row.action === 'HOLD') item.hold += 1;
-    if (row.action === 'BUY') item.buy += 1;
-    if (row.action === 'SELL') item.sell += 1;
+    if (row.action === "HOLD") item.hold += 1;
+    if (row.action === "BUY") item.buy += 1;
+    if (row.action === "SELL") item.sell += 1;
     if (row.isSignalReady === true) item.signalReady += 1;
     if (row.executed === true) item.executed += 1;
     const rsi = toNumber(row.rsi);
     if (rsi !== null) item.avgRsi += rsi;
-    item.maxClosenessScore = Math.max(item.maxClosenessScore, toNumber(row.closenessScore) || 0);
+    item.maxClosenessScore = Math.max(
+      item.maxClosenessScore,
+      toNumber(row.closenessScore) || 0,
+    );
     item.lastReason = row.reason || item.lastReason;
+    item.lastReadableSummary = row.readableSummary || item.lastReadableSummary;
   }
 
   return Array.from(map.values()).map((item) => ({
     ...item,
-    avgRsi: item.decisions ? Number((item.avgRsi / item.decisions).toFixed(2)) : null,
+    avgRsi: item.decisions
+      ? Number((item.avgRsi / item.decisions).toFixed(2))
+      : null,
     maxClosenessScore: Number(item.maxClosenessScore.toFixed(3)),
   }));
 }
 
-function buildReport(compact, tickerStats, closestSignals) {
+function getLatestRowsByTicker(decisionRows) {
+  const map = new Map();
+  for (const row of decisionRows) {
+    if (!row.ticker) continue;
+    if (!map.has(row.ticker)) {
+      map.set(row.ticker, row);
+    }
+  }
+  return Array.from(map.values()).sort((a, b) =>
+    a.ticker.localeCompare(b.ticker),
+  );
+}
+
+function buildDecisionsReport(compact, latestRows, closestSignals) {
+  const lines = [];
+
+  lines.push("# Latest Decision Summary");
+  lines.push("");
+  lines.push(`Collected at: ${compact.collectedAt}`);
+  lines.push(
+    `Market: ${compact.market.statusLabel || "unknown"} (${compact.market.countdownLabel || "n/a"})`,
+  );
+  lines.push(
+    `Autopilot: ${compact.autopilot.enabled ? "ON" : "OFF"}, running=${compact.autopilot.running}, execution=${compact.autopilot.executeTrades}`,
+  );
+  lines.push(
+    `Safety: allowBuy=${compact.autopilot.allowBuy}, allowSell=${compact.autopilot.allowSell}, orders=${compact.portfolio.ordersCount}, lastError=${compact.autopilot.lastError}`,
+  );
+  lines.push("");
+  lines.push("| Ticker | Action | RSI | Setup | Summary |");
+  lines.push("|---|---:|---:|---|---|");
+  for (const row of latestRows) {
+    const setup =
+      row.closestSetup || (row.riskPositionCapValue !== null ? "RISK_CAP" : "");
+    lines.push(
+      `| ${row.ticker} | ${row.action} | ${row.rsi ?? ""} | ${setup} | ${String(row.readableSummary || "").replace(/\|/g, "/")} |`,
+    );
+  }
+  lines.push("");
+
+  const riskRows = latestRows.filter(
+    (row) =>
+      row.riskPositionCapValue !== null ||
+      row.riskCurrentPositionValue !== null,
+  );
+  if (riskRows.length) {
+    lines.push("## Risk cap details");
+    lines.push("");
+    for (const row of riskRows) {
+      const current = toNumber(row.riskCurrentPositionValue);
+      const cap = toNumber(row.riskPositionCapValue);
+      const ratio = current !== null && cap ? current / cap : null;
+      lines.push(
+        `- ${row.ticker}: position=${formatMoney(current)}, cap=${formatMoney(cap)}, ratio=${ratio !== null ? `${ratio.toFixed(2)}x` : "n/a"}, remainingCapacity=${formatMoney(row.riskRemainingPositionCapacity)}, cashAllowedForBuy=${formatMoney(row.riskCashAllowedForBuy)}, sharesOwned=${row.riskSharesOwned}`,
+      );
+    }
+    lines.push("");
+  }
+
+  lines.push("## Closest collected decisions");
+  lines.push("");
+  for (const row of closestSignals.slice(0, 10)) {
+    lines.push(
+      `- ${row.ticker}: closeness=${row.closenessScore}, ${row.readableSummary}`,
+    );
+  }
+  lines.push("");
+
+  return `${lines.join("\n")}\n`;
+}
+
+function buildReport(compact, tickerStats, closestSignals, latestRows) {
   const byAction = compact.journal.byAction || {};
   const byReasonType = compact.journal.byReasonType || {};
   const lines = [];
 
-  lines.push('# AI Trading Agent Diagnostics Report');
-  lines.push('');
+  lines.push("# AI Trading Agent Diagnostics Report");
+  lines.push("");
   lines.push(`Collected at: ${compact.collectedAt}`);
   lines.push(`Base URL: ${compact.baseUrl}`);
-  lines.push('');
-  lines.push('## Safety state');
-  lines.push('');
-  lines.push(`- Market: ${compact.market.statusLabel || 'unknown'} (${compact.market.countdownLabel || 'n/a'} until next event)`);
+  lines.push("");
+  lines.push("## Safety state");
+  lines.push("");
+  lines.push(
+    `- Market: ${compact.market.statusLabel || "unknown"} (${compact.market.countdownLabel || "n/a"} until next event)`,
+  );
   lines.push(`- Trade mode: ${compact.autopilot.tradeMode}`);
   lines.push(`- Autopilot enabled: ${compact.autopilot.enabled}`);
   lines.push(`- Running now: ${compact.autopilot.running}`);
   lines.push(`- Execute trades: ${compact.autopilot.executeTrades}`);
-  lines.push(`- Allow buy / sell: ${compact.autopilot.allowBuy} / ${compact.autopilot.allowSell}`);
-  lines.push(`- Last error: ${compact.autopilot.lastError === null ? 'null' : compact.autopilot.lastError}`);
+  lines.push(
+    `- Allow buy / sell: ${compact.autopilot.allowBuy} / ${compact.autopilot.allowSell}`,
+  );
+  lines.push(
+    `- Last error: ${compact.autopilot.lastError === null ? "null" : compact.autopilot.lastError}`,
+  );
   lines.push(`- Open orders count: ${compact.portfolio.ordersCount}`);
   lines.push(`- Health OK: ${compact.health && compact.health.ok}`);
-  lines.push('');
-  lines.push('## Journal summary');
-  lines.push('');
+  lines.push("");
+  lines.push("## Journal summary");
+  lines.push("");
   lines.push(`- Runs: ${compact.journal.totalRuns}`);
   lines.push(`- Decisions: ${compact.journal.totalDecisions}`);
   lines.push(`- Signal-ready: ${compact.journal.signalReadySignals}`);
@@ -336,41 +547,63 @@ function buildReport(compact, tickerStats, closestSignals) {
   lines.push(`- Executed: ${compact.journal.executedSignals}`);
   lines.push(`- By action: ${JSON.stringify(byAction)}`);
   lines.push(`- By reason type: ${JSON.stringify(byReasonType)}`);
-  lines.push('');
-  lines.push('## Portfolio');
-  lines.push('');
-  lines.push(`- Equity: ${compact.portfolio.equity} ${compact.portfolio.currency || ''}`.trim());
-  lines.push(`- Cash: ${compact.portfolio.cash} ${compact.portfolio.currency || ''}`.trim());
-  lines.push(`- Positions: ${JSON.stringify(compact.portfolio.positions || {})}`);
-  lines.push('');
-  lines.push('## Ticker stats from collected latest runs');
-  lines.push('');
+  lines.push("");
+  lines.push("## Portfolio");
+  lines.push("");
+  lines.push(
+    `- Equity: ${compact.portfolio.equity} ${compact.portfolio.currency || ""}`.trim(),
+  );
+  lines.push(
+    `- Cash: ${compact.portfolio.cash} ${compact.portfolio.currency || ""}`.trim(),
+  );
+  lines.push(
+    `- Positions: ${JSON.stringify(compact.portfolio.positions || {})}`,
+  );
+  lines.push("");
+  lines.push("## Latest decision summary");
+  lines.push("");
+  for (const row of latestRows) {
+    lines.push(`- ${row.ticker} ${row.action}: ${row.readableSummary}`);
+  }
+  lines.push("");
+  lines.push("## Ticker stats from collected latest runs");
+  lines.push("");
   for (const row of tickerStats) {
-    lines.push(`- ${row.ticker}: decisions=${row.decisions}, HOLD=${row.hold}, BUY=${row.buy}, SELL=${row.sell}, signalReady=${row.signalReady}, avgRSI=${row.avgRsi}, maxCloseness=${row.maxClosenessScore}`);
+    lines.push(
+      `- ${row.ticker}: decisions=${row.decisions}, HOLD=${row.hold}, BUY=${row.buy}, SELL=${row.sell}, signalReady=${row.signalReady}, avgRSI=${row.avgRsi}, maxCloseness=${row.maxClosenessScore}`,
+    );
   }
-  lines.push('');
-  lines.push('## Closest latest decisions');
-  lines.push('');
+  lines.push("");
+  lines.push("## Closest latest decisions");
+  lines.push("");
   for (const row of closestSignals.slice(0, 10)) {
-    lines.push(`- ${row.ticker} ${row.action}: closeness=${row.closenessScore}, RSI=${row.rsi}, buyScore=${row.buyScore || ''}/${row.buyScoreRequired || ''}, sellScore=${row.sellScore || ''}/${row.sellScoreRequired || ''}, reason=${row.reason}`);
+    lines.push(
+      `- ${row.ticker} ${row.action}: closeness=${row.closenessScore}, RSI=${row.rsi}, buyScore=${row.buyScore || ""}/${row.buyScoreRequired || ""}, sellScore=${row.sellScore || ""}/${row.sellScoreRequired || ""}, summary=${row.readableSummary}`,
+    );
   }
-  lines.push('');
+  lines.push("");
 
-  return `${lines.join('\n')}\n`;
+  return `${lines.join("\n")}\n`;
 }
 
 function tryCreateZip(dir, zipPath) {
   const command = `$ErrorActionPreference = 'Stop'; Compress-Archive -Path '${dir.replace(/'/g, "''")}\\*' -DestinationPath '${zipPath.replace(/'/g, "''")}' -Force`;
-  const result = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
-    encoding: 'utf8',
-    windowsHide: true,
-  });
+  const result = spawnSync(
+    "powershell.exe",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+    {
+      encoding: "utf8",
+      windowsHide: true,
+    },
+  );
 
   if (result.error || result.status !== 0) {
     const details = result.error ? result.error.message : result.stderr;
     console.warn(`Could not create zip automatically: ${details}`);
     console.warn(`Manual zip command:`);
-    console.warn(`Compress-Archive -Path "${dir}\\*" -DestinationPath "${zipPath}" -Force`);
+    console.warn(
+      `Compress-Archive -Path "${dir}\\*" -DestinationPath "${zipPath}" -Force`,
+    );
     return false;
   }
 
@@ -381,18 +614,48 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   const repoRoot = process.cwd();
   const stamp = timestampForPath();
-  const diagnosticsRoot = path.join(repoRoot, 'diagnostics');
+  const diagnosticsRoot = path.join(repoRoot, "diagnostics");
   const dir = path.join(diagnosticsRoot, stamp);
-  const rawDir = path.join(dir, 'raw');
+  const rawDir = path.join(dir, "raw");
 
   fs.mkdirSync(rawDir, { recursive: true });
 
-  const health = await saveEndpoint(options.baseUrl, rawDir, 'health.deep.json', '/api/health?deep=true');
-  const clock = await saveEndpoint(options.baseUrl, rawDir, 'market.clock.json', '/api/market/clock');
-  const status = await saveEndpoint(options.baseUrl, rawDir, 'autopilot.status.json', '/api/autopilot/status');
-  const dashboard = await saveEndpoint(options.baseUrl, rawDir, 'dashboard.json', '/api/dashboard');
-  const journalLatest = await saveEndpoint(options.baseUrl, rawDir, 'journal.latest.json', `/api/autopilot/journal?limit=${options.journalLimit}`);
-  const journalSummary = await saveEndpoint(options.baseUrl, rawDir, 'journal.summary.json', `/api/autopilot/journal/summary?limit=${options.journalLimit}`);
+  const health = await saveEndpoint(
+    options.baseUrl,
+    rawDir,
+    "health.deep.json",
+    "/api/health?deep=true",
+  );
+  const clock = await saveEndpoint(
+    options.baseUrl,
+    rawDir,
+    "market.clock.json",
+    "/api/market/clock",
+  );
+  const status = await saveEndpoint(
+    options.baseUrl,
+    rawDir,
+    "autopilot.status.json",
+    "/api/autopilot/status",
+  );
+  const dashboard = await saveEndpoint(
+    options.baseUrl,
+    rawDir,
+    "dashboard.json",
+    "/api/dashboard",
+  );
+  const journalLatest = await saveEndpoint(
+    options.baseUrl,
+    rawDir,
+    "journal.latest.json",
+    `/api/autopilot/journal?limit=${options.journalLimit}`,
+  );
+  const journalSummary = await saveEndpoint(
+    options.baseUrl,
+    rawDir,
+    "journal.summary.json",
+    `/api/autopilot/journal/summary?limit=${options.journalLimit}`,
+  );
 
   const compact = buildCompactSummary({
     baseUrl: options.baseUrl,
@@ -403,104 +666,156 @@ async function main() {
     journalSummary,
   });
 
-  writeJson(path.join(dir, 'compact.summary.json'), compact);
+  writeJson(path.join(dir, "compact.summary.json"), compact);
 
-  const runs = Array.isArray(journalLatest && journalLatest.runs) ? journalLatest.runs : [];
+  const runs = Array.isArray(journalLatest && journalLatest.runs)
+    ? journalLatest.runs
+    : [];
   const runRows = runs.map((run) => ({
-    id: run.id || '',
-    timestamp: run.timestamp || '',
-    trigger: run.trigger || '',
+    id: run.id || "",
+    timestamp: run.timestamp || "",
+    trigger: run.trigger || "",
     enabled: run.enabled,
     executeTrades: run.executeTrades,
-    tradeMode: run.tradeMode || '',
+    tradeMode: run.tradeMode || "",
     signalReadyCount: run.signalReadyCount,
     signalBlockedCount: run.signalBlockedCount,
     dryRunCount: run.dryRunCount,
     executedCount: run.executedCount,
-    strategyVersion: run.strategyVersion || '',
-    strategyConfigHash: run.strategyConfigHash || '',
+    strategyVersion: run.strategyVersion || "",
+    strategyConfigHash: run.strategyConfigHash || "",
   }));
 
-  writeCsv(path.join(dir, 'journal-runs.csv'), runRows, [
-    'id',
-    'timestamp',
-    'trigger',
-    'enabled',
-    'executeTrades',
-    'tradeMode',
-    'signalReadyCount',
-    'signalBlockedCount',
-    'dryRunCount',
-    'executedCount',
-    'strategyVersion',
-    'strategyConfigHash',
+  writeCsv(path.join(dir, "journal-runs.csv"), runRows, [
+    "id",
+    "timestamp",
+    "trigger",
+    "enabled",
+    "executeTrades",
+    "tradeMode",
+    "signalReadyCount",
+    "signalBlockedCount",
+    "dryRunCount",
+    "executedCount",
+    "strategyVersion",
+    "strategyConfigHash",
   ]);
 
   const decisionRows = flattenJournalDecisions(journalLatest);
   const decisionColumns = [
-    'runId',
-    'runTimestamp',
-    'trigger',
-    'runEnabled',
-    'executeTrades',
-    'tradeMode',
-    'ticker',
-    'timestamp',
-    'price',
-    'rsi',
-    'macdHistogram',
-    'previousMacdHistogram',
-    'bollingerLower',
-    'bollingerUpper',
-    'action',
-    'confidence',
-    'suggestedShares',
-    'reasonType',
-    'finalStatus',
-    'signalStatus',
-    'executionStatus',
-    'isSignalReady',
-    'executed',
-    'buyScore',
-    'buyScoreRequired',
-    'sellScore',
-    'sellScoreRequired',
-    'nearLowerBand',
-    'nearUpperBand',
-    'macdRising',
-    'macdFalling',
-    'closenessScore',
-    'reason',
+    "runId",
+    "runTimestamp",
+    "trigger",
+    "runEnabled",
+    "executeTrades",
+    "tradeMode",
+    "ticker",
+    "timestamp",
+    "price",
+    "rsi",
+    "macdHistogram",
+    "previousMacdHistogram",
+    "bollingerLower",
+    "bollingerUpper",
+    "action",
+    "confidence",
+    "suggestedShares",
+    "reasonType",
+    "finalStatus",
+    "signalStatus",
+    "executionStatus",
+    "isSignalReady",
+    "executed",
+    "buyScore",
+    "buyScoreRequired",
+    "sellScore",
+    "sellScoreRequired",
+    "nearLowerBand",
+    "nearUpperBand",
+    "macdRising",
+    "macdFalling",
+    "closestSetup",
+    "missingReasons",
+    "riskMaxSharesToBuy",
+    "riskSharesOwned",
+    "riskCurrentPositionValue",
+    "riskPositionCapValue",
+    "riskRemainingPositionCapacity",
+    "riskCashAllowedForBuy",
+    "riskCash",
+    "riskPrice",
+    "riskMaxPositionEquityFraction",
+    "riskMaxBuyCashFraction",
+    "closenessScore",
+    "readableSummary",
+    "reason",
   ];
 
-  writeCsv(path.join(dir, 'all-decisions.csv'), decisionRows, decisionColumns);
-  writeCsv(path.join(dir, 'last-decisions.csv'), decisionRows.slice(0, 5), decisionColumns);
+  writeCsv(path.join(dir, "all-decisions.csv"), decisionRows, decisionColumns);
+  writeCsv(
+    path.join(dir, "last-decisions.csv"),
+    decisionRows.slice(0, 5),
+    decisionColumns,
+  );
 
   const closestSignals = [...decisionRows]
-    .sort((a, b) => (toNumber(b.closenessScore) || 0) - (toNumber(a.closenessScore) || 0))
+    .sort(
+      (a, b) =>
+        (toNumber(b.closenessScore) || 0) - (toNumber(a.closenessScore) || 0),
+    )
     .slice(0, 25)
     .map((row) => ({
       ...row,
       closenessScore: Number((toNumber(row.closenessScore) || 0).toFixed(3)),
     }));
 
-  writeCsv(path.join(dir, 'closest-signals.csv'), closestSignals, decisionColumns);
+  writeCsv(
+    path.join(dir, "closest-signals.csv"),
+    closestSignals,
+    decisionColumns,
+  );
 
-  const tickerStats = groupByTicker(decisionRows).sort((a, b) => a.ticker.localeCompare(b.ticker));
-  writeCsv(path.join(dir, 'ticker-stats.csv'), tickerStats, [
-    'ticker',
-    'decisions',
-    'hold',
-    'buy',
-    'sell',
-    'signalReady',
-    'executed',
-    'avgRsi',
-    'maxClosenessScore',
-    'lastReason',
+  const latestRows = getLatestRowsByTicker(decisionRows);
+  writeCsv(path.join(dir, "latest-decision-summary.csv"), latestRows, [
+    "ticker",
+    "action",
+    "price",
+    "rsi",
+    "closestSetup",
+    "missingReasons",
+    "riskCurrentPositionValue",
+    "riskPositionCapValue",
+    "riskRemainingPositionCapacity",
+    "readableSummary",
   ]);
 
-  fs.writeFileSync(path.join(dir, 'diagnostics.report.md'), buildReport(compact, tickerStats, closestSignals), 'utf8');
+  const tickerStats = groupByTicker(decisionRows).sort((a, b) =>
+    a.ticker.localeCompare(b.ticker),
+  );
+  writeCsv(path.join(dir, "ticker-stats.csv"), tickerStats, [
+    "ticker",
+    "decisions",
+    "hold",
+    "buy",
+    "sell",
+    "signalReady",
+    "executed",
+    "avgRsi",
+    "maxClosenessScore",
+    "lastReadableSummary",
+    "lastReason",
+  ]);
+
+  fs.writeFileSync(
+    path.join(dir, "diagnostics.report.md"),
+    buildReport(compact, tickerStats, closestSignals, latestRows),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(dir, "decisions.report.md"),
+    buildDecisionsReport(compact, latestRows, closestSignals),
+    "utf8",
+  );
 
   const zipPath = `${dir}.zip`;
   let zipCreated = false;
@@ -512,8 +827,8 @@ async function main() {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 
-  console.log('');
-  console.log('Diagnostics created:');
+  console.log("");
+  console.log("Diagnostics created:");
   if (!options.zipOnly || !zipCreated) {
     console.log(dir);
   }
@@ -521,17 +836,17 @@ async function main() {
     console.log(zipPath);
   }
   if (options.zipOnly && zipCreated) {
-    console.log('');
-    console.log('Zip-only mode: temporary diagnostics folder was removed.');
+    console.log("");
+    console.log("Zip-only mode: temporary diagnostics folder was removed.");
   }
-  console.log('');
-  console.log('Most useful files:');
+  console.log("");
+  console.log("Most useful files:");
   if (options.zip && zipCreated) {
     console.log(zipPath);
   } else {
-    console.log(path.join(dir, 'compact.summary.json'));
-    console.log(path.join(dir, 'diagnostics.report.md'));
-    console.log(path.join(dir, 'closest-signals.csv'));
+    console.log(path.join(dir, "decisions.report.md"));
+    console.log(path.join(dir, "diagnostics.report.md"));
+    console.log(path.join(dir, "latest-decision-summary.csv"));
   }
 }
 
