@@ -320,8 +320,21 @@ export function decideTradeSignal(input: StrategyInput): StrategyDecision {
   }
 
   if (maxSharesToBuy <= 0) {
+    const positionCapValue =
+      input.portfolioValue * config.maxPositionEquityFraction;
+
     return buildHoldDecision(
-      `Risk limit: no capacity to buy ${input.ticker}. Position cap or cash limit reached.`,
+      `Risk limit: no capacity to buy ${input.ticker}: maxSharesToBuy=${maxSharesToBuy}, sharesOwned=${input.sharesOwned}, currentPositionValue=${currentPositionValue.toFixed(
+        2,
+      )}, positionCapValue=${positionCapValue.toFixed(
+        2,
+      )}, remainingPositionCapacity=${remainingPositionCapacity.toFixed(
+        2,
+      )}, cashAllowedForBuy=${cashAllowedForBuy.toFixed(
+        2,
+      )}, cash=${input.cash.toFixed(2)}, price=${input.price.toFixed(
+        2,
+      )}, maxPositionEquityFraction=${config.maxPositionEquityFraction}, maxBuyCashFraction=${config.maxBuyCashFraction}`,
       diagnostics,
     );
   }
