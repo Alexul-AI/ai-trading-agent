@@ -351,8 +351,50 @@ export function decideTradeSignal(input: StrategyInput): StrategyDecision {
     };
   }
 
+  const closestSetup = sellSignal.score > buySignal.score ? "SELL" : "BUY";
+
+  const buyMissingReasons: string[] = [];
+  if (buySignal.score < config.minBuySignalScore) {
+    buyMissingReasons.push(
+      `buyScore ${buySignal.score}/${config.minBuySignalScore}`,
+    );
+  }
+  if (!nearLowerBand) {
+    buyMissingReasons.push("price is not near lower Bollinger band");
+  }
+  if (!macdRising) {
+    buyMissingReasons.push("MACD is not rising");
+  }
+
+  const sellMissingReasons: string[] = [];
+  if (input.sharesOwned <= 0) {
+    sellMissingReasons.push("no shares owned");
+  }
+  if (sellSignal.score < config.minSellSignalScore) {
+    sellMissingReasons.push(
+      `sellScore ${sellSignal.score}/${config.minSellSignalScore}`,
+    );
+  }
+  if (input.rsi < config.sellRsiThreshold) {
+    sellMissingReasons.push(
+      `RSI ${input.rsi} is below sell threshold ${config.sellRsiThreshold}`,
+    );
+  }
+  if (!macdFalling) {
+    sellMissingReasons.push("MACD is not falling");
+  }
+
+  const closestSetupReason =
+    closestSetup === "SELL"
+      ? `closest SELL setup is not actionable: ${sellMissingReasons.join("; ")}`
+      : `closest BUY setup is not actionable: ${buyMissingReasons.join("; ")}`;
+
   return buildHoldDecision(
-    `No confluence signal for ${input.ticker}: buyScore=${buySignal.score}/${config.minBuySignalScore}, sellScore=${sellSignal.score}/${config.minSellSignalScore}, RSI=${input.rsi}, nearLowerBand=${nearLowerBand}, nearUpperBand=${nearUpperBand}, macdRising=${macdRising}, macdFalling=${macdFalling}`,
+    `No confluence signal for ${input.ticker}: ${closestSetupReason}. buyScore=${buySignal.score}/${config.minBuySignalScore}, buyReasons=[${buySignal.reasons.join(
+      ", ",
+    )}], sellScore=${sellSignal.score}/${config.minSellSignalScore}, sellReasons=[${sellSignal.reasons.join(
+      ", ",
+    )}], RSI=${input.rsi}, nearLowerBand=${nearLowerBand}, nearUpperBand=${nearUpperBand}, macdRising=${macdRising}, macdFalling=${macdFalling}, sharesOwned=${input.sharesOwned}`,
     diagnostics,
   );
 }
