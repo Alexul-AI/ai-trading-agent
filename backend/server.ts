@@ -37,6 +37,7 @@ import {
   parseCorsOrigins,
   resolveAllowedCorsOrigin,
 } from "./src/config/cors.js";
+import { getBuildInfo } from "./src/config/buildInfo.js";
 
 dotenv.config();
 
@@ -651,7 +652,10 @@ app.get("/api/health", async (req, res) => {
       checkOpenAIConnectivity: false,
     });
 
-    res.status(report.ok ? 200 : 503).json(report);
+    res.status(report.ok ? 200 : 503).json({
+      ...report,
+      build: getBuildInfo(),
+    });
   } catch (error) {
     console.error("[API] /api/health failed:", error);
     res.status(500).json({
