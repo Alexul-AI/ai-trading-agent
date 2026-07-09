@@ -8,6 +8,7 @@ import { ExecutionReadinessPanel } from "./components/ExecutionReadinessPanel";
 import { LastAutopilotDecisions } from "./components/LastAutopilotDecisions";
 import { ManualOrderPanel } from "./components/ManualOrderPanel";
 import { MarketClockPanel } from "./components/MarketClockPanel";
+import { NewsSentimentPanel } from "./components/NewsSentimentPanel";
 import { StrategyComparisonPanel } from "./components/StrategyComparisonPanel";
 import { StrategyConfigPanel } from "./components/StrategyConfigPanel";
 import { StrategyQualityPanel } from "./components/StrategyQualityPanel";
@@ -30,6 +31,7 @@ import { isSignalReadyDecision } from "./utils/signalReadiness";
 import { useAdminSessionFetch } from "./hooks/useAdminSessionFetch";
 import { useAutopilotJournal } from "./hooks/useAutopilotJournal";
 import { useMarketClock } from "./hooks/useMarketClock";
+import { useNewsSentiment } from "./hooks/useNewsSentiment";
 import { useDashboardData } from "./hooks/useDashboardData";
 import { useAutopilotStream } from "./hooks/useAutopilotStream";
 import { useChatTerminal } from "./hooks/useChatTerminal";
@@ -109,6 +111,9 @@ export default function App() {
     setChatInput,
     handleSendMessage,
   } = useChatTerminal(fetchWithAdminSession);
+
+  const { sentiment, isLoadingSentiment, sentimentError, fetchSentiment } =
+    useNewsSentiment(fetchWithAdminSession);
 
   const manualOrder = useManualOrder({
     addAutopilotLog,
@@ -601,6 +606,14 @@ export default function App() {
           <LastAutopilotDecisions
             latestDecisions={latestDecisions}
             signalReadyCount={signalReadyDecisions.length}
+          />
+
+          <NewsSentimentPanel
+            watchlist={watchlist}
+            sentiment={sentiment}
+            isLoadingSentiment={isLoadingSentiment}
+            sentimentError={sentimentError}
+            onFetchSentiment={fetchSentiment}
           />
 
           <ChatTerminal

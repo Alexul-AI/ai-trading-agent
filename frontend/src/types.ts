@@ -198,6 +198,24 @@ export interface ChatResponse {
   reply?: string;
 }
 
+export interface NewsArticle {
+  id: number;
+  headline: string;
+  summary: string;
+  source: string;
+  url: string;
+  createdAt: string;
+}
+
+export interface NewsSentimentResult {
+  ticker: string;
+  sentiment: "BULLISH" | "BEARISH" | "NEUTRAL";
+  summary: string;
+  notableEvents: string[];
+  articleCount: number;
+  articles: NewsArticle[];
+}
+
 export interface TradeResponse {
   success?: boolean;
   error?: string;
