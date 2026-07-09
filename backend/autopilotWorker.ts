@@ -12,7 +12,7 @@ import {
   appendAutopilotRun,
   createStrategyConfigHash,
 } from "./decisionJournal.js";
-import { getNewsSentiment } from "./agent.js";
+import { getNewsSentiment, getInsiderActivity } from "./agent.js";
 
 interface AlpacaBar {
   t: string;
@@ -89,6 +89,7 @@ export type BlockReasonCategory =
   | "safety_cap"
   | "quantity"
   | "sentiment_filter"
+  | "insider_filter"
   | "error"
   | "other";
 
@@ -205,6 +206,15 @@ const AUTOPILOT_SENTIMENT_FILTER_ENABLED =
   process.env.AUTOPILOT_SENTIMENT_FILTER === "true";
 const SENTIMENT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
+// Same rationale as the sentiment filter: unbacktestable, off by default.
+// Threshold is intentionally conservative - a single insider sale is a
+// weak/noisy signal (taxes, diversification), so it only blocks on a
+// cluster of open-market sells with zero offsetting buys.
+const AUTOPILOT_INSIDER_FILTER_ENABLED =
+  process.env.AUTOPILOT_INSIDER_FILTER === "true";
+const INSIDER_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const INSIDER_SELL_CLUSTER_THRESHOLD = 2;
+
 // Default safety behavior:
 // normal SELL_SIGNAL should not sell a held position below average entry.
 // STOP_LOSS remains allowed to protect capital.
@@ -299,6 +309,66 @@ async function getBuySentimentVeto(
   return {
     blocked: false,
     note: `News sentiment filter: ${entry.sentiment} for ${ticker} - not blocking.`,
+  };
+}
+
+interface InsiderCacheEntry {
+  buyCount: number;
+  sellCount: number;
+  fetchedAt: number;
+}
+
+const insiderCacheByTicker = new Map<string, InsiderCacheEntry>();
+
+// Filters BUY signals against cached open-market insider transactions.
+// Fails open on fetch errors, same as the sentiment filter.
+async function getBuyInsiderVeto(
+  ticker: string,
+): Promise<SentimentVetoResult | null> {
+  if (!AUTOPILOT_INSIDER_FILTER_ENABLED) return null;
+
+  const cached = insiderCacheByTicker.get(ticker);
+  const isFresh =
+    cached !== undefined &&
+    Date.now() - cached.fetchedAt < INSIDER_CACHE_TTL_MS;
+
+  let entry: InsiderCacheEntry;
+
+  if (isFresh) {
+    entry = cached;
+  } else {
+    try {
+      const result = await getInsiderActivity(ticker);
+      const openMarket = result.transactions.filter((tx) => tx.isOpenMarket);
+
+      entry = {
+        buyCount: openMarket.filter((tx) => tx.transactionCode === "P").length,
+        sellCount: openMarket.filter((tx) => tx.transactionCode === "S").length,
+        fetchedAt: Date.now(),
+      };
+      insiderCacheByTicker.set(ticker, entry);
+    } catch (error) {
+      console.warn(
+        `[AUTOPILOT] Insider filter fetch failed for ${ticker}, not blocking trade:`,
+        getErrorMessage(error),
+      );
+      return null;
+    }
+  }
+
+  if (
+    entry.sellCount >= INSIDER_SELL_CLUSTER_THRESHOLD &&
+    entry.buyCount === 0
+  ) {
+    return {
+      blocked: true,
+      note: `Insider activity filter: ${entry.sellCount} open-market insider sells with no offsetting buys for ${ticker}.`,
+    };
+  }
+
+  return {
+    blocked: false,
+    note: `Insider activity filter: ${entry.buyCount} buys / ${entry.sellCount} sells for ${ticker} - not blocking.`,
   };
 }
 
@@ -607,6 +677,21 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         log.blockReasonDetail = sentimentVeto.note;
         log.safetyNote = appendSafetyNote(log.safetyNote, sentimentVeto.note);
         log.skippedReason = sentimentVeto.note;
+        return log;
+      }
+
+      const insiderVeto = await getBuyInsiderVeto(ticker);
+
+      if (insiderVeto?.blocked) {
+        log.finalStatus = "blocked";
+        log.signalStatus = "blocked";
+        log.executionStatus = "not_attempted";
+        log.isSignalReady = false;
+        log.blockReasonCategory = "insider_filter";
+        log.blockReasonCode = "INSIDER_SELL_CLUSTER";
+        log.blockReasonDetail = insiderVeto.note;
+        log.safetyNote = appendSafetyNote(log.safetyNote, insiderVeto.note);
+        log.skippedReason = insiderVeto.note;
         return log;
       }
     }

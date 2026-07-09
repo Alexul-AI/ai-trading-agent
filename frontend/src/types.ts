@@ -70,6 +70,7 @@ export type BlockReasonCategory =
   | "safety_cap"
   | "quantity"
   | "sentiment_filter"
+  | "insider_filter"
   | "error"
   | "other";
 
