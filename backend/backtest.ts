@@ -89,12 +89,18 @@ const APCA_API_KEY_ID = process.env.APCA_API_KEY_ID ?? "";
 const APCA_API_SECRET_KEY = process.env.APCA_API_SECRET_KEY ?? "";
 
 if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY) {
-  console.error("Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY in backend/.env");
+  console.error(
+    "Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY in backend/.env",
+  );
   process.exit(1);
 }
 
 const config: BacktestConfig = {
-  tickers: (process.env.BACKTEST_TICKERS || process.env.BACKTEST_TICKER || "TSLA")
+  tickers: (
+    process.env.BACKTEST_TICKERS ||
+    process.env.BACKTEST_TICKER ||
+    "TSLA"
+  )
     .split(",")
     .map((ticker) => ticker.trim().toUpperCase())
     .filter(Boolean),
@@ -228,7 +234,8 @@ function calculateTradeStats(closedTrades: Trade[]) {
     .filter((value): value is number => typeof value === "number");
 
   const wins = pnlValues.filter((pnl) => pnl > 0).length;
-  const winRatePercent = pnlValues.length > 0 ? (wins / pnlValues.length) * 100 : 0;
+  const winRatePercent =
+    pnlValues.length > 0 ? (wins / pnlValues.length) * 100 : 0;
   const averageClosedTradePnl =
     pnlValues.length > 0
       ? pnlValues.reduce((sum, pnl) => sum + pnl, 0) / pnlValues.length
@@ -254,7 +261,9 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
     `Max position: ${(config.strategy.maxPositionEquityFraction * 100).toFixed(0)}% equity`,
   );
   console.log(`Cooldown: ${config.strategy.cooldownBars} bars`);
-  console.log(`Stop-loss: ${(config.strategy.stopLossPercent * 100).toFixed(0)}%`);
+  console.log(
+    `Stop-loss: ${(config.strategy.stopLossPercent * 100).toFixed(0)}%`,
+  );
   console.log(
     `Take-profit: ${(config.strategy.takeProfitPercent * 100).toFixed(0)}%`,
   );
@@ -263,9 +272,16 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
 
   const bars = await fetchAlpacaBars(ticker, config.days, config.feed);
 
-  if (bars.length < 35) {
+  // RSI (Wilder smoothing) and MACD (EMA) are seeded from bars[0] and only
+  // converge to accurate values after ~100+ bars of recursive smoothing.
+  // Starting the simulation too early trades on distorted indicator values
+  // and makes results depend on how much history was fetched, not just the
+  // strategy itself.
+  const WARMUP_BARS = 150;
+
+  if (bars.length < WARMUP_BARS + 5) {
     throw new Error(
-      `Not enough bars for ${ticker}. Received ${bars.length}; need at least 35.`,
+      `Not enough bars for ${ticker}. Received ${bars.length}; need at least ${WARMUP_BARS + 5} for indicators to warm up.`,
     );
   }
 
@@ -285,7 +301,7 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
     firstPrice > 0 ? Math.floor(config.startingCapital / firstPrice) : 0;
   const buyAndHoldCash = config.startingCapital - buyAndHoldShares * firstPrice;
 
-  for (let i = 30; i < bars.length; i += 1) {
+  for (let i = WARMUP_BARS; i < bars.length; i += 1) {
     const currentBar = bars[i];
     if (!currentBar) continue;
 
@@ -482,7 +498,9 @@ function printResult(result: BacktestResult) {
   console.log(`Remaining cash: ${formatMoney(result.finalCash)}`);
   console.log(`Shares owned: ${result.finalShares}`);
   console.log(`Average entry price: ${formatMoney(result.averageEntryPrice)}`);
-  console.log(`Final portfolio value: ${formatMoney(result.finalPortfolioValue)}`);
+  console.log(
+    `Final portfolio value: ${formatMoney(result.finalPortfolioValue)}`,
+  );
   console.log(`Realized PnL: ${formatMoney(result.realizedPnl)}`);
   console.log(`Open unrealized PnL: ${formatMoney(result.openUnrealizedPnl)}`);
   console.log(
@@ -572,7 +590,8 @@ async function main() {
 }
 
 main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : "Unknown backtest error";
+  const message =
+    error instanceof Error ? error.message : "Unknown backtest error";
   console.error(`Backtest failed: ${message}`);
   process.exit(1);
 });
