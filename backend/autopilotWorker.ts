@@ -873,6 +873,53 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     );
   }
 
+  // Sentiment/insider filters are experimental and off by default - when
+  // enabled, the user should see a filter actually veto a signal, not have
+  // to go dig through the journal to find out.
+  async function sendTelegramForFilterBlocks(decisions: AutopilotDecisionLog[]) {
+    if (!options.sendTelegramAlert) return;
+
+    const blocked = decisions.filter(
+      (decision) =>
+        decision.blockReasonCategory === "sentiment_filter" ||
+        decision.blockReasonCategory === "insider_filter",
+    );
+
+    if (blocked.length === 0) return;
+
+    const now = Date.now();
+    const cooldownMs = AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES * 60 * 1000;
+
+    const newBlocks = blocked.filter((decision) => {
+      const key = `FILTER:${buildSignalKey(decision)}`;
+      const lastSentAt = lastTelegramSentAtBySignal.get(key);
+
+      if (lastSentAt && now - lastSentAt < cooldownMs) {
+        return false;
+      }
+
+      lastTelegramSentAtBySignal.set(key, now);
+      return true;
+    });
+
+    if (newBlocks.length === 0) return;
+
+    const lines = newBlocks.map((decision) => {
+      const filterName =
+        decision.blockReasonCategory === "sentiment_filter"
+          ? "Sentiment"
+          : "Insider activity";
+
+      return `${decision.ticker}: ${filterName} filter blocked a BUY - ${
+        decision.blockReasonDetail ?? decision.skippedReason
+      }`;
+    });
+
+    await options.sendTelegramAlert(
+      `Autopilot experimental filter vetoed a signal:\n${lines.join("\n")}`,
+    );
+  }
+
   async function runOnce(trigger: "manual" | "scheduled" = "manual") {
     if (running) {
       return {
@@ -1027,6 +1074,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       });
 
       await sendTelegramForNewSignalReadyDecisions(signalReady);
+      await sendTelegramForFilterBlocks(decisions);
     } catch (error) {
       topLevelError = getErrorMessage(error);
       lastError = topLevelError;
