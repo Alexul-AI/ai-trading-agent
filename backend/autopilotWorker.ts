@@ -12,6 +12,7 @@ import {
   appendAutopilotRun,
   createStrategyConfigHash,
 } from "./decisionJournal.js";
+import { getNewsSentiment } from "./agent.js";
 
 interface AlpacaBar {
   t: string;
@@ -87,6 +88,7 @@ export type BlockReasonCategory =
   | "position_guard"
   | "safety_cap"
   | "quantity"
+  | "sentiment_filter"
   | "error"
   | "other";
 
@@ -196,6 +198,13 @@ const AUTOPILOT_EXECUTE_TRADES =
 const AUTOPILOT_ALLOW_BUY = process.env.AUTOPILOT_ALLOW_BUY === "true";
 const AUTOPILOT_ALLOW_SELL = process.env.AUTOPILOT_ALLOW_SELL === "true";
 
+// Off by default: this signal cannot be backtested (news APIs only return
+// current data, not point-in-time history), so enabling it is an explicit,
+// unvalidated opt-in rather than a proven improvement.
+const AUTOPILOT_SENTIMENT_FILTER_ENABLED =
+  process.env.AUTOPILOT_SENTIMENT_FILTER === "true";
+const SENTIMENT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
 // Default safety behavior:
 // normal SELL_SIGNAL should not sell a held position below average entry.
 // STOP_LOSS remains allowed to protect capital.
@@ -228,6 +237,69 @@ function getErrorMessage(error: unknown): string {
 function clampFraction(value: number): number {
   if (!Number.isFinite(value)) return 0.25;
   return Math.max(0.01, Math.min(1, value));
+}
+
+interface SentimentCacheEntry {
+  sentiment: string;
+  summary: string;
+  fetchedAt: number;
+}
+
+const sentimentCacheByTicker = new Map<string, SentimentCacheEntry>();
+
+interface SentimentVetoResult {
+  blocked: boolean;
+  note: string;
+}
+
+// Filters BUY signals against cached news sentiment. Fails open: if
+// sentiment can't be fetched (rate limit, API error), the trade is not
+// blocked - this is a risk-reducing enhancement, not a reliability
+// dependency for the core strategy.
+async function getBuySentimentVeto(
+  ticker: string,
+): Promise<SentimentVetoResult | null> {
+  if (!AUTOPILOT_SENTIMENT_FILTER_ENABLED) return null;
+
+  const cached = sentimentCacheByTicker.get(ticker);
+  const isFresh =
+    cached !== undefined &&
+    Date.now() - cached.fetchedAt < SENTIMENT_CACHE_TTL_MS;
+
+  let entry: SentimentCacheEntry;
+
+  if (isFresh) {
+    entry = cached;
+  } else {
+    try {
+      const result = await getNewsSentiment(ticker);
+
+      entry = {
+        sentiment: result.sentiment,
+        summary: result.summary,
+        fetchedAt: Date.now(),
+      };
+      sentimentCacheByTicker.set(ticker, entry);
+    } catch (error) {
+      console.warn(
+        `[AUTOPILOT] Sentiment filter fetch failed for ${ticker}, not blocking trade:`,
+        getErrorMessage(error),
+      );
+      return null;
+    }
+  }
+
+  if (entry.sentiment === "BEARISH") {
+    return {
+      blocked: true,
+      note: `News sentiment filter: BEARISH for ${ticker} - ${entry.summary}`,
+    };
+  }
+
+  return {
+    blocked: false,
+    note: `News sentiment filter: ${entry.sentiment} for ${ticker} - not blocking.`,
+  };
 }
 
 function getSafeSellShares(
@@ -520,6 +592,23 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       log.skippedReason =
         "Position guard blocked SELL_SIGNAL below average entry.";
       return log;
+    }
+
+    if (decision.action === "BUY") {
+      const sentimentVeto = await getBuySentimentVeto(ticker);
+
+      if (sentimentVeto?.blocked) {
+        log.finalStatus = "blocked";
+        log.signalStatus = "blocked";
+        log.executionStatus = "not_attempted";
+        log.isSignalReady = false;
+        log.blockReasonCategory = "sentiment_filter";
+        log.blockReasonCode = "BEARISH_SENTIMENT";
+        log.blockReasonDetail = sentimentVeto.note;
+        log.safetyNote = appendSafetyNote(log.safetyNote, sentimentVeto.note);
+        log.skippedReason = sentimentVeto.note;
+        return log;
+      }
     }
 
     if (decision.confidence < AUTOPILOT_MIN_CONFIDENCE) {

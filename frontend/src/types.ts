@@ -69,6 +69,7 @@ export type BlockReasonCategory =
   | "position_guard"
   | "safety_cap"
   | "quantity"
+  | "sentiment_filter"
   | "error"
   | "other";
 
