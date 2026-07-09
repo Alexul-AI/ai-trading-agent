@@ -8,7 +8,7 @@ import { ExecutionReadinessPanel } from "./components/ExecutionReadinessPanel";
 import { LastAutopilotDecisions } from "./components/LastAutopilotDecisions";
 import { ManualOrderPanel } from "./components/ManualOrderPanel";
 import { MarketClockPanel } from "./components/MarketClockPanel";
-import { NewsSentimentPanel } from "./components/NewsSentimentPanel";
+import { MarketIntelPanel } from "./components/MarketIntelPanel";
 import { StrategyComparisonPanel } from "./components/StrategyComparisonPanel";
 import { StrategyConfigPanel } from "./components/StrategyConfigPanel";
 import { StrategyQualityPanel } from "./components/StrategyQualityPanel";
@@ -32,6 +32,7 @@ import { useAdminSessionFetch } from "./hooks/useAdminSessionFetch";
 import { useAutopilotJournal } from "./hooks/useAutopilotJournal";
 import { useMarketClock } from "./hooks/useMarketClock";
 import { useNewsSentiment } from "./hooks/useNewsSentiment";
+import { useFundamentals } from "./hooks/useFundamentals";
 import { useDashboardData } from "./hooks/useDashboardData";
 import { useAutopilotStream } from "./hooks/useAutopilotStream";
 import { useChatTerminal } from "./hooks/useChatTerminal";
@@ -114,6 +115,13 @@ export default function App() {
 
   const { sentiment, isLoadingSentiment, sentimentError, fetchSentiment } =
     useNewsSentiment(fetchWithAdminSession);
+
+  const {
+    fundamentals,
+    isLoadingFundamentals,
+    fundamentalsError,
+    fetchFundamentals,
+  } = useFundamentals(fetchWithAdminSession);
 
   const manualOrder = useManualOrder({
     addAutopilotLog,
@@ -608,12 +616,16 @@ export default function App() {
             signalReadyCount={signalReadyDecisions.length}
           />
 
-          <NewsSentimentPanel
+          <MarketIntelPanel
             watchlist={watchlist}
             sentiment={sentiment}
             isLoadingSentiment={isLoadingSentiment}
             sentimentError={sentimentError}
             onFetchSentiment={fetchSentiment}
+            fundamentals={fundamentals}
+            isLoadingFundamentals={isLoadingFundamentals}
+            fundamentalsError={fundamentalsError}
+            onFetchFundamentals={fetchFundamentals}
           />
 
           <ChatTerminal

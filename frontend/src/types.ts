@@ -216,6 +216,17 @@ export interface NewsSentimentResult {
   articles: NewsArticle[];
 }
 
+export interface FundamentalResult {
+  ticker: string;
+  marketCap: string;
+  peRatio: string;
+  forwardPE: string;
+  dividendYield: string;
+  fiftyTwoWeekHigh: string;
+  fiftyTwoWeekLow: string;
+  analystRating: string;
+}
+
 export interface TradeResponse {
   success?: boolean;
   error?: string;
