@@ -9,8 +9,11 @@ import {
 import type { AlpacaBar, MarketChartPoint } from "../types/serverTypes.js";
 import { roundOrNull } from "../utils/values.js";
 
-export function buildMarketChartPoints(bars: AlpacaBar[]): MarketChartPoint[] {
-  return bars.map((bar, index) => {
+export function buildMarketChartPoints(
+  bars: AlpacaBar[],
+  outputCount?: number,
+): MarketChartPoint[] {
+  const points = bars.map((bar, index) => {
     const closesUpToPoint = bars.slice(0, index + 1).map((item) => item.c);
 
     const hasRsi = closesUpToPoint.length >= 15;
@@ -37,4 +40,6 @@ export function buildMarketChartPoints(bars: AlpacaBar[]): MarketChartPoint[] {
       bollingerUpper: roundOrNull(bb?.upper, 2),
     };
   });
+
+  return outputCount ? points.slice(-outputCount) : points;
 }

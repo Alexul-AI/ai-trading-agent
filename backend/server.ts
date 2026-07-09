@@ -766,13 +766,16 @@ app.get("/api/market/chart/:ticker", async (req, res) => {
       .toUpperCase();
     const days = Number.parseInt(String(req.query.days ?? "120"), 10);
     const safeDays = Number.isFinite(days) ? days : 120;
+    const clampedDays = Math.max(30, Math.min(365, safeDays));
     const bars = await fetchDailyBarsForChart(ticker, safeDays);
 
     const payload: MarketChartResponse = {
       ticker,
-      days: Math.max(30, Math.min(365, safeDays)),
+      days: clampedDays,
       feed: ALPACA_DATA_FEED,
-      points: buildMarketChartPoints(bars),
+      // bars includes extra warm-up history so RSI/MACD are computed
+      // accurately; trim to the requested display window here.
+      points: buildMarketChartPoints(bars, clampedDays),
     };
 
     res.json(payload);

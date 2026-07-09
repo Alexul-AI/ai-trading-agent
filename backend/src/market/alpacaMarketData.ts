@@ -211,6 +211,15 @@ export function createAlpacaMarketData(config: AlpacaMarketDataConfig) {
     return items;
   }
 
+  // RSI and MACD use recursive/exponential smoothing seeded from the
+  // first bar in the series and only converge to accurate values after
+  // ~100+ bars of runway (same root cause as the backtest warm-up bug
+  // fixed earlier). Fetching extra history and trimming the *computed
+  // points* afterward (see buildMarketChartPoints) instead of trimming
+  // the raw bars first keeps the displayed indicator values accurate
+  // even for short chart windows like 60D.
+  const CHART_WARMUP_TRADING_DAYS = 150;
+
   async function fetchDailyBarsForChart(
     ticker: string,
     days: number,
@@ -220,11 +229,14 @@ export function createAlpacaMarketData(config: AlpacaMarketDataConfig) {
     }
 
     const safeDays = Math.max(30, Math.min(365, days));
+    const totalTradingDaysNeeded = safeDays + CHART_WARMUP_TRADING_DAYS;
     const endDate = new Date();
     const startDate = new Date();
 
     // Add buffer for weekends and market holidays.
-    startDate.setDate(endDate.getDate() - safeDays - 20);
+    startDate.setDate(
+      endDate.getDate() - Math.ceil(totalTradingDaysNeeded * 1.6),
+    );
 
     const allBars: AlpacaBar[] = [];
     let pageToken: string | undefined;
@@ -271,7 +283,7 @@ export function createAlpacaMarketData(config: AlpacaMarketDataConfig) {
 
     return allBars
       .sort((a, b) => new Date(a.t).getTime() - new Date(b.t).getTime())
-      .slice(-safeDays);
+      .slice(-totalTradingDaysNeeded);
   }
 
   async function getEstimatedPrice(ticker: string, fallbackPrice?: number) {
