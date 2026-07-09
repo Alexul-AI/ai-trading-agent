@@ -3,7 +3,11 @@ import dotenv from "dotenv";
 
 import { createAlpacaNews } from "./src/market/alpacaNews.js";
 import { createNewsSentimentAnalyzer } from "./src/market/newsSentiment.js";
-import type { NewsSentimentResult } from "./src/types/serverTypes.js";
+import { createAlphaVantageFundamentals } from "./src/market/alphaVantageFundamentals.js";
+import type {
+  NewsSentimentResult,
+  FundamentalResult,
+} from "./src/types/serverTypes.js";
 
 dotenv.config();
 
@@ -31,16 +35,7 @@ export interface TechnicalData {
 
 export type SentimentData = NewsSentimentResult;
 
-export interface FundamentalData {
-  ticker: string;
-  marketCap: string;
-  peRatio: string;
-  forwardPE: string;
-  dividendYield: string;
-  fiftyTwoWeekHigh: string;
-  fiftyTwoWeekLow: string;
-  analystRating: string;
-}
+export type FundamentalData = FundamentalResult;
 
 export interface AgentResponse {
   text: string;
@@ -80,6 +75,10 @@ const alpacaNews = createAlpacaNews({
 
 const newsSentimentAnalyzer = createNewsSentimentAnalyzer(openai);
 
+const alphaVantageFundamentals = createAlphaVantageFundamentals({
+  apiKey: process.env.ALPHA_VANTAGE_API_KEY ?? "",
+});
+
 const SYSTEM_PROMPT = `You are Alexul-AI Trading Agent.
 
 Yahoo Finance has been removed from this project.
@@ -90,10 +89,11 @@ Rules:
 2. Do not claim you checked live news, sentiment, fundamentals, RSI, MACD, Bollinger Bands or historical charts unless that data is explicitly present in the user's message or came back from a tool call in this conversation.
 3. If current Alpaca account/watchlist context is included in the user message, use it.
 4. If the user asks about news, sentiment, or what is happening with a stock, call get_news_sentiment instead of answering from memory.
-5. If the user asks to trade, never pretend execution in plain text. Use execute_trade.
-6. The backend RiskManager has final authority and can reject or reduce trades.
-7. Default to conservative paper-trading behavior.
-8. Keep answers practical and concise.`;
+5. If the user asks about fundamentals, valuation, P/E, dividends, or analyst ratings, call get_fundamentals instead of answering from memory.
+6. If the user asks to trade, never pretend execution in plain text. Use execute_trade.
+7. The backend RiskManager has final authority and can reject or reduce trades.
+8. Default to conservative paper-trading behavior.
+9. Keep answers practical and concise.`;
 
 const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
@@ -150,6 +150,21 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       name: "get_news_sentiment",
       description:
         "Fetches real recent news headlines for a ticker from Alpaca and classifies overall sentiment as BULLISH, BEARISH, or NEUTRAL, plus notable events like product launches, earnings, or leadership changes explicitly mentioned in the headlines.",
+      parameters: {
+        type: "object",
+        properties: {
+          ticker: { type: "string" },
+        },
+        required: ["ticker"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_fundamentals",
+      description:
+        "Fetches real company fundamentals for a ticker from Alpha Vantage: market cap, P/E ratio, forward P/E, dividend yield, 52-week high/low, and analyst consensus rating.",
       parameters: {
         type: "object",
         properties: {
@@ -236,6 +251,16 @@ export async function getNewsSentiment(
 }
 
 /**
+ * Standalone fundamentals lookup, usable outside the chat tool loop
+ * (e.g. a REST endpoint or a future dashboard panel).
+ */
+export async function getFundamentals(
+  ticker: string,
+): Promise<FundamentalResult> {
+  return alphaVantageFundamentals.fetchFundamentals(ticker);
+}
+
+/**
  * Backwards compatibility for server.ts.
  * Yahoo screener has been removed; this is now a static default watchlist.
  */
@@ -280,6 +305,7 @@ export async function runTradingAgentStep(
   let iterations = 0;
   const maxIterations = 3;
   let latestSentimentData: NewsSentimentResult | undefined;
+  let latestFundamentalData: FundamentalResult | undefined;
 
   while (
     message?.tool_calls &&
@@ -401,6 +427,27 @@ export async function runTradingAgentStep(
             };
           }
         }
+      } else if (functionName === "get_fundamentals") {
+        const ticker = toStringValue(args.ticker).toUpperCase();
+
+        if (!ticker) {
+          toolResult = { error: "Ticker is required." };
+        } else {
+          try {
+            const result =
+              await alphaVantageFundamentals.fetchFundamentals(ticker);
+
+            latestFundamentalData = result;
+            toolResult = result;
+          } catch (error) {
+            toolResult = {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to fetch fundamentals.",
+            };
+          }
+        }
       } else {
         toolResult = {
           error: `Unknown tool: ${functionName}`,
@@ -430,5 +477,6 @@ export async function runTradingAgentStep(
         ? message.content
         : "Done.",
     sentimentData: latestSentimentData,
+    fundamentalData: latestFundamentalData,
   };
 }

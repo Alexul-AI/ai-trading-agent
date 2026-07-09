@@ -4,7 +4,11 @@ import dotenv from "dotenv";
 import * as AlpacaModule from "@alpacahq/alpaca-trade-api";
 import { z } from "zod";
 
-import { runTradingAgentStep, getNewsSentiment } from "./agent.js";
+import {
+  runTradingAgentStep,
+  getNewsSentiment,
+  getFundamentals,
+} from "./agent.js";
 import { evaluateTrade, type AccountState } from "./riskManager.js";
 import { createAutopilotWorker } from "./autopilotWorker.js";
 import { createAdminAuth } from "./src/auth/adminAuth.js";
@@ -933,6 +937,23 @@ app.get("/api/news-sentiment/:ticker", requireAdminToken, async (req, res) => {
   } catch (error) {
     console.error("[API] /api/news-sentiment failed:", error);
     res.status(500).json({ error: "News sentiment engine error" });
+  }
+});
+
+app.get("/api/fundamentals/:ticker", requireAdminToken, async (req, res) => {
+  try {
+    const ticker = toStringValue(req.params.ticker).toUpperCase();
+
+    if (!ticker) {
+      return res.status(400).json({ error: "Ticker is required" });
+    }
+
+    const result = await getFundamentals(ticker);
+
+    res.json(result);
+  } catch (error) {
+    console.error("[API] /api/fundamentals failed:", error);
+    res.status(500).json({ error: "Fundamentals engine error" });
   }
 });
 

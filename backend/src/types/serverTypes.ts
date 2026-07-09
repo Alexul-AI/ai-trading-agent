@@ -106,3 +106,14 @@ export interface NewsSentimentResult {
   articleCount: number;
   articles: AlpacaNewsArticle[];
 }
+
+export interface FundamentalResult {
+  ticker: string;
+  marketCap: string;
+  peRatio: string;
+  forwardPE: string;
+  dividendYield: string;
+  fiftyTwoWeekHigh: string;
+  fiftyTwoWeekLow: string;
+  analystRating: string;
+}
