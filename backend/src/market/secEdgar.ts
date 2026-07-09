@@ -151,7 +151,10 @@ function toNumberOrNull(value: unknown): number | null {
   return Number.isFinite(num) ? num : null;
 }
 
-function parseForm4Xml(xml: string, filingUrl: string): InsiderTransaction[] {
+export function parseForm4Xml(
+  xml: string,
+  filingUrl: string,
+): InsiderTransaction[] {
   const parsed = xmlParser.parse(xml) as Form4Document;
   const doc = parsed.ownershipDocument;
 

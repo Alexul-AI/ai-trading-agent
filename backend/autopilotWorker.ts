@@ -257,9 +257,29 @@ interface SentimentCacheEntry {
 
 const sentimentCacheByTicker = new Map<string, SentimentCacheEntry>();
 
-interface SentimentVetoResult {
+export interface SentimentVetoResult {
   blocked: boolean;
   note: string;
+}
+
+// Pure decision rule, kept separate from the fetch/cache orchestration
+// below so it's testable without mocking network calls.
+export function evaluateSentimentVeto(
+  ticker: string,
+  sentiment: string,
+  summary: string,
+): SentimentVetoResult {
+  if (sentiment === "BEARISH") {
+    return {
+      blocked: true,
+      note: `News sentiment filter: BEARISH for ${ticker} - ${summary}`,
+    };
+  }
+
+  return {
+    blocked: false,
+    note: `News sentiment filter: ${sentiment} for ${ticker} - not blocking.`,
+  };
 }
 
 // Filters BUY signals against cached news sentiment. Fails open: if
@@ -299,17 +319,7 @@ async function getBuySentimentVeto(
     }
   }
 
-  if (entry.sentiment === "BEARISH") {
-    return {
-      blocked: true,
-      note: `News sentiment filter: BEARISH for ${ticker} - ${entry.summary}`,
-    };
-  }
-
-  return {
-    blocked: false,
-    note: `News sentiment filter: ${entry.sentiment} for ${ticker} - not blocking.`,
-  };
+  return evaluateSentimentVeto(ticker, entry.sentiment, entry.summary);
 }
 
 interface InsiderCacheEntry {
@@ -319,6 +329,26 @@ interface InsiderCacheEntry {
 }
 
 const insiderCacheByTicker = new Map<string, InsiderCacheEntry>();
+
+// Pure decision rule, kept separate from the fetch/cache orchestration
+// below so it's testable without mocking network calls.
+export function evaluateInsiderVeto(
+  ticker: string,
+  buyCount: number,
+  sellCount: number,
+): SentimentVetoResult {
+  if (sellCount >= INSIDER_SELL_CLUSTER_THRESHOLD && buyCount === 0) {
+    return {
+      blocked: true,
+      note: `Insider activity filter: ${sellCount} open-market insider sells with no offsetting buys for ${ticker}.`,
+    };
+  }
+
+  return {
+    blocked: false,
+    note: `Insider activity filter: ${buyCount} buys / ${sellCount} sells for ${ticker} - not blocking.`,
+  };
+}
 
 // Filters BUY signals against cached open-market insider transactions.
 // Fails open on fetch errors, same as the sentiment filter.
@@ -356,20 +386,7 @@ async function getBuyInsiderVeto(
     }
   }
 
-  if (
-    entry.sellCount >= INSIDER_SELL_CLUSTER_THRESHOLD &&
-    entry.buyCount === 0
-  ) {
-    return {
-      blocked: true,
-      note: `Insider activity filter: ${entry.sellCount} open-market insider sells with no offsetting buys for ${ticker}.`,
-    };
-  }
-
-  return {
-    blocked: false,
-    note: `Insider activity filter: ${entry.buyCount} buys / ${entry.sellCount} sells for ${ticker} - not blocking.`,
-  };
+  return evaluateInsiderVeto(ticker, entry.buyCount, entry.sellCount);
 }
 
 function getSafeSellShares(
@@ -769,12 +786,18 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
 
     const stopLoss =
       decision.action === "BUY"
-        ? Number((price * (1 - DEFAULT_STRATEGY_CONFIG.stopLossPercent)).toFixed(2))
+        ? Number(
+            (price * (1 - DEFAULT_STRATEGY_CONFIG.stopLossPercent)).toFixed(2),
+          )
         : undefined;
 
     const takeProfit =
       decision.action === "BUY"
-        ? Number((price * (1 + DEFAULT_STRATEGY_CONFIG.takeProfitPercent)).toFixed(2))
+        ? Number(
+            (price * (1 + DEFAULT_STRATEGY_CONFIG.takeProfitPercent)).toFixed(
+              2,
+            ),
+          )
         : undefined;
 
     const result = await options.executeSafeTrade(
@@ -949,7 +972,8 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         (decision) => decision.executionStatus === "dry_run",
       );
       const executedSignals = signalReady.filter(
-        (decision) => decision.executed || decision.executionStatus === "executed",
+        (decision) =>
+          decision.executed || decision.executionStatus === "executed",
       );
 
       runSignalReadyCount = signalReady.length;
@@ -971,7 +995,10 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           executedCount: runExecutedCount,
           strategyVersion: STRATEGY_VERSION,
           strategyConfigHash: STRATEGY_CONFIG_HASH,
-          strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<string, unknown>,
+          strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<
+            string,
+            unknown
+          >,
           decisions,
         });
 
@@ -1076,7 +1103,10 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       tradeMode: options.tradeMode,
       strategyVersion: STRATEGY_VERSION,
       strategyConfigHash: STRATEGY_CONFIG_HASH,
-      strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<string, unknown>,
+      strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<
+        string,
+        unknown
+      >,
       running,
       intervalMs: AUTOPILOT_INTERVAL_MS,
       tickers: AUTOPILOT_TICKERS,
