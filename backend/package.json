@@ -8,7 +8,8 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "test:backtest": "tsx backtest.ts"
+    "test:backtest": "tsx backtest.ts",
+    "test:backtest-sweep": "tsx backtest-sweep.ts"
   },
   "dependencies": {
     "@alpacahq/alpaca-trade-api": "^3.1.3",
