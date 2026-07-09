@@ -987,51 +987,59 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         ]),
       );
 
-      for (const ticker of tickers) {
-        try {
-          const decision = await analyzeTicker(ticker, portfolio);
-          decisions.push(decision);
+      // Each ticker's analysis only reads/writes its own per-ticker cache
+      // and cooldown entries (bars, sentiment, insider caches; lastBuyAt),
+      // and all of them read the same read-only portfolio snapshot - safe
+      // to run concurrently. Errors are caught per-ticker below so one
+      // failing ticker can never affect another or reject the batch.
+      decisions = await Promise.all(
+        tickers.map(async (ticker): Promise<AutopilotDecisionLog> => {
+          try {
+            const decision = await analyzeTicker(ticker, portfolio);
 
-          options.broadcastSSE({
-            type: "autopilot_signal",
-            data: decision,
-          });
-        } catch (error) {
-          const message = getErrorMessage(error);
+            options.broadcastSSE({
+              type: "autopilot_signal",
+              data: decision,
+            });
 
-          const failedDecision: AutopilotDecisionLog = {
-            ticker,
-            timestamp: new Date().toISOString(),
-            price: 0,
-            rsi: 0,
-            macdHistogram: 0,
-            previousMacdHistogram: 0,
-            bollingerLower: 0,
-            bollingerUpper: 0,
-            action: "HOLD",
-            confidence: 0,
-            suggestedShares: 0,
-            reasonType: "NO_SIGNAL",
-            reason: `Autopilot analysis failed for ${ticker}: ${message}`,
-            finalStatus: "error",
-            signalStatus: "blocked",
-            executionStatus: "not_attempted",
-            isSignalReady: false,
-            blockReasonCategory: "error",
-            blockReasonCode: "ANALYSIS_ERROR",
-            blockReasonDetail: message,
-            executed: false,
-            skippedReason: message,
-          };
+            return decision;
+          } catch (error) {
+            const message = getErrorMessage(error);
 
-          decisions.push(failedDecision);
+            const failedDecision: AutopilotDecisionLog = {
+              ticker,
+              timestamp: new Date().toISOString(),
+              price: 0,
+              rsi: 0,
+              macdHistogram: 0,
+              previousMacdHistogram: 0,
+              bollingerLower: 0,
+              bollingerUpper: 0,
+              action: "HOLD",
+              confidence: 0,
+              suggestedShares: 0,
+              reasonType: "NO_SIGNAL",
+              reason: `Autopilot analysis failed for ${ticker}: ${message}`,
+              finalStatus: "error",
+              signalStatus: "blocked",
+              executionStatus: "not_attempted",
+              isSignalReady: false,
+              blockReasonCategory: "error",
+              blockReasonCode: "ANALYSIS_ERROR",
+              blockReasonDetail: message,
+              executed: false,
+              skippedReason: message,
+            };
 
-          options.broadcastSSE({
-            type: "autopilot_signal_error",
-            data: failedDecision,
-          });
-        }
-      }
+            options.broadcastSSE({
+              type: "autopilot_signal_error",
+              data: failedDecision,
+            });
+
+            return failedDecision;
+          }
+        }),
+      );
 
       lastDecisions = decisions;
       lastRunAt = new Date().toISOString();
