@@ -464,7 +464,7 @@ function isSignalReadyDecision(decision: AutopilotDecisionLog): boolean {
   );
 }
 
-async function fetchAlpacaBars(ticker: string): Promise<AlpacaBar[]> {
+async function fetchAlpacaBarsUncached(ticker: string): Promise<AlpacaBar[]> {
   if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY) {
     throw new Error("Missing Alpaca API keys for market data.");
   }
@@ -516,6 +516,30 @@ async function fetchAlpacaBars(ticker: string): Promise<AlpacaBar[]> {
   return allBars.sort(
     (a, b) => new Date(a.t).getTime() - new Date(b.t).getTime(),
   );
+}
+
+// Daily bars cannot change more than once a day, so re-fetching the full
+// 180-day history on every 60s tick (5 tickers x 1440 ticks/day = up to
+// 7200 calls/day) was almost entirely redundant. A short cache cuts that
+// by ~5x with zero effect on the actual decisions.
+const BARS_CACHE_TTL_MS = 5 * 60 * 1000;
+const barsCacheByTicker = new Map<
+  string,
+  { bars: AlpacaBar[]; fetchedAt: number }
+>();
+
+async function fetchAlpacaBars(ticker: string): Promise<AlpacaBar[]> {
+  const cached = barsCacheByTicker.get(ticker);
+
+  if (cached && Date.now() - cached.fetchedAt < BARS_CACHE_TTL_MS) {
+    return cached.bars;
+  }
+
+  const bars = await fetchAlpacaBarsUncached(ticker);
+
+  barsCacheByTicker.set(ticker, { bars, fetchedAt: Date.now() });
+
+  return bars;
 }
 
 function calculateBarsSinceLastBuy(
