@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type {
   FundamentalResult,
+  InsiderActivityResult,
   NewsSentimentResult,
   WatchlistItem,
 } from "../types";
@@ -15,6 +16,10 @@ interface MarketIntelPanelProps {
   isLoadingFundamentals: boolean;
   fundamentalsError: string | null;
   onFetchFundamentals: (ticker: string) => void;
+  insiderActivity: InsiderActivityResult | null;
+  isLoadingInsiderActivity: boolean;
+  insiderActivityError: string | null;
+  onFetchInsiderActivity: (ticker: string) => void;
 }
 
 function sentimentPillClass(
@@ -41,6 +46,10 @@ export function MarketIntelPanel({
   isLoadingFundamentals,
   fundamentalsError,
   onFetchFundamentals,
+  insiderActivity,
+  isLoadingInsiderActivity,
+  insiderActivityError,
+  onFetchInsiderActivity,
 }: MarketIntelPanelProps) {
   const [selectedTicker, setSelectedTicker] = useState<string>("");
   const activeTicker = selectedTicker || watchlist[0]?.ticker || "";
@@ -209,6 +218,90 @@ export function MarketIntelPanel({
               </span>
             </div>
           </div>
+        )}
+      </div>
+
+      <div className="mt-3 border-t border-slate-800 pt-2">
+        <div className="flex items-center justify-between mb-1">
+          <div className="text-[10px] text-slate-600 font-black uppercase">
+            Insider activity
+          </div>
+
+          <button
+            type="button"
+            onClick={() => activeTicker && onFetchInsiderActivity(activeTicker)}
+            disabled={isLoadingInsiderActivity || !activeTicker}
+            className="text-[10px] font-bold text-slate-300 border border-slate-800 rounded px-1.5 py-0.5 hover:bg-slate-900 disabled:opacity-50"
+          >
+            {isLoadingInsiderActivity ? "Loading (SEC)..." : "Load"}
+          </button>
+        </div>
+
+        {insiderActivityError ? (
+          <div className="text-rose-300 font-bold text-xs">
+            INSIDER ERROR: {insiderActivityError}
+          </div>
+        ) : !insiderActivity ? (
+          <div className="text-slate-500 text-xs">
+            Not loaded. SEC EDGAR lookup takes ~10-15s.
+          </div>
+        ) : (
+          <>
+            {insiderActivity.transactions.filter((tx) => tx.isOpenMarket)
+              .length === 0 ? (
+              <div className="text-[11px] text-slate-500">
+                No open-market buys/sells in recent Form 4 filings (only routine
+                grants/exercises).
+              </div>
+            ) : (
+              <div className="space-y-1">
+                {insiderActivity.transactions
+                  .filter((tx) => tx.isOpenMarket)
+                  .slice(0, 5)
+                  .map((tx, index) => (
+                    <a
+                      key={`${tx.reportingOwnerName}-${tx.transactionDate}-${index}`}
+                      href={tx.filingUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="flex items-center justify-between text-[11px] hover:bg-slate-900 rounded px-1 py-0.5"
+                    >
+                      <span className="text-slate-300 truncate mr-2">
+                        {tx.reportingOwnerName}{" "}
+                        <span className="text-slate-500">({tx.title})</span>
+                      </span>
+                      <span
+                        className={`font-mono font-bold shrink-0 ${
+                          tx.transactionCode === "P"
+                            ? "text-emerald-300"
+                            : "text-rose-300"
+                        }`}
+                      >
+                        {tx.transactionCode === "P" ? "BUY" : "SELL"}{" "}
+                        {tx.shares.toLocaleString()}
+                      </span>
+                    </a>
+                  ))}
+              </div>
+            )}
+
+            {insiderActivity.personnelFilings.length > 0 && (
+              <div className="mt-2 space-y-1.5 border-t border-slate-800 pt-1.5">
+                {insiderActivity.personnelFilings.map((filing) => (
+                  <a
+                    key={filing.filingUrl}
+                    href={filing.filingUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="block text-[11px] text-slate-400 hover:text-slate-200 leading-snug"
+                  >
+                    <span className="text-slate-600">{filing.filingDate}:</span>{" "}
+                    {filing.summary}
+                  </a>
+                ))}
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>

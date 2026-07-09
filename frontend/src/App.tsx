@@ -33,6 +33,7 @@ import { useAutopilotJournal } from "./hooks/useAutopilotJournal";
 import { useMarketClock } from "./hooks/useMarketClock";
 import { useNewsSentiment } from "./hooks/useNewsSentiment";
 import { useFundamentals } from "./hooks/useFundamentals";
+import { useInsiderActivity } from "./hooks/useInsiderActivity";
 import { useDashboardData } from "./hooks/useDashboardData";
 import { useAutopilotStream } from "./hooks/useAutopilotStream";
 import { useChatTerminal } from "./hooks/useChatTerminal";
@@ -122,6 +123,13 @@ export default function App() {
     fundamentalsError,
     fetchFundamentals,
   } = useFundamentals(fetchWithAdminSession);
+
+  const {
+    insiderActivity,
+    isLoadingInsiderActivity,
+    insiderActivityError,
+    fetchInsiderActivity,
+  } = useInsiderActivity(fetchWithAdminSession);
 
   const manualOrder = useManualOrder({
     addAutopilotLog,
@@ -626,6 +634,10 @@ export default function App() {
             isLoadingFundamentals={isLoadingFundamentals}
             fundamentalsError={fundamentalsError}
             onFetchFundamentals={fetchFundamentals}
+            insiderActivity={insiderActivity}
+            isLoadingInsiderActivity={isLoadingInsiderActivity}
+            insiderActivityError={insiderActivityError}
+            onFetchInsiderActivity={fetchInsiderActivity}
           />
 
           <ChatTerminal
