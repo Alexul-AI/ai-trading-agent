@@ -277,14 +277,36 @@ export async function getNewsSentiment(
   return newsSentimentAnalyzer.analyzeSentiment(ticker, articles);
 }
 
+// Fundamentals (P/E, dividends, etc.) don't meaningfully change within a
+// day, and Alpha Vantage's free tier caps out at 25 requests/day for the
+// whole key - cache aggressively so repeated dashboard views of the same
+// ticker don't burn quota.
+const FUNDAMENTALS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const fundamentalsCache = new Map<
+  string,
+  { result: FundamentalResult; fetchedAt: number }
+>();
+
 /**
  * Standalone fundamentals lookup, usable outside the chat tool loop
- * (e.g. a REST endpoint or a future dashboard panel).
+ * (e.g. a REST endpoint or a future dashboard panel). Cached for 24h per
+ * ticker to conserve Alpha Vantage's free-tier daily quota.
  */
 export async function getFundamentals(
   ticker: string,
 ): Promise<FundamentalResult> {
-  return alphaVantageFundamentals.fetchFundamentals(ticker);
+  const key = ticker.toUpperCase();
+  const cached = fundamentalsCache.get(key);
+
+  if (cached && Date.now() - cached.fetchedAt < FUNDAMENTALS_CACHE_TTL_MS) {
+    return cached.result;
+  }
+
+  const result = await alphaVantageFundamentals.fetchFundamentals(key);
+
+  fundamentalsCache.set(key, { result, fetchedAt: Date.now() });
+
+  return result;
 }
 
 /**
@@ -486,8 +508,7 @@ export async function runTradingAgentStep(
           toolResult = { error: "Ticker is required." };
         } else {
           try {
-            const result =
-              await alphaVantageFundamentals.fetchFundamentals(ticker);
+            const result = await getFundamentals(ticker);
 
             latestFundamentalData = result;
             toolResult = result;
