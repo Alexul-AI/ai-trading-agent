@@ -36,16 +36,10 @@ export function evaluateTrade(
   account: AccountState,
   profile: RiskProfile = DEFAULT_PROFILE,
 ): RiskResult {
-  // 1. GLOBAL KILL SWITCH: Daily Drawdown Check
-  if (account.dailyDrawdownPercent <= profile.maxDailyDrawdownPercent) {
-    return {
-      approved: false,
-      adjustedShares: 0,
-      reason: `FATAL RISK: Daily drawdown (${(account.dailyDrawdownPercent * 100).toFixed(2)}%) has exceeded the safety limit of ${(profile.maxDailyDrawdownPercent * 100).toFixed(2)}%. Trading suspended.`,
-    };
-  }
-
-  // 2. SELL LOGIC: Always allow reducing exposure (if shares are owned)
+  // 1. SELL LOGIC: Always allow reducing exposure (if shares are owned),
+  // checked before the kill switch below - the kill switch exists to stop
+  // the bot from taking on MORE risk, not to trap it in a losing position
+  // when cutting losses is exactly what's needed.
   if (order.action === "SELL") {
     const existingPosition = account.currentPositions.find(
       (p) => p.ticker === order.ticker,
@@ -65,6 +59,15 @@ export function evaluateTrade(
       approved: true,
       adjustedShares: safeSharesToSell,
       reason: `APPROVED: Sell order verified for ${safeSharesToSell} shares of ${order.ticker}.`,
+    };
+  }
+
+  // 2. GLOBAL KILL SWITCH: Daily Drawdown Check (blocks new BUYs only)
+  if (account.dailyDrawdownPercent <= profile.maxDailyDrawdownPercent) {
+    return {
+      approved: false,
+      adjustedShares: 0,
+      reason: `FATAL RISK: Daily drawdown (${(account.dailyDrawdownPercent * 100).toFixed(2)}%) has exceeded the safety limit of ${(profile.maxDailyDrawdownPercent * 100).toFixed(2)}%. New buys suspended.`,
     };
   }
 
