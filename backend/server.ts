@@ -8,6 +8,7 @@ import {
   runTradingAgentStep,
   getNewsSentiment,
   getFundamentals,
+  getInsiderActivity,
 } from "./agent.js";
 import { evaluateTrade, type AccountState } from "./riskManager.js";
 import { createAutopilotWorker } from "./autopilotWorker.js";
@@ -956,6 +957,27 @@ app.get("/api/fundamentals/:ticker", requireAdminToken, async (req, res) => {
     res.status(500).json({ error: "Fundamentals engine error" });
   }
 });
+
+app.get(
+  "/api/insider-activity/:ticker",
+  requireAdminToken,
+  async (req, res) => {
+    try {
+      const ticker = toStringValue(req.params.ticker).toUpperCase();
+
+      if (!ticker) {
+        return res.status(400).json({ error: "Ticker is required" });
+      }
+
+      const result = await getInsiderActivity(ticker);
+
+      res.json(result);
+    } catch (error) {
+      console.error("[API] /api/insider-activity failed:", error);
+      res.status(500).json({ error: "Insider activity engine error" });
+    }
+  },
+);
 
 app.post("/api/autopilot", requireAdminToken, (req, res) => {
   const parsed = z.object({ enabled: z.boolean() }).safeParse(req.body);

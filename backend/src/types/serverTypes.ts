@@ -117,3 +117,30 @@ export interface FundamentalResult {
   fiftyTwoWeekLow: string;
   analystRating: string;
 }
+
+export interface InsiderTransaction {
+  reportingOwnerName: string;
+  title: string;
+  transactionDate: string;
+  transactionCode: string;
+  transactionCodeLabel: string;
+  isOpenMarket: boolean;
+  shares: number;
+  pricePerShare: number | null;
+  acquiredOrDisposed: "A" | "D";
+  sharesOwnedAfter: number | null;
+  filingUrl: string;
+}
+
+export interface PersonnelFiling {
+  filingDate: string;
+  itemCodes: string;
+  summary: string;
+  filingUrl: string;
+}
+
+export interface InsiderActivityResult {
+  ticker: string;
+  transactions: InsiderTransaction[];
+  personnelFilings: PersonnelFiling[];
+}
