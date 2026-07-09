@@ -256,9 +256,42 @@ export async function appendAutopilotRun(
   return runWithId;
 }
 
-export async function readAutopilotRuns(limit = 50): Promise<JournalRun[]> {
+// After weeks of continuous scheduled runs (one append per tick), the
+// journal file can grow to tens of MB. Reading a bounded tail instead of
+// the whole file keeps this fast and memory-stable no matter how long the
+// bot has been running - readAutopilotRuns is polled by the dashboard
+// every ~15s.
+const JOURNAL_TAIL_READ_BYTES = 5 * 1024 * 1024; // ~1700+ runs at typical row size, far more than any `limit` used today
+
+export async function readJournalTail(
+  maxBytes: number,
+  filePath: string = JOURNAL_FILE,
+): Promise<string> {
+  const stat = await fs.stat(filePath);
+  const start = Math.max(0, stat.size - maxBytes);
+  const length = stat.size - start;
+
+  if (length <= 0) return "";
+
+  const fileHandle = await fs.open(filePath, "r");
+
   try {
-    const raw = await fs.readFile(JOURNAL_FILE, "utf-8");
+    const buffer = Buffer.alloc(length);
+    await fileHandle.read(buffer, 0, length, start);
+
+    return buffer.toString("utf-8");
+  } finally {
+    await fileHandle.close();
+  }
+}
+
+export async function readAutopilotRuns(
+  limit = 50,
+  filePath: string = JOURNAL_FILE,
+  tailBytes: number = JOURNAL_TAIL_READ_BYTES,
+): Promise<JournalRun[]> {
+  try {
+    const raw = await readJournalTail(tailBytes, filePath);
     const lines = raw
       .split("\n")
       .map((line) => line.trim())
@@ -269,6 +302,8 @@ export async function readAutopilotRuns(limit = 50): Promise<JournalRun[]> {
         try {
           return JSON.parse(line) as JournalRun;
         } catch {
+          // A tail read may start mid-line - the first fragment is
+          // expected to fail to parse and is safely dropped.
           return null;
         }
       })
