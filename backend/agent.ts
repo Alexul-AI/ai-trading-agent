@@ -1,6 +1,10 @@
 import OpenAI from "openai";
 import dotenv from "dotenv";
 
+import { createAlpacaNews } from "./src/market/alpacaNews.js";
+import { createNewsSentimentAnalyzer } from "./src/market/newsSentiment.js";
+import type { NewsSentimentResult } from "./src/types/serverTypes.js";
+
 dotenv.config();
 
 export interface ChartPoint {
@@ -25,10 +29,7 @@ export interface TechnicalData {
   state: string;
 }
 
-export interface SentimentData {
-  sentiment: "BULLISH" | "BEARISH" | "NEUTRAL";
-  summary: string;
-}
+export type SentimentData = NewsSentimentResult;
 
 export interface FundamentalData {
   ticker: string;
@@ -72,6 +73,13 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const alpacaNews = createAlpacaNews({
+  keyId: process.env.APCA_API_KEY_ID ?? "",
+  secretKey: process.env.APCA_API_SECRET_KEY ?? "",
+});
+
+const newsSentimentAnalyzer = createNewsSentimentAnalyzer(openai);
+
 const SYSTEM_PROMPT = `You are Alexul-AI Trading Agent.
 
 Yahoo Finance has been removed from this project.
@@ -79,12 +87,13 @@ The backend uses Alpaca as the source of truth for account, positions, orders, e
 
 Rules:
 1. Do not claim you checked Yahoo Finance.
-2. Do not claim you checked live news, fundamentals, RSI, MACD, Bollinger Bands or historical charts unless that data is explicitly present in the user's message.
+2. Do not claim you checked live news, sentiment, fundamentals, RSI, MACD, Bollinger Bands or historical charts unless that data is explicitly present in the user's message or came back from a tool call in this conversation.
 3. If current Alpaca account/watchlist context is included in the user message, use it.
-4. If the user asks to trade, never pretend execution in plain text. Use execute_trade.
-5. The backend RiskManager has final authority and can reject or reduce trades.
-6. Default to conservative paper-trading behavior.
-7. Keep answers practical and concise.`;
+4. If the user asks about news, sentiment, or what is happening with a stock, call get_news_sentiment instead of answering from memory.
+5. If the user asks to trade, never pretend execution in plain text. Use execute_trade.
+6. The backend RiskManager has final authority and can reject or reduce trades.
+7. Default to conservative paper-trading behavior.
+8. Keep answers practical and concise.`;
 
 const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
@@ -102,11 +111,11 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           orderType: { type: "string", enum: ["market", "limit"] },
           limitPrice: { type: "number" },
           stopLoss: { type: "number" },
-          takeProfit: { type: "number" }
+          takeProfit: { type: "number" },
         },
-        required: ["ticker", "action", "shares"]
-      }
-    }
+        required: ["ticker", "action", "shares"],
+      },
+    },
   },
   {
     type: "function",
@@ -115,9 +124,9 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       description: "Returns local paper-trading transaction history.",
       parameters: {
         type: "object",
-        properties: {}
-      }
-    }
+        properties: {},
+      },
+    },
   },
   {
     type: "function",
@@ -129,12 +138,27 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
         type: "object",
         properties: {
           tickers: { type: "array", items: { type: "string" } },
-          budget: { type: "number" }
+          budget: { type: "number" },
         },
-        required: ["tickers", "budget"]
-      }
-    }
-  }
+        required: ["tickers", "budget"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_news_sentiment",
+      description:
+        "Fetches real recent news headlines for a ticker from Alpaca and classifies overall sentiment as BULLISH, BEARISH, or NEUTRAL, plus notable events like product launches, earnings, or leadership changes explicitly mentioned in the headlines.",
+      parameters: {
+        type: "object",
+        properties: {
+          ticker: { type: "string" },
+        },
+        required: ["ticker"],
+      },
+    },
+  },
 ];
 
 function parseToolArguments(rawArguments: string | undefined): ToolArguments {
@@ -176,25 +200,39 @@ function safeJson(value: unknown): string {
 function normalizeHistory(
   history: unknown[],
 ): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
-  return history.flatMap((item): OpenAI.Chat.Completions.ChatCompletionMessageParam[] => {
-    const record =
-      typeof item === "object" && item !== null ? (item as HistoryItem) : {};
+  return history.flatMap(
+    (item): OpenAI.Chat.Completions.ChatCompletionMessageParam[] => {
+      const record =
+        typeof item === "object" && item !== null ? (item as HistoryItem) : {};
 
-    const role = toStringValue(record.role);
-    const content = toStringValue(record.content);
+      const role = toStringValue(record.role);
+      const content = toStringValue(record.content);
 
-    if (!content) return [];
+      if (!content) return [];
 
-    if (role === "user") {
-      return [{ role: "user", content }];
-    }
+      if (role === "user") {
+        return [{ role: "user", content }];
+      }
 
-    if (role === "agent" || role === "assistant") {
-      return [{ role: "assistant", content }];
-    }
+      if (role === "agent" || role === "assistant") {
+        return [{ role: "assistant", content }];
+      }
 
-    return [];
-  });
+      return [];
+    },
+  );
+}
+
+/**
+ * Standalone news sentiment lookup, usable outside the chat tool loop
+ * (e.g. a REST endpoint or a future dashboard panel).
+ */
+export async function getNewsSentiment(
+  ticker: string,
+): Promise<NewsSentimentResult> {
+  const articles = await alpacaNews.fetchRecentNews(ticker, 8);
+
+  return newsSentimentAnalyzer.analyzeSentiment(ticker, articles);
 }
 
 /**
@@ -241,6 +279,7 @@ export async function runTradingAgentStep(
   let message = response.choices[0]?.message;
   let iterations = 0;
   const maxIterations = 3;
+  let latestSentimentData: NewsSentimentResult | undefined;
 
   while (
     message?.tool_calls &&
@@ -304,13 +343,18 @@ export async function runTradingAgentStep(
           const ticker = toStringValue(args.ticker).toUpperCase();
           const action = toStringValue(args.action).toUpperCase();
           const shares = toNumberValue(args.shares);
-          const orderType = toStringValue(args.orderType, "market").toLowerCase();
+          const orderType = toStringValue(
+            args.orderType,
+            "market",
+          ).toLowerCase();
           const limitPrice =
             args.limitPrice === undefined
               ? undefined
               : toNumberValue(args.limitPrice);
           const stopLoss =
-            args.stopLoss === undefined ? undefined : toNumberValue(args.stopLoss);
+            args.stopLoss === undefined
+              ? undefined
+              : toNumberValue(args.stopLoss);
           const takeProfit =
             args.takeProfit === undefined
               ? undefined
@@ -331,6 +375,30 @@ export async function runTradingAgentStep(
               stopLoss,
               takeProfit,
             );
+          }
+        }
+      } else if (functionName === "get_news_sentiment") {
+        const ticker = toStringValue(args.ticker).toUpperCase();
+
+        if (!ticker) {
+          toolResult = { error: "Ticker is required." };
+        } else {
+          try {
+            const articles = await alpacaNews.fetchRecentNews(ticker, 8);
+            const result = await newsSentimentAnalyzer.analyzeSentiment(
+              ticker,
+              articles,
+            );
+
+            latestSentimentData = result;
+            toolResult = result;
+          } catch (error) {
+            toolResult = {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to fetch news sentiment.",
+            };
           }
         }
       } else {
@@ -361,5 +429,6 @@ export async function runTradingAgentStep(
       typeof message?.content === "string" && message.content.trim()
         ? message.content
         : "Done.",
+    sentimentData: latestSentimentData,
   };
 }

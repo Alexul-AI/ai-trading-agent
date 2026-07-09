@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import * as AlpacaModule from "@alpacahq/alpaca-trade-api";
 import { z } from "zod";
 
-import { runTradingAgentStep } from "./agent.js";
+import { runTradingAgentStep, getNewsSentiment } from "./agent.js";
 import { evaluateTrade, type AccountState } from "./riskManager.js";
 import { createAutopilotWorker } from "./autopilotWorker.js";
 import { createAdminAuth } from "./src/auth/adminAuth.js";
@@ -916,6 +916,23 @@ app.post("/api/chat", requireAdminToken, async (req, res) => {
   } catch (error) {
     console.error("[API] /api/chat failed:", error);
     res.status(500).json({ error: "AI engine error" });
+  }
+});
+
+app.get("/api/news-sentiment/:ticker", requireAdminToken, async (req, res) => {
+  try {
+    const ticker = toStringValue(req.params.ticker).toUpperCase();
+
+    if (!ticker) {
+      return res.status(400).json({ error: "Ticker is required" });
+    }
+
+    const result = await getNewsSentiment(ticker);
+
+    res.json(result);
+  } catch (error) {
+    console.error("[API] /api/news-sentiment failed:", error);
+    res.status(500).json({ error: "News sentiment engine error" });
   }
 });
 

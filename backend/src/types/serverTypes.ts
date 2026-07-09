@@ -88,3 +88,21 @@ export type AlpacaConstructor = new (config: {
   secretKey: string;
   paper: boolean;
 }) => AlpacaLike;
+
+export interface AlpacaNewsArticle {
+  id: number;
+  headline: string;
+  summary: string;
+  source: string;
+  url: string;
+  createdAt: string;
+}
+
+export interface NewsSentimentResult {
+  ticker: string;
+  sentiment: "BULLISH" | "BEARISH" | "NEUTRAL";
+  summary: string;
+  notableEvents: string[];
+  articleCount: number;
+  articles: AlpacaNewsArticle[];
+}
