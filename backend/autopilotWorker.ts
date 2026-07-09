@@ -558,14 +558,15 @@ function calculateBarsSinceLastBuy(
   return elapsedMs >= cooldownMs ? DEFAULT_STRATEGY_CONFIG.cooldownBars : 0;
 }
 
-function buildSignalKey(decision: AutopilotDecisionLog): string {
-  return [
-    decision.ticker,
-    decision.action,
-    decision.reasonType,
-    decision.suggestedShares,
-    decision.reason,
-  ].join("|");
+// Deliberately excludes decision.reason and suggestedShares: both embed
+// live indicator values (RSI, price) that drift almost every tick, which
+// would make this key near-unique per call. That both defeats the
+// cooldown dedup (Telegram would alert on nearly every tick instead of
+// once per AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES) and leaks memory forever
+// in lastTelegramSentAtBySignal, since old keys are never evicted. Ticker
+// + action + reasonType is a small, naturally bounded key space.
+export function buildSignalKey(decision: AutopilotDecisionLog): string {
+  return [decision.ticker, decision.action, decision.reasonType].join("|");
 }
 
 export function createAutopilotWorker(options: AutopilotWorkerOptions) {
