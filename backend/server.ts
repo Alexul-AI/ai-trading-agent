@@ -15,6 +15,7 @@ import { createAutopilotWorker } from "./autopilotWorker.js";
 import { createAdminAuth } from "./src/auth/adminAuth.js";
 import {
   getAutopilotJournalPath,
+  getJournalTruncationInfo,
   readAutopilotRuns,
   summarizeAutopilotRuns,
 } from "./decisionJournal.js";
@@ -798,11 +799,16 @@ app.get("/api/autopilot/journal", async (req, res) => {
 
   try {
     const limit = Number.parseInt(String(req.query.limit ?? "50"), 10);
-    const runs = await readAutopilotRuns(Number.isFinite(limit) ? limit : 50);
+    const [runs, truncationInfo] = await Promise.all([
+      readAutopilotRuns(Number.isFinite(limit) ? limit : 50),
+      getJournalTruncationInfo(),
+    ]);
 
     res.json({
       file: getAutopilotJournalPath(),
       runs,
+      truncated: truncationInfo.truncated,
+      fileSizeBytes: truncationInfo.fileSizeBytes,
     });
   } catch (error) {
     console.error("[API] /api/autopilot/journal failed:", error);

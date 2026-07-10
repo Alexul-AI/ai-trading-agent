@@ -23,6 +23,12 @@ export interface AlpacaNewsConfig {
   secretKey: string;
 }
 
+// Without a timeout, a hung (not failed) request here never resolves,
+// which means Promise.all over tickers in autopilotWorker.ts never
+// settles either - running never gets reset to false, and every future
+// scheduled tick silently no-ops forever with no error logged.
+const FETCH_TIMEOUT_MS = 15_000;
+
 export function createAlpacaNews(config: AlpacaNewsConfig) {
   async function fetchRecentNews(
     ticker: string,
@@ -39,6 +45,7 @@ export function createAlpacaNews(config: AlpacaNewsConfig) {
         "APCA-API-KEY-ID": config.keyId,
         "APCA-API-SECRET-KEY": config.secretKey,
       },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {

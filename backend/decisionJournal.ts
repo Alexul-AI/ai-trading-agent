@@ -109,7 +109,25 @@ export interface JournalSummary {
   byAction: Record<string, number>;
   byTicker: Record<string, number>;
   byReasonType: Record<string, number>;
+  /**
+   * Blocked signal counts broken out by why they were blocked
+   * (confidence, position_guard, sentiment_filter, insider_filter, etc.).
+   * Without this, blocks from the experimental sentiment/insider filters
+   * were indistinguishable from ordinary strategy blocks in
+   * signalBlockedSignals - GOLIVE_CRITERIA.md gate #4 requires the two be
+   * tracked separately.
+   */
+  byBlockReasonCategory: Record<string, number>;
   lastRunAt: string | null;
+  oldestRunAt: string | null;
+  /**
+   * True when the journal file is larger than the tail window this
+   * summary was read from - i.e. this summary does NOT cover the bot's
+   * whole history, only its most recent slice. See
+   * getJournalTruncationInfo.
+   */
+  truncated: boolean;
+  fileSizeBytes: number;
 }
 
 const DATA_DIR = path.resolve(process.cwd(), "data");
@@ -321,8 +339,12 @@ export async function readAutopilotRuns(
 
 export async function summarizeAutopilotRuns(
   limit = 200,
+  filePath: string = JOURNAL_FILE,
 ): Promise<JournalSummary> {
-  const runs = await readAutopilotRuns(limit);
+  const [runs, truncationInfo] = await Promise.all([
+    readAutopilotRuns(limit, filePath),
+    getJournalTruncationInfo(filePath),
+  ]);
   const chronologicalRuns = [...runs].reverse();
 
   const summary: JournalSummary = {
@@ -335,7 +357,11 @@ export async function summarizeAutopilotRuns(
     byAction: {},
     byTicker: {},
     byReasonType: {},
+    byBlockReasonCategory: {},
     lastRunAt: chronologicalRuns.at(-1)?.timestamp ?? null,
+    oldestRunAt: chronologicalRuns.at(0)?.timestamp ?? null,
+    truncated: truncationInfo.truncated,
+    fileSizeBytes: truncationInfo.fileSizeBytes,
   };
 
   for (const run of chronologicalRuns) {
@@ -356,6 +382,11 @@ export async function summarizeAutopilotRuns(
           summary.signalReadySignals += 1;
         } else {
           summary.signalBlockedSignals += 1;
+
+          const category = decision.blockReasonCategory ?? "other";
+
+          summary.byBlockReasonCategory[category] =
+            (summary.byBlockReasonCategory[category] ?? 0) + 1;
         }
 
         if (isDryRunDecision(decision)) {
@@ -374,4 +405,32 @@ export async function summarizeAutopilotRuns(
 
 export function getAutopilotJournalPath(): string {
   return JOURNAL_FILE;
+}
+
+export interface JournalTruncationInfo {
+  truncated: boolean;
+  fileSizeBytes: number;
+}
+
+// Surfaces whether readAutopilotRuns/summarizeAutopilotRuns are seeing the
+// bot's whole history or only the tail window (JOURNAL_TAIL_READ_BYTES).
+// GOLIVE_CRITERIA.md gate #1 requires 4-6 weeks of continuous data - at
+// current tick volume the tail window covers roughly a day, so without
+// this flag the summary endpoint silently looks like "the whole history"
+// when it's actually a small, recent slice.
+export async function getJournalTruncationInfo(
+  filePath: string = JOURNAL_FILE,
+  tailBytes: number = JOURNAL_TAIL_READ_BYTES,
+): Promise<JournalTruncationInfo> {
+  try {
+    const stat = await fs.stat(filePath);
+
+    return { truncated: stat.size > tailBytes, fileSizeBytes: stat.size };
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return { truncated: false, fileSizeBytes: 0 };
+    }
+
+    throw error;
+  }
 }
