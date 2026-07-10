@@ -15,6 +15,7 @@ import {
 import { getNewsSentiment, getInsiderActivity } from "./agent.js";
 import {
   updatePortfolioCircuitBreaker,
+  getMaxDrawdownFromPeakPercent,
   type CircuitBreakerState,
 } from "./portfolioCircuitBreaker.js";
 
@@ -156,6 +157,7 @@ export interface AutopilotStatus {
   lastError: string | null;
   lastDecisions: AutopilotDecisionLog[];
   circuitBreaker: CircuitBreakerState | null;
+  circuitBreakerMaxDrawdownFromPeakPercent: number;
 }
 
 const APCA_API_KEY_ID = process.env.APCA_API_KEY_ID ?? "";
@@ -1264,6 +1266,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       lastError,
       lastDecisions,
       circuitBreaker: lastCircuitBreakerState,
+      circuitBreakerMaxDrawdownFromPeakPercent: getMaxDrawdownFromPeakPercent(),
     };
   }
 
