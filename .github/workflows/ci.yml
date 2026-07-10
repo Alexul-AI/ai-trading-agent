@@ -22,6 +22,14 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+        env:
+          # agent.ts constructs an OpenAI client at import time, and the SDK
+          # throws if the key is absent - autopilotWorker.ts (and thus its
+          # test suite) transitively imports agent.ts even though none of
+          # the unit tests actually call an OpenAI-backed function. A
+          # placeholder satisfies the constructor without touching the
+          # network or needing a real secret.
+          OPENAI_API_KEY: test-placeholder-key
 
   frontend:
     runs-on: ubuntu-latest
