@@ -13,6 +13,10 @@ import {
   createStrategyConfigHash,
 } from "./decisionJournal.js";
 import { getNewsSentiment, getInsiderActivity } from "./agent.js";
+import {
+  updatePortfolioCircuitBreaker,
+  type CircuitBreakerState,
+} from "./portfolioCircuitBreaker.js";
 
 interface AlpacaBar {
   t: string;
@@ -151,6 +155,7 @@ export interface AutopilotStatus {
   lastRunAt: string | null;
   lastError: string | null;
   lastDecisions: AutopilotDecisionLog[];
+  circuitBreaker: CircuitBreakerState | null;
 }
 
 const APCA_API_KEY_ID = process.env.APCA_API_KEY_ID ?? "";
@@ -578,12 +583,14 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
   let lastJournalRunId: string | null = null;
   let lastError: string | null = null;
   let lastDecisions: AutopilotDecisionLog[] = [];
+  let lastCircuitBreakerState: CircuitBreakerState | null = null;
   const lastBuyAtByTicker = new Map<string, number>();
   const lastTelegramSentAtBySignal = new Map<string, number>();
 
   async function analyzeTicker(
     ticker: string,
     portfolio: PortfolioSnapshot,
+    circuitBreakerState: CircuitBreakerState | null,
   ): Promise<AutopilotDecisionLog> {
     const bars = await fetchAlpacaBars(ticker);
 
@@ -708,6 +715,27 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     }
 
     if (decision.action === "BUY") {
+      if (circuitBreakerState?.tripped) {
+        const breakerNote = `Portfolio circuit breaker tripped: equity is down ${(
+          ((portfolio.equity - circuitBreakerState.peakEquity) /
+            circuitBreakerState.peakEquity) *
+          100
+        ).toFixed(1)}% from peak ${circuitBreakerState.peakEquity.toFixed(
+          2,
+        )} (recorded ${circuitBreakerState.peakEquityAt}). New BUYs blocked until reset.`;
+
+        log.finalStatus = "blocked";
+        log.signalStatus = "blocked";
+        log.executionStatus = "not_attempted";
+        log.isSignalReady = false;
+        log.blockReasonCategory = "safety_cap";
+        log.blockReasonCode = "PORTFOLIO_CIRCUIT_BREAKER";
+        log.blockReasonDetail = breakerNote;
+        log.safetyNote = appendSafetyNote(log.safetyNote, breakerNote);
+        log.skippedReason = breakerNote;
+        return log;
+      }
+
       const sentimentVeto = await getBuySentimentVeto(ticker);
 
       if (sentimentVeto?.blocked) {
@@ -988,15 +1016,50 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         ]),
       );
 
+      // Updated once per cycle here, never inside analyzeTicker - tickers
+      // are analyzed concurrently below, and a read-modify-write of the
+      // breaker's persisted state from multiple concurrent callers would race.
+      const circuitBreakerUpdate = await updatePortfolioCircuitBreaker(
+        portfolio.equity,
+      );
+      lastCircuitBreakerState = circuitBreakerUpdate.state;
+
+      if (circuitBreakerUpdate.justTripped) {
+        const alertMessage = `PORTFOLIO CIRCUIT BREAKER TRIPPED: equity ${portfolio.equity.toFixed(
+          2,
+        )} is down ${(
+          ((portfolio.equity - circuitBreakerUpdate.state.peakEquity) /
+            circuitBreakerUpdate.state.peakEquity) *
+          100
+        ).toFixed(1)}% from peak ${circuitBreakerUpdate.state.peakEquity.toFixed(
+          2,
+        )}. New BUYs are blocked until manually reset.`;
+
+        options.broadcastSSE({
+          type: "notification",
+          level: "error",
+          message: alertMessage,
+        });
+
+        if (options.sendTelegramAlert) {
+          await options.sendTelegramAlert(alertMessage);
+        }
+      }
+
       // Each ticker's analysis only reads/writes its own per-ticker cache
       // and cooldown entries (bars, sentiment, insider caches; lastBuyAt),
-      // and all of them read the same read-only portfolio snapshot - safe
-      // to run concurrently. Errors are caught per-ticker below so one
-      // failing ticker can never affect another or reject the batch.
+      // and all of them read the same read-only portfolio snapshot and
+      // circuit breaker state - safe to run concurrently. Errors are caught
+      // per-ticker below so one failing ticker can never affect another or
+      // reject the batch.
       decisions = await Promise.all(
         tickers.map(async (ticker): Promise<AutopilotDecisionLog> => {
           try {
-            const decision = await analyzeTicker(ticker, portfolio);
+            const decision = await analyzeTicker(
+              ticker,
+              portfolio,
+              circuitBreakerUpdate.state,
+            );
 
             options.broadcastSSE({
               type: "autopilot_signal",
@@ -1200,6 +1263,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       lastRunAt,
       lastError,
       lastDecisions,
+      circuitBreaker: lastCircuitBreakerState,
     };
   }
 
