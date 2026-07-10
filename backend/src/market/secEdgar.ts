@@ -12,6 +12,12 @@ const USER_AGENT =
 
 const TICKER_TO_CIK_URL = "https://www.sec.gov/files/company_tickers.json";
 
+// Without a timeout, a hung (not failed) request here never resolves,
+// which means Promise.all over tickers in autopilotWorker.ts never
+// settles either - running never gets reset to false, and every future
+// scheduled tick silently no-ops forever with no error logged.
+const FETCH_TIMEOUT_MS = 15_000;
+
 interface CompanyTickerEntry {
   cik_str: number;
   ticker: string;
@@ -22,7 +28,10 @@ let cikByTickerCache: Map<string, string> | null = null;
 let cikByTickerCachePromise: Promise<Map<string, string>> | null = null;
 
 async function fetchJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { headers: { "User-Agent": USER_AGENT } });
+  const response = await fetch(url, {
+    headers: { "User-Agent": USER_AGENT },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
 
   if (!response.ok) {
     throw new Error(
@@ -34,7 +43,10 @@ async function fetchJson<T>(url: string): Promise<T> {
 }
 
 async function fetchText(url: string): Promise<string> {
-  const response = await fetch(url, { headers: { "User-Agent": USER_AGENT } });
+  const response = await fetch(url, {
+    headers: { "User-Agent": USER_AGENT },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
 
   if (!response.ok) {
     throw new Error(
