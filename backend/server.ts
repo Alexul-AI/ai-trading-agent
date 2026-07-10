@@ -12,6 +12,10 @@ import {
 } from "./agent.js";
 import { evaluateTrade, type AccountState } from "./riskManager.js";
 import { createAutopilotWorker } from "./autopilotWorker.js";
+import {
+  getPortfolioCircuitBreakerState,
+  resetPortfolioCircuitBreaker,
+} from "./portfolioCircuitBreaker.js";
 import { createAdminAuth } from "./src/auth/adminAuth.js";
 import {
   getAutopilotJournalPath,
@@ -391,6 +395,27 @@ async function executeSafeTrade(
         };
       }),
     };
+
+    if (action === "BUY") {
+      const circuitBreakerState = await getPortfolioCircuitBreakerState();
+
+      if (circuitBreakerState?.tripped) {
+        const reason = `REJECTED: Portfolio circuit breaker tripped (equity down from peak ${circuitBreakerState.peakEquity.toFixed(
+          2,
+        )}). New BUYs blocked until reset via /api/autopilot/circuit-breaker/reset.`;
+
+        broadcastSSE({
+          type: "notification",
+          level: "error",
+          message: reason,
+        });
+
+        return {
+          status: "rejected",
+          reason,
+        };
+      }
+    }
 
     const riskResult = evaluateTrade(
       {
@@ -836,6 +861,28 @@ app.post("/api/autopilot/run-once", requireAdminToken, async (_req, res) => {
   const result = await autopilotWorker.runOnce("manual");
   res.json(result);
 });
+
+app.post(
+  "/api/autopilot/circuit-breaker/reset",
+  requireAdminToken,
+  async (_req, res) => {
+    try {
+      const portfolio = await getPortfolioSnapshot();
+      const state = await resetPortfolioCircuitBreaker(portfolio.equity);
+
+      broadcastSSE({
+        type: "notification",
+        level: "info",
+        message: `Portfolio circuit breaker reset. New peak equity: ${state.peakEquity.toFixed(2)}.`,
+      });
+
+      res.json({ status: "reset", state });
+    } catch (error) {
+      console.error("[API] /api/autopilot/circuit-breaker/reset failed:", error);
+      res.status(500).json({ error: "Failed to reset circuit breaker" });
+    }
+  },
+);
 
 app.post("/api/trade", requireAdminToken, async (req, res) => {
   if (!areManualTradesAllowed()) {
