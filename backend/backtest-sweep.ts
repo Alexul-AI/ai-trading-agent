@@ -39,7 +39,7 @@ if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY) {
 
 const TICKERS = (
   process.env.BACKTEST_TICKERS ||
-  "AMD,NVDA,AAPL,MSFT,TSLA,JPM,JNJ,XOM,PG,SPY"
+  "AMD,NVDA,AAPL,MSFT,TSLA,JPM,JNJ,XOM,PG,SPY,GLD,TLT,EFA"
 )
   .split(",")
   .map((t) => t.trim().toUpperCase())
