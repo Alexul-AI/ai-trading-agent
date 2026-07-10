@@ -8,6 +8,10 @@ const AUTOPILOT_MAX_DRAWDOWN_FROM_PEAK_PERCENT = Number.parseFloat(
   process.env.AUTOPILOT_MAX_DRAWDOWN_FROM_PEAK_PERCENT || "-0.15",
 );
 
+export function getMaxDrawdownFromPeakPercent(): number {
+  return AUTOPILOT_MAX_DRAWDOWN_FROM_PEAK_PERCENT;
+}
+
 export interface CircuitBreakerState {
   peakEquity: number;
   peakEquityAt: string;
