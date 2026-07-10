@@ -188,7 +188,7 @@ const ALPACA_DATA_FEED = process.env.ALPACA_DATA_FEED || "iex";
 
 const AUTOPILOT_TICKERS = (
   process.env.AUTOPILOT_TICKERS ||
-  "AMD,NVDA,AAPL,MSFT,TSLA,JPM,JNJ,XOM,PG,SPY"
+  "AMD,NVDA,AAPL,MSFT,TSLA,JPM,JNJ,XOM,PG,SPY,GLD,TLT,EFA"
 )
   .split(",")
   .map((ticker) => ticker.trim().toUpperCase())
