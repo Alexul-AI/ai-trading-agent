@@ -166,6 +166,21 @@ const AUTOPILOT_BARS_DAYS = Number.parseInt(
   10,
 );
 
+// RSI/MACD use recursive/Wilder smoothing seeded from bars[0] and only
+// converge to accurate values after ~150 trading days of runway - same
+// root cause already fixed in backtest.ts/backtest-sweep.ts/chartPoints.ts.
+// This was missed in the live decision path: AUTOPILOT_BARS_DAYS=180
+// calendar days is only ~128 trading days, so every live tick was computing
+// indicators on an under-warmed series. Enforcing a floor here means live
+// decisions stay correct even if AUTOPILOT_BARS_DAYS is ever configured
+// lower than this.
+const AUTOPILOT_WARMUP_TRADING_BARS = 150;
+const AUTOPILOT_MIN_FETCH_CALENDAR_DAYS = 230; // ~150+ trading days after weekends/holidays
+const AUTOPILOT_EFFECTIVE_BARS_DAYS = Math.max(
+  AUTOPILOT_BARS_DAYS,
+  AUTOPILOT_MIN_FETCH_CALENDAR_DAYS,
+);
+
 const AUTOPILOT_MIN_CONFIDENCE = Number.parseFloat(
   process.env.AUTOPILOT_MIN_CONFIDENCE || "0.75",
 );
@@ -471,7 +486,7 @@ async function fetchAlpacaBarsUncached(ticker: string): Promise<AlpacaBar[]> {
 
   const endDate = new Date();
   const startDate = new Date();
-  startDate.setDate(endDate.getDate() - AUTOPILOT_BARS_DAYS);
+  startDate.setDate(endDate.getDate() - AUTOPILOT_EFFECTIVE_BARS_DAYS);
 
   const allBars: AlpacaBar[] = [];
   let pageToken: string | undefined;
@@ -586,9 +601,9 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
   ): Promise<AutopilotDecisionLog> {
     const bars = await fetchAlpacaBars(ticker);
 
-    if (bars.length < 35) {
+    if (bars.length < AUTOPILOT_WARMUP_TRADING_BARS) {
       throw new Error(
-        `Not enough bars for ${ticker}. Received ${bars.length}; need at least 35.`,
+        `Not enough bars for ${ticker} to compute reliable indicators. Received ${bars.length}; need at least ${AUTOPILOT_WARMUP_TRADING_BARS} for RSI/MACD warm-up.`,
       );
     }
 
