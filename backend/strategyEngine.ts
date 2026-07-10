@@ -13,6 +13,17 @@ export interface StrategyConfig {
   cooldownBars: number;
   stopLossPercent: number;
   takeProfitPercent: number;
+
+  /**
+   * Off by default (see DEFAULT_STRATEGY_CONFIG): when true, the stop-loss
+   * and take-profit distances scale with each position's own entry-time
+   * volatility (entryAtrPercent * multiplier) instead of the flat
+   * stopLossPercent/takeProfitPercent above. Falls back to the flat
+   * percentages when entryAtrPercent is unavailable.
+   */
+  useAtrStops: boolean;
+  atrStopMultiplier: number;
+  atrTakeProfitMultiplier: number;
   buyRsiThreshold: number;
   buyRsiWithMomentumThreshold: number;
   sellRsiThreshold: number;
@@ -49,6 +60,7 @@ export interface StrategyInput {
   bollingerLower: number;
   bollingerUpper: number;
   barsSinceLastBuy: number;
+  entryAtrPercent?: number;
   config?: Partial<StrategyConfig>;
 }
 
@@ -86,6 +98,17 @@ export const DEFAULT_STRATEGY_CONFIG: StrategyConfig = {
   cooldownBars: 3,
   stopLossPercent: 0.08,
   takeProfitPercent: 0.15,
+  useAtrStops: false,
+  // Backtest-validated (900-day/13-ticker sweep): 2.5x/4.5x was a clear net
+  // negative on average (avg return +1.64% vs +3.05% baseline). 3.5x/6x
+  // roughly matches baseline (+3.10% avg return, -3.95% avg maxDD) while
+  // meaningfully improving win-rate consistency on the most volatile
+  // tickers (AMD 50%->83%, NVDA 87.5%->100%, TSLA 50%->67%). Still off by
+  // default - "roughly matches baseline" isn't yet strong enough evidence
+  // to flip the default, per this project's history of tweaks that looked
+  // promising on one backtest window and didn't hold up.
+  atrStopMultiplier: 3.5,
+  atrTakeProfitMultiplier: 6,
   buyRsiThreshold: 38,
   buyRsiWithMomentumThreshold: 46,
   sellRsiThreshold: 65,
@@ -257,7 +280,15 @@ export function decideTradeSignal(input: StrategyInput): StrategyDecision {
   };
 
   if (input.sharesOwned > 0 && input.averageEntryPrice > 0) {
-    if (positionReturn <= -config.stopLossPercent) {
+    const useAtr = config.useAtrStops && (input.entryAtrPercent ?? 0) > 0;
+    const effectiveStopLossPercent = useAtr
+      ? (input.entryAtrPercent as number) * config.atrStopMultiplier
+      : config.stopLossPercent;
+    const effectiveTakeProfitPercent = useAtr
+      ? (input.entryAtrPercent as number) * config.atrTakeProfitMultiplier
+      : config.takeProfitPercent;
+
+    if (positionReturn <= -effectiveStopLossPercent) {
       return {
         action: "SELL",
         suggestedShares: input.sharesOwned,
@@ -265,12 +296,12 @@ export function decideTradeSignal(input: StrategyInput): StrategyDecision {
         reasonType: "STOP_LOSS",
         reason: `Stop-loss triggered for ${input.ticker}: positionReturn=${formatPercent(
           positionReturn * 100,
-        )}`,
+        )}${useAtr ? ` (ATR-based, threshold=${formatPercent(-effectiveStopLossPercent * 100)})` : ""}`,
         diagnostics,
       };
     }
 
-    if (positionReturn >= config.takeProfitPercent) {
+    if (positionReturn >= effectiveTakeProfitPercent) {
       return {
         action: "SELL",
         suggestedShares: input.sharesOwned,
@@ -278,7 +309,7 @@ export function decideTradeSignal(input: StrategyInput): StrategyDecision {
         reasonType: "TAKE_PROFIT",
         reason: `Take-profit triggered for ${input.ticker}: positionReturn=${formatPercent(
           positionReturn * 100,
-        )}`,
+        )}${useAtr ? ` (ATR-based, threshold=${formatPercent(effectiveTakeProfitPercent * 100)})` : ""}`,
         diagnostics,
       };
     }

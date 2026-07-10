@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 
 import {
+  calculateATR,
   calculateBollingerBands,
   calculateMACD,
   calculateRSI,
@@ -288,6 +289,7 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
   let cash = config.startingCapital;
   let sharesOwned = 0;
   let averageEntryPrice = 0;
+  let entryAtrPercent = 0;
   let lastBuyIndex = -999;
   let realizedPnlTotal = 0;
   let totalEstimatedSlippageCost = 0;
@@ -315,6 +317,8 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
     const macd = calculateMACD(prices);
     const previousMacd = calculateMACD(previousPrices);
     const bb = calculateBollingerBands(prices, 20, 2);
+    const atr = calculateATR(bars.slice(0, i + 1), 14);
+    const atrPercent = currentPrice > 0 ? atr / currentPrice : 0;
 
     const portfolioValueBeforeDecision = cash + sharesOwned * currentPrice;
     const barsSinceLastBuy = i - lastBuyIndex;
@@ -332,6 +336,7 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
       bollingerLower: bb.lower,
       bollingerUpper: bb.upper,
       barsSinceLastBuy,
+      entryAtrPercent,
       config: config.strategy,
     });
 
@@ -346,14 +351,19 @@ async function runBacktestForTicker(ticker: string): Promise<BacktestResult> {
 
       if (cash >= cost) {
         const previousPositionCost = averageEntryPrice * sharesOwned;
+        const previousAtrWeight = entryAtrPercent * previousPositionCost;
+        const newBuyCost = executionPrice * decision.suggestedShares;
 
         cash -= cost;
         sharesOwned += decision.suggestedShares;
         averageEntryPrice =
           sharesOwned > 0
-            ? (previousPositionCost +
-                executionPrice * decision.suggestedShares) /
-              sharesOwned
+            ? (previousPositionCost + newBuyCost) / sharesOwned
+            : 0;
+        entryAtrPercent =
+          sharesOwned > 0
+            ? (previousAtrWeight + atrPercent * newBuyCost) /
+              (previousPositionCost + newBuyCost)
             : 0;
 
         lastBuyIndex = i;

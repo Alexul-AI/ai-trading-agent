@@ -10,6 +10,45 @@ export interface BollingerBandsResult {
   sma: number;
 }
 
+export interface AtrBar {
+  h: number;
+  l: number;
+  c: number;
+}
+
+// Wilder smoothing, same recursive-average style as calculateRSI below -
+// seed from a simple average over the first `periods` true ranges, then
+// smooth. Returns ATR in absolute price units, not a percent.
+export function calculateATR(bars: AtrBar[], periods = 14): number {
+  if (bars.length <= periods) return 0;
+
+  const trueRanges: number[] = [];
+
+  for (let i = 1; i < bars.length; i += 1) {
+    const current = bars[i];
+    const previous = bars[i - 1];
+    if (!current || !previous) continue;
+
+    const highLow = current.h - current.l;
+    const highPrevClose = Math.abs(current.h - previous.c);
+    const lowPrevClose = Math.abs(current.l - previous.c);
+
+    trueRanges.push(Math.max(highLow, highPrevClose, lowPrevClose));
+  }
+
+  if (trueRanges.length <= periods) return 0;
+
+  let atr =
+    trueRanges.slice(0, periods).reduce((sum, tr) => sum + tr, 0) / periods;
+
+  for (let i = periods; i < trueRanges.length; i += 1) {
+    const tr = trueRanges[i] ?? 0;
+    atr = (atr * (periods - 1) + tr) / periods;
+  }
+
+  return Number(atr.toFixed(4));
+}
+
 export function calculateRSI(prices: number[], periods = 14): number {
   if (prices.length <= periods) return 50;
 

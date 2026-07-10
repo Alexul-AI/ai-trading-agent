@@ -1,4 +1,5 @@
 import {
+  calculateATR,
   calculateBollingerBands,
   calculateMACD,
   calculateRSI,
@@ -587,6 +588,13 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
   let lastDecisions: AutopilotDecisionLog[] = [];
   let lastCircuitBreakerState: CircuitBreakerState | null = null;
   const lastBuyAtByTicker = new Map<string, number>();
+  // Entry-time ATR%, weighted-averaged across partial buys the same way
+  // averageEntryPrice is - in-memory only (not persisted like the circuit
+  // breaker): useAtrStops ships off by default and no trades execute yet
+  // (AUTOPILOT_EXECUTE_TRADES=false), so there's nothing real to lose on a
+  // restart today. decideTradeSignal falls back to the current cycle's ATR%
+  // when a ticker has no recorded entry here.
+  const entryAtrPercentByTicker = new Map<string, number>();
   const lastTelegramSentAtBySignal = new Map<string, number>();
 
   async function analyzeTicker(
@@ -615,6 +623,8 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     const macd = calculateMACD(prices);
     const previousMacd = calculateMACD(previousPrices);
     const bb = calculateBollingerBands(prices, 20, 2);
+    const atr = calculateATR(bars, 14);
+    const atrPercent = price > 0 ? atr / price : 0;
 
     const position = portfolio.positions[ticker];
     const sharesOwned = position?.shares ?? 0;
@@ -623,6 +633,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       ticker,
       lastBuyAtByTicker,
     );
+    const entryAtrPercent = entryAtrPercentByTicker.get(ticker) ?? atrPercent;
 
     const decision = decideTradeSignal({
       ticker,
@@ -637,6 +648,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       bollingerLower: bb.lower,
       bollingerUpper: bb.upper,
       barsSinceLastBuy,
+      entryAtrPercent,
     });
 
     let safeSuggestedShares = decision.suggestedShares;
@@ -840,19 +852,32 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       return log;
     }
 
+    const useAtrForOrder =
+      DEFAULT_STRATEGY_CONFIG.useAtrStops && atrPercent > 0;
+
     const stopLoss =
       decision.action === "BUY"
         ? Number(
-            (price * (1 - DEFAULT_STRATEGY_CONFIG.stopLossPercent)).toFixed(2),
+            (
+              price *
+              (1 -
+                (useAtrForOrder
+                  ? atrPercent * DEFAULT_STRATEGY_CONFIG.atrStopMultiplier
+                  : DEFAULT_STRATEGY_CONFIG.stopLossPercent))
+            ).toFixed(2),
           )
         : undefined;
 
     const takeProfit =
       decision.action === "BUY"
         ? Number(
-            (price * (1 + DEFAULT_STRATEGY_CONFIG.takeProfitPercent)).toFixed(
-              2,
-            ),
+            (
+              price *
+              (1 +
+                (useAtrForOrder
+                  ? atrPercent * DEFAULT_STRATEGY_CONFIG.atrTakeProfitMultiplier
+                  : DEFAULT_STRATEGY_CONFIG.takeProfitPercent))
+            ).toFixed(2),
           )
         : undefined;
 
@@ -875,6 +900,18 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
 
       if (decision.action === "BUY") {
         lastBuyAtByTicker.set(ticker, Date.now());
+
+        const previousPositionCost = averageEntryPrice * sharesOwned;
+        const previousAtrWeight = entryAtrPercent * previousPositionCost;
+        const newBuyCost = price * safeSuggestedShares;
+        const newPositionCost = previousPositionCost + newBuyCost;
+
+        entryAtrPercentByTicker.set(
+          ticker,
+          newPositionCost > 0
+            ? (previousAtrWeight + atrPercent * newBuyCost) / newPositionCost
+            : atrPercent,
+        );
       }
     } else {
       const executionFailure =
