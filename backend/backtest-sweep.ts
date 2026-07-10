@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 
 import {
+  calculateATR,
   calculateBollingerBands,
   calculateMACD,
   calculateRSI,
@@ -139,6 +140,7 @@ function simulate(
   let cash = STARTING_CAPITAL;
   let sharesOwned = 0;
   let averageEntryPrice = 0;
+  let entryAtrPercent = 0;
   let lastBuyIndex = -999;
   let lastStopLossIndex = -999;
   let realizedPnlTotal = 0;
@@ -165,6 +167,8 @@ function simulate(
     const macd = calculateMACD(prices);
     const previousMacd = calculateMACD(previousPrices);
     const bb = calculateBollingerBands(prices, 20, 2);
+    const atr = calculateATR(bars.slice(0, i + 1), 14);
+    const atrPercent = currentPrice > 0 ? atr / currentPrice : 0;
 
     const portfolioValueBeforeDecision = cash + sharesOwned * currentPrice;
     const barsSinceLastBuy = i - lastBuyIndex;
@@ -182,6 +186,7 @@ function simulate(
       bollingerLower: bb.lower,
       bollingerUpper: bb.upper,
       barsSinceLastBuy,
+      entryAtrPercent,
       config: strategy,
     });
 
@@ -223,13 +228,19 @@ function simulate(
 
       if (cash >= cost) {
         const previousPositionCost = averageEntryPrice * sharesOwned;
+        const previousAtrWeight = entryAtrPercent * previousPositionCost;
+        const newBuyCost = executionPrice * decision.suggestedShares;
+
         cash -= cost;
         sharesOwned += decision.suggestedShares;
         averageEntryPrice =
           sharesOwned > 0
-            ? (previousPositionCost +
-                executionPrice * decision.suggestedShares) /
-              sharesOwned
+            ? (previousPositionCost + newBuyCost) / sharesOwned
+            : 0;
+        entryAtrPercent =
+          sharesOwned > 0
+            ? (previousAtrWeight + atrPercent * newBuyCost) /
+              (previousPositionCost + newBuyCost)
             : 0;
         lastBuyIndex = i;
         tradesCount += 1;
@@ -250,7 +261,10 @@ function simulate(
         realizedPnlTotal += realizedPnl;
         closedPnls.push(realizedPnl);
         tradesCount += 1;
-        if (sharesOwned === 0) averageEntryPrice = 0;
+        if (sharesOwned === 0) {
+          averageEntryPrice = 0;
+          entryAtrPercent = 0;
+        }
         if (decision.reasonType === "STOP_LOSS") lastStopLossIndex = i;
       }
     }
@@ -320,6 +334,25 @@ const VARIANTS: {
     name: "slope-sma150-lb20",
     overrides: {},
     simOptions: { trendSlopeFilter: { smaLength: 150, lookbackBars: 20 } },
+  },
+  {
+    name: "atr-stops-2.5x-4.5x",
+    overrides: {
+      useAtrStops: true,
+      atrStopMultiplier: 2.5,
+      atrTakeProfitMultiplier: 4.5,
+    },
+  },
+  {
+    // Matches DEFAULT_STRATEGY_CONFIG's atrStopMultiplier/atrTakeProfitMultiplier -
+    // spelled out explicitly so this variant stays meaningful even if those
+    // defaults change later.
+    name: "atr-stops-3.5x-6x",
+    overrides: {
+      useAtrStops: true,
+      atrStopMultiplier: 3.5,
+      atrTakeProfitMultiplier: 6,
+    },
   },
 ];
 
