@@ -187,7 +187,8 @@ const AUTOPILOT_MAX_SELL_FRACTION = Number.parseFloat(
 const ALPACA_DATA_FEED = process.env.ALPACA_DATA_FEED || "iex";
 
 const AUTOPILOT_TICKERS = (
-  process.env.AUTOPILOT_TICKERS || "AMD,NVDA,AAPL,MSFT,TSLA"
+  process.env.AUTOPILOT_TICKERS ||
+  "AMD,NVDA,AAPL,MSFT,TSLA,JPM,JNJ,XOM,PG,SPY"
 )
   .split(",")
   .map((ticker) => ticker.trim().toUpperCase())

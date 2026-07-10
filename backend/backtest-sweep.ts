@@ -37,7 +37,10 @@ if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY) {
   process.exit(1);
 }
 
-const TICKERS = (process.env.BACKTEST_TICKERS || "AMD,NVDA,AAPL,MSFT,TSLA")
+const TICKERS = (
+  process.env.BACKTEST_TICKERS ||
+  "AMD,NVDA,AAPL,MSFT,TSLA,JPM,JNJ,XOM,PG,SPY"
+)
   .split(",")
   .map((t) => t.trim().toUpperCase())
   .filter(Boolean);
