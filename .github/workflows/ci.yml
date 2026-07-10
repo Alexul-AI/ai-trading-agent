@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+        env:
+          # agent.ts constructs an OpenAI client at import time, and the SDK
+          # throws if the key is absent - autopilotWorker.ts (and thus its
+          # test suite) transitively imports agent.ts even though none of
+          # the unit tests actually call an OpenAI-backed function. A
+          # placeholder satisfies the constructor without touching the
+          # network or needing a real secret.
+          OPENAI_API_KEY: test-placeholder-key
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
