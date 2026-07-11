@@ -17,6 +17,11 @@ import {
   resetPortfolioCircuitBreaker,
   type EquityHistoryPoint,
 } from "./portfolioCircuitBreaker.js";
+import {
+  classifyOrderError,
+  createClientOrderIdTracker,
+  type AlpacaErrorLike,
+} from "./orderIdempotency.js";
 import { createAdminAuth } from "./src/auth/adminAuth.js";
 import {
   getAutopilotJournalPath,
@@ -210,6 +215,11 @@ let transactionHistory: Array<{
   price: number;
   orderId?: string;
 }> = [];
+
+// Kept alive for this process's lifetime (see orderIdempotency.ts) - a
+// client_order_id for a given ticker+action is held until we get a
+// definitive outcome, not regenerated per call.
+const clientOrderIdTracker = createClientOrderIdTracker();
 
 const sseClients = new Set<Response>();
 
@@ -485,12 +495,15 @@ async function executeSafeTrade(
 
     const finalShares = riskResult.adjustedShares;
 
+    const clientOrderId = clientOrderIdTracker.getOrCreate(ticker, action);
+
     const orderPayload: UnknownRecord = {
       symbol: ticker,
       qty: finalShares,
       side: action.toLowerCase(),
       type: orderType,
       time_in_force: orderType === "limit" ? "gtc" : "day",
+      client_order_id: clientOrderId,
     };
 
     if (orderType === "limit") {
@@ -516,7 +529,41 @@ async function executeSafeTrade(
       }
     }
 
-    const createdOrder = asRecord(await alpaca.createOrder(orderPayload));
+    let createdOrder: UnknownRecord;
+
+    try {
+      createdOrder = asRecord(await alpaca.createOrder(orderPayload));
+      clientOrderIdTracker.clear(ticker, action);
+    } catch (orderError) {
+      const classification = classifyOrderError(
+        orderError as AlpacaErrorLike,
+      );
+
+      if (classification === "duplicate_client_order_id") {
+        // Our previous attempt with this exact client_order_id actually
+        // went through (this call is a retry after we couldn't confirm
+        // that) - fetch what Alpaca actually did instead of erroring.
+        createdOrder = asRecord(
+          await alpaca.getOrderByClientId(clientOrderId),
+        );
+        clientOrderIdTracker.clear(ticker, action);
+      } else if (classification === "definitive_rejection") {
+        // A real problem with the order itself - retrying the identical
+        // request won't fix it, safe to free up this ticker+action for a
+        // fresh attempt.
+        clientOrderIdTracker.clear(ticker, action);
+        throw orderError;
+      } else {
+        // Ambiguous network error (timeout, DNS, connection reset) - we
+        // genuinely don't know if Alpaca received it. Deliberately do NOT
+        // clear the tracker: a future attempt for this ticker+action
+        // reuses this same client_order_id, so if it turns out this
+        // attempt did land, that retry resolves safely via the duplicate
+        // branch above instead of submitting a second real order.
+        throw orderError;
+      }
+    }
+
     const orderId = toStringValue(createdOrder.id);
 
     transactionHistory.push({
