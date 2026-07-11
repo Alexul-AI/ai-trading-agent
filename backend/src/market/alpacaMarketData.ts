@@ -292,7 +292,16 @@ export function createAlpacaMarketData(config: AlpacaMarketDataConfig) {
     const latestTrade = await alpaca.getLatestTrade(ticker);
     const numericPrice = extractAlpacaPrice(latestTrade);
 
-    return numericPrice > 0 ? numericPrice : 1;
+    // This feeds riskManager.evaluateTrade's position-sizing math (the only
+    // caller - server.ts's executeSafeTrade). A silent $1 fallback here
+    // previously meant an Alpaca quote failure would make the risk manager
+    // think the ticker was absurdly cheap and approve a wildly oversized
+    // order. Better to reject the trade than size it against a fake price.
+    if (numericPrice <= 0) {
+      throw new Error(`Cannot estimate price for ${ticker}: no valid quote from Alpaca.`);
+    }
+
+    return numericPrice;
   }
 
   return {

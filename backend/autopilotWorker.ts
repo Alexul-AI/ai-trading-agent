@@ -915,6 +915,26 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         return log;
       }
 
+      // Fail closed on new risk when the breaker's own risk state can't be
+      // confirmed this cycle (equity-history fetch failed) - a hard safety
+      // layer shouldn't assume the best case just because a data source had
+      // a bad moment. SELL/STOP_LOSS are unaffected either way.
+      if (circuitBreakerState?.dataStale) {
+        const staleNote =
+          "Portfolio circuit breaker could not confirm current drawdown this cycle (equity history fetch failed) - new BUYs blocked until it succeeds again.";
+
+        log.finalStatus = "blocked";
+        log.signalStatus = "blocked";
+        log.executionStatus = "not_attempted";
+        log.isSignalReady = false;
+        log.blockReasonCategory = "safety_cap";
+        log.blockReasonCode = "PORTFOLIO_CIRCUIT_BREAKER_DATA_STALE";
+        log.blockReasonDetail = staleNote;
+        log.safetyNote = appendSafetyNote(log.safetyNote, staleNote);
+        log.skippedReason = staleNote;
+        return log;
+      }
+
       if (AUTOPILOT_REGIME_FILTER_ENABLED) {
         const regimeCheck = isBuySuppressedByRegime(
           regimeByBucketByDate,

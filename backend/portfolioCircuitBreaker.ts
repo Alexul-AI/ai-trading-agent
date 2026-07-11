@@ -26,6 +26,13 @@ export interface CircuitBreakerState {
   peakEquityAt: string;
   tripped: boolean;
   trippedAt: string | null;
+  // Recomputed fresh each cycle (not sticky like `tripped`): true when the
+  // most recent equity-history fetch failed, so peakEquity/drawdown for
+  // this cycle could not be confirmed. New BUYs are blocked while this is
+  // true - a hard safety layer should fail closed on new risk, not fail
+  // open just because a data fetch had a bad moment. SELL/STOP_LOSS are
+  // never affected by this, same as `tripped`.
+  dataStale: boolean;
 }
 
 export interface DrawdownEvaluation {
@@ -64,14 +71,24 @@ export function evaluatePortfolioDrawdown(
 
 // Pure - also testable without I/O. currentEquity is included as a
 // candidate (not just history) since Alpaca's history may lag the live
-// tick by up to a day.
+// tick by up to a day. `cachedPeak` (the last successfully-recorded peak,
+// if any) is also a candidate - without it, a history-fetch failure would
+// silently recompute peakEquity from currentEquity alone, potentially
+// *lowering* the recorded peak below a real, previously-confirmed high and
+// masking how deep the actual drawdown is.
 export function findPeakSinceTracking(
   history: EquityHistoryPoint[],
   currentEquity: number,
   now: string,
+  cachedPeak?: { equity: number; at: string },
 ): { peakEquity: number; peakEquityAt: string } {
   let peakEquity = currentEquity;
   let peakEquityAt = now;
+
+  if (cachedPeak && cachedPeak.equity > peakEquity) {
+    peakEquity = cachedPeak.equity;
+    peakEquityAt = cachedPeak.at;
+  }
 
   for (const point of history) {
     if (point.equity > peakEquity) {
@@ -123,27 +140,33 @@ export async function updatePortfolioCircuitBreaker(
   const existing = await readState();
   const trackingStartDate = existing?.trackingStartDate ?? now;
 
-  // Fails open to an empty history (peak falls back to currentEquity for
-  // this cycle only) rather than letting a fetch error crash the whole
-  // autopilot cycle - a crash here would block SELL/STOP_LOSS evaluation
-  // too, not just this breaker's own check, which is worse than missing one
-  // cycle's peak update. Critically, this can never un-trip an already-
-  // tripped breaker: `tripped` below is carried forward from the persisted
-  // state regardless of what happens to the history fetch.
+  // A fetch failure never crashes the whole autopilot cycle - a crash here
+  // would block SELL/STOP_LOSS evaluation too, not just this breaker's own
+  // check. But it also must not fail *open* for new risk: dataStale below
+  // blocks new BUYs for this cycle when we can't confirm the real drawdown,
+  // the same way a hard safety layer should fail closed on uncertainty
+  // rather than assume the best case. SELL/STOP_LOSS are never affected.
   let history: EquityHistoryPoint[] = [];
+  let dataStale = false;
   try {
     history = await fetchEquityHistory(trackingStartDate);
   } catch (error) {
+    dataStale = true;
     console.warn(
-      "[CIRCUIT BREAKER] Failed to fetch equity history, falling back to current equity as peak for this cycle:",
+      "[CIRCUIT BREAKER] Failed to fetch equity history - new BUYs blocked for this cycle until it succeeds again:",
       error instanceof Error ? error.message : error,
     );
   }
+
+  const cachedPeak = existing
+    ? { equity: existing.peakEquity, at: existing.peakEquityAt }
+    : undefined;
 
   const { peakEquity, peakEquityAt } = findPeakSinceTracking(
     history,
     currentEquity,
     now,
+    cachedPeak,
   );
 
   const evaluation = evaluatePortfolioDrawdown(currentEquity, peakEquity);
@@ -156,6 +179,7 @@ export async function updatePortfolioCircuitBreaker(
     peakEquityAt,
     tripped: evaluation.tripped || wasTripped,
     trippedAt: justTripped ? now : (existing?.trippedAt ?? null),
+    dataStale,
   };
 
   await writeState(state);
@@ -172,6 +196,7 @@ export async function resetPortfolioCircuitBreaker(
     peakEquityAt: now,
     tripped: false,
     trippedAt: null,
+    dataStale: false,
   };
   await writeState(state);
   return state;
