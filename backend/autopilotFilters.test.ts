@@ -192,6 +192,40 @@ describe("getSafeBuySharesForBucketCap", () => {
 
     expect(result.shares).toBe(10);
   });
+
+  it("uses a per-bucket override instead of the default fraction when one is set", () => {
+    // b1 override cap = 10000 * 0.1 = 1000, tighter than the 0.4 default.
+    const portfolio = makePortfolio(10000);
+
+    const result = getSafeBuySharesForBucketCap(
+      "AAA",
+      20,
+      100,
+      portfolio,
+      TICKER_TO_BUCKET,
+      0.4,
+      { b1: 0.1 },
+    );
+
+    expect(result.shares).toBe(10); // 1000 / 100
+    expect(result.safetyNote).toContain("Bucket cap");
+  });
+
+  it("falls back to the default fraction for a bucket with no override", () => {
+    const portfolio = makePortfolio(10000);
+
+    const result = getSafeBuySharesForBucketCap(
+      "CCC", // bucket b2, no override
+      20,
+      100,
+      portfolio,
+      TICKER_TO_BUCKET,
+      0.4,
+      { b1: 0.1 },
+    );
+
+    expect(result.shares).toBe(20); // 4000 / 100 cap, well above requested
+  });
 });
 
 describe("buildSignalKey", () => {
