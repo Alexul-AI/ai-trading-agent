@@ -5,12 +5,19 @@ import {
   calculateBollingerBands,
   calculateMACD,
   calculateRSI,
+  calculateSMA,
 } from "./indicators.js";
 import {
   DEFAULT_STRATEGY_CONFIG,
   decideTradeSignal,
   type StrategyConfig,
 } from "./strategyEngine.js";
+import {
+  computeBucketRegimeByDate,
+  isBuySuppressedByRegime,
+  type RegimeBucketConfig,
+  type RegimeState,
+} from "./src/strategy/portfolioRegimeFilter.js";
 
 dotenv.config();
 
@@ -45,6 +52,61 @@ const TICKERS = (
   .split(",")
   .map((t) => t.trim().toUpperCase())
   .filter(Boolean);
+
+// Mirrors autopilotWorker.ts's REGIME_BUCKETS/TICKER_TO_REGIME_BUCKET -
+// must stay identical between backtest and live, same as every other piece
+// of strategy logic in this file.
+function makeRegimeBuckets(exemptHighBeta: boolean): RegimeBucketConfig[] {
+  return [
+    {
+      bucketId: "us_broad",
+      label: "US broad market",
+      tickers: ["SPY"],
+      smaWindowDays: 200,
+    },
+    {
+      bucketId: "international",
+      label: "International developed",
+      tickers: ["EFA"],
+      smaWindowDays: 200,
+    },
+    {
+      bucketId: "bonds",
+      label: "Long treasuries",
+      tickers: ["TLT"],
+      smaWindowDays: 200,
+    },
+    {
+      bucketId: "commodities",
+      label: "Gold",
+      tickers: ["GLD"],
+      smaWindowDays: 200,
+    },
+    {
+      bucketId: "high_beta_growth",
+      label: "High-beta growth",
+      tickers: ["AMD", "NVDA", "TSLA"],
+      smaWindowDays: 200,
+      exempt: exemptHighBeta,
+    },
+  ];
+}
+
+const TICKER_TO_REGIME_BUCKET: Record<string, string> = {
+  AAPL: "us_broad",
+  MSFT: "us_broad",
+  JPM: "us_broad",
+  JNJ: "us_broad",
+  XOM: "us_broad",
+  PG: "us_broad",
+  SPY: "us_broad",
+  EFA: "international",
+  TLT: "bonds",
+  GLD: "commodities",
+  AMD: "high_beta_growth",
+  NVDA: "high_beta_growth",
+  TSLA: "high_beta_growth",
+};
 const DAYS = Number.parseInt(process.env.BACKTEST_DAYS || "365", 10);
 const STARTING_CAPITAL = Number.parseFloat(
   process.env.BACKTEST_STARTING_CAPITAL || "10000",
@@ -57,12 +119,21 @@ function toIsoDate(date: Date): string {
   return date.toISOString().split("T")[0] ?? date.toISOString();
 }
 
+// Lets a sweep run end on a historical date instead of always "today" - used
+// to validate a filter across multiple non-overlapping periods rather than
+// just the one window that happens to be convenient right now.
+const END_DAYS_AGO = Number.parseInt(
+  process.env.BACKTEST_END_DAYS_AGO || "0",
+  10,
+);
+
 async function fetchAlpacaBars(
   ticker: string,
   days: number,
 ): Promise<AlpacaBar[]> {
   const endDate = new Date();
-  const startDate = new Date();
+  endDate.setDate(endDate.getDate() - END_DAYS_AGO);
+  const startDate = new Date(endDate);
   startDate.setDate(endDate.getDate() - days);
 
   const allBars: AlpacaBar[] = [];
@@ -122,11 +193,7 @@ interface SimOptions {
   stopLossCooldownBars?: number;
   trendFilterSmaLength?: number;
   trendSlopeFilter?: { smaLength: number; lookbackBars: number };
-}
-
-function calculateSMA(prices: number[], period: number): number {
-  const slice = prices.slice(-period);
-  return slice.reduce((sum, p) => sum + p, 0) / slice.length;
+  regimeBlockedDates?: Set<string>;
 }
 
 function simulate(
@@ -213,12 +280,18 @@ function simulate(
       }
     }
 
+    const currentDateKey = currentBar.t.split("T")[0] ?? currentBar.t;
+    const blockedByRegimeFilter =
+      decision.action === "BUY" &&
+      (options.regimeBlockedDates?.has(currentDateKey) ?? false);
+
     if (
       decision.action === "BUY" &&
       decision.suggestedShares > 0 &&
       !blockedByStopLossCooldown &&
       !blockedByTrendFilter &&
-      !blockedByTrendSlope
+      !blockedByTrendSlope &&
+      !blockedByRegimeFilter
     ) {
       const executionPrice = Number(
         (currentPrice * (1 + SLIPPAGE_PERCENT)).toFixed(4),
@@ -313,6 +386,10 @@ const VARIANTS: {
   name: string;
   overrides: Partial<StrategyConfig>;
   simOptions?: SimOptions;
+  // Set instead of a static simOptions.regimeBlockedDates, since the
+  // blocked-dates set depends on which bucket the ticker being simulated
+  // belongs to - resolved per-ticker in main() below.
+  regimeExemptHighBeta?: boolean;
 }[] = [
   { name: "baseline", overrides: {} },
   {
@@ -354,7 +431,37 @@ const VARIANTS: {
       atrTakeProfitMultiplier: 6,
     },
   },
+  {
+    name: "regime-filter-exempt-highbeta",
+    overrides: {},
+    regimeExemptHighBeta: true,
+  },
+  {
+    name: "regime-filter-no-exempt",
+    overrides: {},
+    regimeExemptHighBeta: false,
+  },
 ];
+
+// computeBucketRegimeByDate's output doesn't depend on `exempt` (exempt only
+// affects whether the regime is honored, not how it's computed) - so the
+// timeline is built once, and exempt is applied here at lookup time.
+function deriveRegimeBlockedDates(
+  regimeByBucketByDate: Map<string, Map<string, RegimeState>>,
+  bucket: RegimeBucketConfig | undefined,
+): Set<string> {
+  const blocked = new Set<string>();
+  if (!bucket || bucket.exempt) return blocked;
+
+  const regimeByDate = regimeByBucketByDate.get(bucket.bucketId);
+  if (!regimeByDate) return blocked;
+
+  for (const [dateKey, state] of regimeByDate) {
+    if (state === "RISK_OFF") blocked.add(dateKey);
+  }
+
+  return blocked;
+}
 
 async function main() {
   console.log(
@@ -367,6 +474,20 @@ async function main() {
     console.log(`Fetching ${ticker}...`);
     barsByTicker.set(ticker, await fetchAlpacaBars(ticker, DAYS));
   }
+
+  // computeBucketRegimeByDate's output doesn't depend on `exempt`, so the
+  // timeline is computed once here; exempt is applied per-variant below via
+  // deriveRegimeBlockedDates.
+  const regimeByBucketByDate = new Map<string, Map<string, RegimeState>>();
+  for (const bucket of makeRegimeBuckets(true)) {
+    regimeByBucketByDate.set(
+      bucket.bucketId,
+      computeBucketRegimeByDate(barsByTicker, bucket),
+    );
+  }
+
+  const regimeBucketsExempt = makeRegimeBuckets(true);
+  const regimeBucketsNotExempt = makeRegimeBuckets(false);
 
   const perVariantTotals = new Map<
     string,
@@ -391,7 +512,26 @@ async function main() {
         ...DEFAULT_STRATEGY_CONFIG,
         ...variant.overrides,
       };
-      const result = simulate(bars, strategy, variant.simOptions ?? {});
+
+      let simOptions = variant.simOptions ?? {};
+
+      if (variant.regimeExemptHighBeta !== undefined) {
+        const buckets = variant.regimeExemptHighBeta
+          ? regimeBucketsExempt
+          : regimeBucketsNotExempt;
+        const bucketId = TICKER_TO_REGIME_BUCKET[ticker];
+        const bucket = buckets.find((b) => b.bucketId === bucketId);
+
+        simOptions = {
+          ...simOptions,
+          regimeBlockedDates: deriveRegimeBlockedDates(
+            regimeByBucketByDate,
+            bucket,
+          ),
+        };
+      }
+
+      const result = simulate(bars, strategy, simOptions);
 
       console.log(
         variant.name.padEnd(24) +

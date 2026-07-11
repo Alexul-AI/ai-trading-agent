@@ -19,6 +19,12 @@ import {
   getMaxDrawdownFromPeakPercent,
   type CircuitBreakerState,
 } from "./portfolioCircuitBreaker.js";
+import {
+  computeBucketRegimeByDate,
+  isBuySuppressedByRegime,
+  type RegimeBucketConfig,
+  type RegimeState,
+} from "./src/strategy/portfolioRegimeFilter.js";
 
 interface AlpacaBar {
   t: string;
@@ -96,6 +102,7 @@ export type BlockReasonCategory =
   | "quantity"
   | "sentiment_filter"
   | "insider_filter"
+  | "regime_filter"
   | "error"
   | "other";
 
@@ -223,6 +230,70 @@ const AUTOPILOT_INSIDER_FILTER_ENABLED =
   process.env.AUTOPILOT_INSIDER_FILTER === "true";
 const INSIDER_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const INSIDER_SELL_CLUSTER_THRESHOLD = 2;
+
+// Off by default: backtest-validated (see backtest-sweep.ts's
+// regime-filter-* variants), but "roughly matches baseline" isn't strong
+// enough evidence to flip a new filter on by default - same standard
+// already applied to useAtrStops.
+const AUTOPILOT_REGIME_FILTER_ENABLED =
+  process.env.AUTOPILOT_REGIME_FILTER === "true";
+
+// Every bucket-representative ticker below (SPY, EFA, TLT, GLD, AMD, NVDA,
+// TSLA) is already part of AUTOPILOT_TICKERS and already fetched every
+// cycle via fetchAlpacaBars's cache - this filter reads bars that are being
+// fetched anyway, no extra API calls.
+const REGIME_BUCKETS: RegimeBucketConfig[] = [
+  {
+    bucketId: "us_broad",
+    label: "US broad market",
+    tickers: ["SPY"],
+    smaWindowDays: 200,
+  },
+  {
+    bucketId: "international",
+    label: "International developed",
+    tickers: ["EFA"],
+    smaWindowDays: 200,
+  },
+  {
+    bucketId: "bonds",
+    label: "Long treasuries",
+    tickers: ["TLT"],
+    smaWindowDays: 200,
+  },
+  {
+    bucketId: "commodities",
+    label: "Gold",
+    tickers: ["GLD"],
+    smaWindowDays: 200,
+  },
+  {
+    bucketId: "high_beta_growth",
+    label: "High-beta growth",
+    tickers: ["AMD", "NVDA", "TSLA"],
+    smaWindowDays: 200,
+    // Backtest-validated: see backtest-sweep.ts's regime-filter-* variants -
+    // an unvalidated hypothesis until checked against our own tickers, not
+    // accepted as a given just because it was suggested.
+    exempt: process.env.AUTOPILOT_REGIME_EXEMPT_HIGH_BETA !== "false",
+  },
+];
+
+const TICKER_TO_REGIME_BUCKET: Record<string, string> = {
+  AAPL: "us_broad",
+  MSFT: "us_broad",
+  JPM: "us_broad",
+  JNJ: "us_broad",
+  XOM: "us_broad",
+  PG: "us_broad",
+  SPY: "us_broad",
+  EFA: "international",
+  TLT: "bonds",
+  GLD: "commodities",
+  AMD: "high_beta_growth",
+  NVDA: "high_beta_growth",
+  TSLA: "high_beta_growth",
+};
 
 // Default safety behavior:
 // normal SELL_SIGNAL should not sell a held position below average entry.
@@ -601,6 +672,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     ticker: string,
     portfolio: PortfolioSnapshot,
     circuitBreakerState: CircuitBreakerState | null,
+    regimeByBucketByDate: Map<string, Map<string, RegimeState>>,
   ): Promise<AutopilotDecisionLog> {
     const bars = await fetchAlpacaBars(ticker);
 
@@ -619,6 +691,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     }
 
     const price = Number(latestBar.c.toFixed(2));
+    const latestDateKey = latestBar.t.split("T")[0] ?? latestBar.t;
     const rsi = calculateRSI(prices, 14);
     const macd = calculateMACD(prices);
     const previousMacd = calculateMACD(previousPrices);
@@ -748,6 +821,29 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         log.safetyNote = appendSafetyNote(log.safetyNote, breakerNote);
         log.skippedReason = breakerNote;
         return log;
+      }
+
+      if (AUTOPILOT_REGIME_FILTER_ENABLED) {
+        const regimeCheck = isBuySuppressedByRegime(
+          regimeByBucketByDate,
+          ticker,
+          latestDateKey,
+          TICKER_TO_REGIME_BUCKET,
+          REGIME_BUCKETS,
+        );
+
+        if (regimeCheck.suppressed) {
+          log.finalStatus = "blocked";
+          log.signalStatus = "blocked";
+          log.executionStatus = "not_attempted";
+          log.isSignalReady = false;
+          log.blockReasonCategory = "regime_filter";
+          log.blockReasonCode = "REGIME_RISK_OFF";
+          log.blockReasonDetail = regimeCheck.reason;
+          log.safetyNote = appendSafetyNote(log.safetyNote, regimeCheck.reason);
+          log.skippedReason = regimeCheck.reason;
+          return log;
+        }
       }
 
       const sentimentVeto = await getBuySentimentVeto(ticker);
@@ -1085,6 +1181,39 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         }
       }
 
+      // Computed once per cycle, before the concurrent per-ticker loop
+      // below - every bucket-representative ticker (SPY, EFA, TLT, GLD,
+      // AMD, NVDA, TSLA) is already part of AUTOPILOT_TICKERS, so this
+      // reuses fetchAlpacaBars's existing cache rather than issuing new
+      // requests.
+      const regimeByBucketByDate = new Map<string, Map<string, RegimeState>>();
+
+      if (AUTOPILOT_REGIME_FILTER_ENABLED) {
+        const regimeBarsByTicker = new Map<string, AlpacaBar[]>();
+        const bucketTickers = new Set(
+          REGIME_BUCKETS.flatMap((bucket) => bucket.tickers),
+        );
+
+        await Promise.all(
+          Array.from(bucketTickers).map(async (ticker) => {
+            try {
+              regimeBarsByTicker.set(ticker, await fetchAlpacaBars(ticker));
+            } catch (error) {
+              console.warn(
+                `[REGIME] Failed to fetch bars for ${ticker}: ${getErrorMessage(error)}`,
+              );
+            }
+          }),
+        );
+
+        for (const bucket of REGIME_BUCKETS) {
+          regimeByBucketByDate.set(
+            bucket.bucketId,
+            computeBucketRegimeByDate(regimeBarsByTicker, bucket),
+          );
+        }
+      }
+
       // Each ticker's analysis only reads/writes its own per-ticker cache
       // and cooldown entries (bars, sentiment, insider caches; lastBuyAt),
       // and all of them read the same read-only portfolio snapshot and
@@ -1098,6 +1227,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
               ticker,
               portfolio,
               circuitBreakerUpdate.state,
+              regimeByBucketByDate,
             );
 
             options.broadcastSSE({

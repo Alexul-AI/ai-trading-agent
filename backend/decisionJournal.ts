@@ -25,6 +25,7 @@ export type BlockReasonCategory =
   | "quantity"
   | "sentiment_filter"
   | "insider_filter"
+  | "regime_filter"
   | "error"
   | "other";
 
