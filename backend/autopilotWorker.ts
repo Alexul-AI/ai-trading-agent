@@ -175,8 +175,13 @@ export interface AutopilotStatus {
 const APCA_API_KEY_ID = process.env.APCA_API_KEY_ID ?? "";
 const APCA_API_SECRET_KEY = process.env.APCA_API_SECRET_KEY ?? "";
 
+// Strategy decisions are computed from daily bars (RSI/MACD/BB don't change
+// intraday), so polling every 60s previously just re-evaluated the same
+// inputs ~390 times between meaningful data changes - added log/journal
+// noise and API calls, not information. Hourly gives 24 evaluations/day
+// instead, still frequent enough to react same-day, without the churn.
 const AUTOPILOT_INTERVAL_MS = Number.parseInt(
-  process.env.AUTOPILOT_INTERVAL_MS || "60000",
+  process.env.AUTOPILOT_INTERVAL_MS || "3600000",
   10,
 );
 
@@ -321,6 +326,21 @@ const TICKER_TO_BUCKET: Record<string, string> = {
 const AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION = Number.parseFloat(
   process.env.AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION || "0.4",
 );
+
+// ETF-first tilt: high_beta_growth (AMD/NVDA/TSLA) gets a tighter cap than
+// the other buckets - equal to the single-ticker cap, so the whole bucket
+// combined can never exceed what one full-sized individual position would
+// already be allowed. Doesn't remove these tickers from the universe, just
+// meaningfully reduces how concentrated the bot can get in speculative
+// single names versus the ETF-heavy buckets (us_broad/international/
+// bonds/commodities), which keep the looser 40% default.
+const AUTOPILOT_HIGH_BETA_BUCKET_EQUITY_FRACTION = Number.parseFloat(
+  process.env.AUTOPILOT_HIGH_BETA_BUCKET_EQUITY_FRACTION || "0.2",
+);
+
+const BUCKET_EQUITY_FRACTION_OVERRIDES: Record<string, number> = {
+  high_beta_growth: AUTOPILOT_HIGH_BETA_BUCKET_EQUITY_FRACTION,
+};
 
 // Default safety behavior:
 // normal SELL_SIGNAL should not sell a held position below average entry.
@@ -540,7 +560,8 @@ export function getSafeBuySharesForBucketCap(
   price: number,
   portfolio: PortfolioSnapshot,
   tickerToBucket: Record<string, string>,
-  maxBucketEquityFraction: number,
+  defaultMaxBucketEquityFraction: number,
+  bucketEquityFractionOverrides: Record<string, number> = {},
 ): { shares: number; safetyNote?: string } {
   if (requestedShares <= 0 || price <= 0) {
     return { shares: Math.max(0, requestedShares) };
@@ -560,6 +581,8 @@ export function getSafeBuySharesForBucketCap(
     }
   }
 
+  const maxBucketEquityFraction =
+    bucketEquityFractionOverrides[bucketId] ?? defaultMaxBucketEquityFraction;
   const bucketCapValue = portfolio.equity * maxBucketEquityFraction;
   const remainingBucketCapacity = Math.max(0, bucketCapValue - bucketExposure);
   const maxSharesForBucket = Math.floor(remainingBucketCapacity / price);
@@ -822,6 +845,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         portfolio,
         TICKER_TO_BUCKET,
         AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION,
+        BUCKET_EQUITY_FRACTION_OVERRIDES,
       );
 
       safeSuggestedShares = bucketCap.shares;
