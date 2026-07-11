@@ -279,7 +279,9 @@ const REGIME_BUCKETS: RegimeBucketConfig[] = [
   },
 ];
 
-const TICKER_TO_REGIME_BUCKET: Record<string, string> = {
+// Shared by the regime filter (#8) and the bucket concentration cap (#9) -
+// same real-world correlation grouping serves both purposes.
+const TICKER_TO_BUCKET: Record<string, string> = {
   AAPL: "us_broad",
   MSFT: "us_broad",
   JPM: "us_broad",
@@ -294,6 +296,15 @@ const TICKER_TO_REGIME_BUCKET: Record<string, string> = {
   NVDA: "high_beta_growth",
   TSLA: "high_beta_growth",
 };
+
+// Twice the single-ticker cap (maxPositionEquityFraction is 0.2) - allows up
+// to two full-sized positions' worth of concentration in one correlated
+// bucket, but blocks the AMD+NVDA+TSLA-all-at-20%-each scenario. Only bites
+// for multi-ticker buckets (us_broad, high_beta_growth) - the single-ticker
+// buckets never approach 40% since they're already capped at 20% each.
+const AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION = Number.parseFloat(
+  process.env.AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION || "0.4",
+);
 
 // Default safety behavior:
 // normal SELL_SIGNAL should not sell a held position below average entry.
@@ -495,6 +506,55 @@ function getSafeSellShares(
       safetyNote: `Safety cap: reduced SELL from ${suggestedShares} to ${safeShares} shares (${Math.round(
         maxFraction * 100,
       )}% max sell fraction).`,
+    };
+  }
+
+  return { shares: safeShares };
+}
+
+// Reduce-don't-just-reject, same shape as getSafeSellShares above - the
+// existing 20% single-ticker cap (maxPositionEquityFraction in
+// strategyEngine.ts) doesn't stop AMD+NVDA+TSLA each sitting at 20%
+// simultaneously (60% in one correlated bucket). This is a portfolio
+// construction safety rule, not a return hypothesis - always on, no opt-in
+// flag, same as the circuit breaker.
+export function getSafeBuySharesForBucketCap(
+  ticker: string,
+  requestedShares: number,
+  price: number,
+  portfolio: PortfolioSnapshot,
+  tickerToBucket: Record<string, string>,
+  maxBucketEquityFraction: number,
+): { shares: number; safetyNote?: string } {
+  if (requestedShares <= 0 || price <= 0) {
+    return { shares: Math.max(0, requestedShares) };
+  }
+
+  const bucketId = tickerToBucket[ticker.toUpperCase()];
+  if (!bucketId) {
+    return { shares: requestedShares };
+  }
+
+  let bucketExposure = 0;
+  for (const [positionTicker, position] of Object.entries(
+    portfolio.positions,
+  )) {
+    if (tickerToBucket[positionTicker.toUpperCase()] === bucketId) {
+      bucketExposure += position.shares * position.currentPrice;
+    }
+  }
+
+  const bucketCapValue = portfolio.equity * maxBucketEquityFraction;
+  const remainingBucketCapacity = Math.max(0, bucketCapValue - bucketExposure);
+  const maxSharesForBucket = Math.floor(remainingBucketCapacity / price);
+  const safeShares = Math.min(requestedShares, Math.max(0, maxSharesForBucket));
+
+  if (safeShares < requestedShares) {
+    return {
+      shares: safeShares,
+      safetyNote: `Bucket cap: reduced BUY from ${requestedShares} to ${safeShares} shares (${bucketId} bucket at ${bucketExposure.toFixed(
+        2,
+      )} of ${bucketCapValue.toFixed(2)} cap).`,
     };
   }
 
@@ -738,6 +798,22 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       safetyNote = safeSell.safetyNote;
     }
 
+    if (decision.action === "BUY") {
+      const bucketCap = getSafeBuySharesForBucketCap(
+        ticker,
+        safeSuggestedShares,
+        price,
+        portfolio,
+        TICKER_TO_BUCKET,
+        AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION,
+      );
+
+      safeSuggestedShares = bucketCap.shares;
+      if (bucketCap.safetyNote) {
+        safetyNote = appendSafetyNote(safetyNote, bucketCap.safetyNote);
+      }
+    }
+
     const log: AutopilotDecisionLog = {
       ticker,
       timestamp: new Date().toISOString(),
@@ -828,7 +904,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           regimeByBucketByDate,
           ticker,
           latestDateKey,
-          TICKER_TO_REGIME_BUCKET,
+          TICKER_TO_BUCKET,
           REGIME_BUCKETS,
         );
 

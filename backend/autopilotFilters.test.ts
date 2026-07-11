@@ -4,8 +4,35 @@ import {
   buildSignalKey,
   evaluateInsiderVeto,
   evaluateSentimentVeto,
+  getSafeBuySharesForBucketCap,
   type AutopilotDecisionLog,
+  type PortfolioSnapshot,
 } from "./autopilotWorker.js";
+
+function makePortfolio(
+  equity: number,
+  positions: Record<string, { shares: number; currentPrice: number }> = {},
+): PortfolioSnapshot {
+  return {
+    balance: equity,
+    equity,
+    currency: "USD",
+    positions: Object.fromEntries(
+      Object.entries(positions).map(([ticker, position]) => [
+        ticker,
+        {
+          shares: position.shares,
+          avgPrice: position.currentPrice,
+          currentPrice: position.currentPrice,
+          pnl: 0,
+          pnlPercent: 0,
+        },
+      ]),
+    ),
+  };
+}
+
+const TICKER_TO_BUCKET = { AAA: "b1", BBB: "b1", CCC: "b2" };
 
 function makeDecision(
   overrides: Partial<AutopilotDecisionLog> = {},
@@ -75,6 +102,95 @@ describe("evaluateInsiderVeto", () => {
     const result = evaluateInsiderVeto("AAPL", 0, 0);
 
     expect(result.blocked).toBe(false);
+  });
+});
+
+describe("getSafeBuySharesForBucketCap", () => {
+  it("does not reduce when the bucket has plenty of room", () => {
+    const portfolio = makePortfolio(10000);
+
+    const result = getSafeBuySharesForBucketCap(
+      "AAA",
+      10,
+      100,
+      portfolio,
+      TICKER_TO_BUCKET,
+      0.4,
+    );
+
+    expect(result.shares).toBe(10);
+    expect(result.safetyNote).toBeUndefined();
+  });
+
+  it("clamps to the remaining bucket capacity when another ticker in the same bucket already has exposure", () => {
+    // Bucket b1 cap = 10000 * 0.4 = 4000. BBB already holds 3500 of it,
+    // leaving 500 -> 5 shares at price 100.
+    const portfolio = makePortfolio(10000, {
+      BBB: { shares: 35, currentPrice: 100 },
+    });
+
+    const result = getSafeBuySharesForBucketCap(
+      "AAA",
+      10,
+      100,
+      portfolio,
+      TICKER_TO_BUCKET,
+      0.4,
+    );
+
+    expect(result.shares).toBe(5);
+    expect(result.safetyNote).toContain("Bucket cap");
+  });
+
+  it("returns 0 when the bucket is already at or over its cap", () => {
+    const portfolio = makePortfolio(10000, {
+      BBB: { shares: 50, currentPrice: 100 }, // 5000 > 4000 cap
+    });
+
+    const result = getSafeBuySharesForBucketCap(
+      "AAA",
+      10,
+      100,
+      portfolio,
+      TICKER_TO_BUCKET,
+      0.4,
+    );
+
+    expect(result.shares).toBe(0);
+  });
+
+  it("ignores exposure from a different bucket", () => {
+    const portfolio = makePortfolio(10000, {
+      CCC: { shares: 100, currentPrice: 100 }, // bucket b2, fully maxed
+    });
+
+    const result = getSafeBuySharesForBucketCap(
+      "AAA",
+      10,
+      100,
+      portfolio,
+      TICKER_TO_BUCKET,
+      0.4,
+    );
+
+    expect(result.shares).toBe(10);
+  });
+
+  it("is a no-op for a ticker with no bucket mapping", () => {
+    const portfolio = makePortfolio(10000, {
+      BBB: { shares: 100, currentPrice: 100 },
+    });
+
+    const result = getSafeBuySharesForBucketCap(
+      "ZZZ",
+      10,
+      100,
+      portfolio,
+      TICKER_TO_BUCKET,
+      0.4,
+    );
+
+    expect(result.shares).toBe(10);
   });
 });
 
