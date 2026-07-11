@@ -390,6 +390,10 @@ const VARIANTS: {
   // blocked-dates set depends on which bucket the ticker being simulated
   // belongs to - resolved per-ticker in main() below.
   regimeExemptHighBeta?: boolean;
+  // Alternate ticker->bucket mapping where AMD/NVDA/TSLA are gated by
+  // us_broad's (SPY's) regime instead of their own composite - see
+  // regime-filter-highbeta-via-us-broad below.
+  regimeHighBetaViaUsBroad?: boolean;
 }[] = [
   { name: "baseline", overrides: {} },
   {
@@ -441,6 +445,16 @@ const VARIANTS: {
     overrides: {},
     regimeExemptHighBeta: false,
   },
+  {
+    // Tests the actual academic framing (broad-market regime overlaid on a
+    // fast-moving sector) rather than the self-referential composite the
+    // other two regime-filter variants use (high-beta gated by its own
+    // AMD/NVDA/TSLA trend). Gates AMD/NVDA/TSLA by us_broad's (SPY's) trend
+    // instead of a separate high_beta_growth composite.
+    name: "regime-filter-highbeta-via-us-broad",
+    overrides: {},
+    regimeHighBetaViaUsBroad: true,
+  },
 ];
 
 // computeBucketRegimeByDate's output doesn't depend on `exempt` (exempt only
@@ -488,6 +502,13 @@ async function main() {
 
   const regimeBucketsExempt = makeRegimeBuckets(true);
   const regimeBucketsNotExempt = makeRegimeBuckets(false);
+  const regimeBucketsHighBetaViaUsBroad = makeRegimeBuckets(false);
+  const TICKER_TO_BUCKET_HIGHBETA_VIA_US_BROAD: Record<string, string> = {
+    ...TICKER_TO_REGIME_BUCKET,
+    AMD: "us_broad",
+    NVDA: "us_broad",
+    TSLA: "us_broad",
+  };
 
   const perVariantTotals = new Map<
     string,
@@ -521,6 +542,21 @@ async function main() {
           : regimeBucketsNotExempt;
         const bucketId = TICKER_TO_REGIME_BUCKET[ticker];
         const bucket = buckets.find((b) => b.bucketId === bucketId);
+
+        simOptions = {
+          ...simOptions,
+          regimeBlockedDates: deriveRegimeBlockedDates(
+            regimeByBucketByDate,
+            bucket,
+          ),
+        };
+      }
+
+      if (variant.regimeHighBetaViaUsBroad) {
+        const bucketId = TICKER_TO_BUCKET_HIGHBETA_VIA_US_BROAD[ticker];
+        const bucket = regimeBucketsHighBetaViaUsBroad.find(
+          (b) => b.bucketId === bucketId,
+        );
 
         simOptions = {
           ...simOptions,
