@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import {
   calculateATR,
   calculateBollingerBands,
@@ -18,6 +19,7 @@ import {
   updatePortfolioCircuitBreaker,
   getMaxDrawdownFromPeakPercent,
   type CircuitBreakerState,
+  type FetchEquityHistory,
 } from "./portfolioCircuitBreaker.js";
 import {
   computeBucketRegimeByDate,
@@ -25,6 +27,7 @@ import {
   type RegimeBucketConfig,
   type RegimeState,
 } from "./src/strategy/portfolioRegimeFilter.js";
+import { tryClaimWorkerLock } from "./autopilotWorkerLock.js";
 
 interface AlpacaBar {
   t: string;
@@ -74,6 +77,7 @@ export type ExecuteSafeTrade = (
 export interface AutopilotWorkerOptions {
   tradeMode: "paper" | "live";
   getPortfolioSnapshot: () => Promise<PortfolioSnapshot>;
+  getEquityHistorySince: FetchEquityHistory;
   executeSafeTrade: ExecuteSafeTrade;
   broadcastSSE: (payload: unknown) => void;
   sendTelegramAlert?: (message: string) => Promise<void>;
@@ -175,6 +179,18 @@ const AUTOPILOT_INTERVAL_MS = Number.parseInt(
   process.env.AUTOPILOT_INTERVAL_MS || "60000",
   10,
 );
+
+// Best-effort, same-host-only protection (see autopilotWorkerLock.ts for
+// the honest limitation) - default 3x the cycle interval, long enough that
+// a normal cycle never falsely looks stale, short enough that a crashed
+// process doesn't block recovery for long.
+const AUTOPILOT_LOCK_STALE_AFTER_MS = Number.parseInt(
+  process.env.AUTOPILOT_LOCK_STALE_AFTER_MS ||
+    String(AUTOPILOT_INTERVAL_MS * 3),
+  10,
+);
+
+const WORKER_OWNER_ID = randomUUID();
 
 const AUTOPILOT_BARS_DAYS = Number.parseInt(
   process.env.AUTOPILOT_BARS_DAYS || "180",
@@ -1199,6 +1215,24 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       };
     }
 
+    const lockClaim = await tryClaimWorkerLock(
+      WORKER_OWNER_ID,
+      AUTOPILOT_LOCK_STALE_AFTER_MS,
+    );
+
+    if (!lockClaim.canProceed) {
+      return {
+        skipped: true,
+        reason: `Autopilot worker lock held elsewhere: ${lockClaim.reason}`,
+        decisions: [],
+        signalReadyCount: 0,
+        signalBlockedCount: 0,
+        dryRunCount: 0,
+        executedCount: 0,
+        status: getStatus(),
+      };
+    }
+
     running = true;
     lastError = null;
 
@@ -1232,6 +1266,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       // breaker's persisted state from multiple concurrent callers would race.
       const circuitBreakerUpdate = await updatePortfolioCircuitBreaker(
         portfolio.equity,
+        options.getEquityHistorySince,
       );
       lastCircuitBreakerState = circuitBreakerUpdate.state;
 
