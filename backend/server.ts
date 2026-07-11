@@ -15,6 +15,7 @@ import { createAutopilotWorker } from "./autopilotWorker.js";
 import {
   getPortfolioCircuitBreakerState,
   resetPortfolioCircuitBreaker,
+  type EquityHistoryPoint,
 } from "./portfolioCircuitBreaker.js";
 import { createAdminAuth } from "./src/auth/adminAuth.js";
 import {
@@ -275,6 +276,44 @@ async function getPortfolioSnapshot() {
   };
 }
 
+// Feeds the portfolio circuit breaker's peak-equity tracking (see
+// portfolioCircuitBreaker.ts) - leans on Alpaca's own durably-stored equity
+// history instead of us maintaining that number ourselves in a local file.
+async function getEquityHistorySince(
+  startDate: string,
+): Promise<EquityHistoryPoint[]> {
+  // Alpaca rejects the request if its own default date_end resolves to
+  // before date_start (observed: when date_start is "today", the default
+  // end can land on the prior session's open) - pass an explicit date_end
+  // a day ahead to always stay on the safe side of that comparison.
+  const dateEnd = new Date();
+  dateEnd.setDate(dateEnd.getDate() + 1);
+
+  const history = asRecord(
+    await alpaca.getPortfolioHistory({
+      date_start: startDate.split("T")[0],
+      date_end: dateEnd.toISOString().split("T")[0],
+      timeframe: "1D",
+    }),
+  );
+
+  const timestamps = asArray(history.timestamp);
+  const equityValues = asArray(history.equity);
+
+  const points: EquityHistoryPoint[] = [];
+
+  for (let i = 0; i < timestamps.length; i += 1) {
+    const timestamp = toNumber(timestamps[i]);
+    const equity = toNumber(equityValues[i]);
+
+    if (Number.isFinite(timestamp) && equity > 0) {
+      points.push({ timestamp, equity });
+    }
+  }
+
+  return points;
+}
+
 async function getOrdersSnapshot() {
   const orders = asArray(
     await alpaca.getOrders({
@@ -524,6 +563,7 @@ async function executeSafeTrade(
 const autopilotWorker = createAutopilotWorker({
   tradeMode: ENV.TRADE_MODE,
   getPortfolioSnapshot,
+  getEquityHistorySince,
   executeSafeTrade,
   broadcastSSE,
   sendTelegramAlert,

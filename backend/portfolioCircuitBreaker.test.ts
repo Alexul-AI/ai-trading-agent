@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { evaluatePortfolioDrawdown } from "./portfolioCircuitBreaker.js";
+import {
+  evaluatePortfolioDrawdown,
+  findPeakSinceTracking,
+} from "./portfolioCircuitBreaker.js";
 
 describe("evaluatePortfolioDrawdown", () => {
   it("does not trip when equity is at a new peak", () => {
@@ -45,5 +48,44 @@ describe("evaluatePortfolioDrawdown", () => {
 
     expect(result.tripped).toBe(false);
     expect(result.drawdownPercent).toBe(0);
+  });
+});
+
+describe("findPeakSinceTracking", () => {
+  const now = "2026-07-11T12:00:00.000Z";
+
+  it("uses current equity as the peak when history is empty", () => {
+    const result = findPeakSinceTracking([], 10000, now);
+
+    expect(result.peakEquity).toBe(10000);
+    expect(result.peakEquityAt).toBe(now);
+  });
+
+  it("uses current equity as the peak when history never exceeds it", () => {
+    const history = [
+      { timestamp: 1, equity: 9000 },
+      { timestamp: 2, equity: 9500 },
+    ];
+
+    const result = findPeakSinceTracking(history, 10000, now);
+
+    expect(result.peakEquity).toBe(10000);
+    expect(result.peakEquityAt).toBe(now);
+  });
+
+  it("picks the historical peak when it exceeds current equity", () => {
+    const peakTimestampSeconds = 1_700_000_000;
+    const history = [
+      { timestamp: 1_699_000_000, equity: 9000 },
+      { timestamp: peakTimestampSeconds, equity: 12000 },
+      { timestamp: 1_701_000_000, equity: 11000 },
+    ];
+
+    const result = findPeakSinceTracking(history, 10000, now);
+
+    expect(result.peakEquity).toBe(12000);
+    expect(result.peakEquityAt).toBe(
+      new Date(peakTimestampSeconds * 1000).toISOString(),
+    );
   });
 });
