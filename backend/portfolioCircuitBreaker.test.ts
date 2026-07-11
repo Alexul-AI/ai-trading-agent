@@ -88,4 +88,22 @@ describe("findPeakSinceTracking", () => {
       new Date(peakTimestampSeconds * 1000).toISOString(),
     );
   });
+
+  it("falls back to the cached peak when history is empty (fetch failure)", () => {
+    const cachedPeak = { equity: 15000, at: "2026-07-01T00:00:00.000Z" };
+
+    const result = findPeakSinceTracking([], 10000, now, cachedPeak);
+
+    expect(result.peakEquity).toBe(15000);
+    expect(result.peakEquityAt).toBe(cachedPeak.at);
+  });
+
+  it("does not let a lower cached peak override a higher current equity or history", () => {
+    const cachedPeak = { equity: 9000, at: "2026-07-01T00:00:00.000Z" };
+    const history = [{ timestamp: 1_700_000_000, equity: 11000 }];
+
+    const result = findPeakSinceTracking(history, 10000, now, cachedPeak);
+
+    expect(result.peakEquity).toBe(11000);
+  });
 });

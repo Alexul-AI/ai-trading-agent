@@ -464,6 +464,22 @@ async function executeSafeTrade(
           reason,
         };
       }
+
+      if (circuitBreakerState?.dataStale) {
+        const reason =
+          "REJECTED: Portfolio circuit breaker could not confirm current drawdown (equity history fetch failed) - new BUYs blocked until it succeeds again.";
+
+        broadcastSSE({
+          type: "notification",
+          level: "error",
+          message: reason,
+        });
+
+        return {
+          status: "rejected",
+          reason,
+        };
+      }
     }
 
     const riskResult = evaluateTrade(
