@@ -96,6 +96,75 @@ describe("decideTradeSignal - BUY confluence", () => {
   });
 });
 
+describe("decideTradeSignal - fractional/notional fallback", () => {
+  it("stays HOLD (risk limit) with no suggestedNotional when allowFractionalShares is off (default)", () => {
+    const decision = decideTradeSignal(
+      baseInput({
+        rsi: 30,
+        price: 1000,
+        bollingerLower: 1000,
+        cash: 100,
+        portfolioValue: 100,
+      }),
+    );
+
+    expect(decision.action).toBe("HOLD");
+    expect(decision.suggestedNotional).toBeUndefined();
+  });
+
+  it("falls back to a notional BUY when allowFractionalShares is on and whole-share sizing is 0 but cash clears the minimum", () => {
+    const decision = decideTradeSignal(
+      baseInput({
+        rsi: 30,
+        price: 1000,
+        bollingerLower: 1000,
+        cash: 100,
+        portfolioValue: 100,
+        config: { allowFractionalShares: true },
+      }),
+    );
+
+    // cashAllowedForBuy = min(100*0.2=20, 100*0.2=20) = 20, >= $5 minimum.
+    expect(decision.action).toBe("BUY");
+    expect(decision.suggestedShares).toBe(0);
+    expect(decision.suggestedNotional).toBe(20);
+  });
+
+  it("does not fall back when cash room is below the minimum notional floor, even with allowFractionalShares on", () => {
+    const decision = decideTradeSignal(
+      baseInput({
+        rsi: 30,
+        price: 1000,
+        bollingerLower: 1000,
+        cash: 10,
+        portfolioValue: 10,
+        config: { allowFractionalShares: true },
+      }),
+    );
+
+    // cashAllowedForBuy = min(10*0.2=2, 10*0.2=2) = 2, below the $5 minimum.
+    expect(decision.action).toBe("HOLD");
+    expect(decision.suggestedNotional).toBeUndefined();
+  });
+
+  it("does not fall back when whole-share sizing already yields shares, even with allowFractionalShares on", () => {
+    const decision = decideTradeSignal(
+      baseInput({
+        rsi: 30,
+        price: 100,
+        bollingerLower: 100,
+        cash: 10000,
+        portfolioValue: 10000,
+        config: { allowFractionalShares: true },
+      }),
+    );
+
+    expect(decision.action).toBe("BUY");
+    expect(decision.suggestedShares).toBe(20);
+    expect(decision.suggestedNotional).toBeUndefined();
+  });
+});
+
 describe("decideTradeSignal - exits", () => {
   it("triggers STOP_LOSS at the configured loss threshold regardless of other signals", () => {
     const decision = decideTradeSignal(

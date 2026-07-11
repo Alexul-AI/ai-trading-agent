@@ -72,6 +72,7 @@ export type ExecuteSafeTrade = (
   limitPrice?: number,
   stopLoss?: number,
   takeProfit?: number,
+  requestedNotional?: number,
 ) => Promise<ExecuteSafeTradeResult>;
 
 export interface AutopilotWorkerOptions {
@@ -130,6 +131,9 @@ export interface AutopilotDecisionLog {
   confidence: number;
   suggestedShares: number;
   originalSuggestedShares?: number;
+  /** Fractional-fallback dollar amount, set only when using notional sizing. */
+  suggestedNotional?: number;
+  originalSuggestedNotional?: number;
   reasonType: StrategyDecision["reasonType"];
   reason: string;
   safetyNote?: string;
@@ -258,6 +262,17 @@ const INSIDER_SELL_CLUSTER_THRESHOLD = 2;
 // already applied to useAtrStops.
 const AUTOPILOT_REGIME_FILTER_ENABLED =
   process.env.AUTOPILOT_REGIME_FILTER === "true";
+
+// Off by default: lets a BUY that would otherwise size to 0 whole shares
+// (most/all tickers below ~$1,000-3,000 of capital) fall back to a
+// fractional/notional order instead. That order gives up Alpaca's
+// broker-side bracket stop_loss/take_profit (see
+// strategyEngine.ts's allowFractionalShares doc comment) - an explicit
+// capability-for-protection trade-off, not a pure risk reduction, so it's
+// opt-in like the sentiment/insider filters rather than always-on like the
+// bucket cap.
+const AUTOPILOT_ALLOW_FRACTIONAL_SHARES_ENABLED =
+  process.env.AUTOPILOT_ALLOW_FRACTIONAL_SHARES === "true";
 
 // Every bucket-representative ticker below (SPY, EFA, TLT, GLD, AMD, NVDA,
 // TSLA) is already part of AUTOPILOT_TICKERS and already fetched every
@@ -516,7 +531,7 @@ async function getBuyInsiderVeto(
   return evaluateInsiderVeto(ticker, entry.buyCount, entry.sellCount);
 }
 
-function getSafeSellShares(
+export function getSafeSellShares(
   reasonType: StrategyDecision["reasonType"],
   suggestedShares: number,
   sharesOwned: number,
@@ -533,7 +548,15 @@ function getSafeSellShares(
   }
 
   const maxFraction = clampFraction(AUTOPILOT_MAX_SELL_FRACTION);
-  const cappedShares = Math.max(1, Math.floor(sharesOwned * maxFraction));
+  // Math.max(1, ...) assumes a whole-share position: it forces a minimum
+  // sell of 1 full share, which is correct when sharesOwned >= 1 but wrong
+  // for a fractional position (e.g. sharesOwned=0.35 would force a
+  // "minimum" sell larger than the entire position). Below 1 share, use
+  // the fraction directly instead of flooring/forcing a whole-share floor.
+  const cappedShares =
+    sharesOwned >= 1
+      ? Math.max(1, Math.floor(sharesOwned * maxFraction))
+      : sharesOwned * maxFraction;
   const safeShares = Math.min(suggestedShares, cappedShares, sharesOwned);
 
   if (safeShares < suggestedShares) {
@@ -554,22 +577,26 @@ function getSafeSellShares(
 // simultaneously (60% in one correlated bucket). This is a portfolio
 // construction safety rule, not a return hypothesis - always on, no opt-in
 // flag, same as the circuit breaker.
-export function getSafeBuySharesForBucketCap(
+function getRemainingBucketCapacity(
   ticker: string,
-  requestedShares: number,
-  price: number,
   portfolio: PortfolioSnapshot,
   tickerToBucket: Record<string, string>,
   defaultMaxBucketEquityFraction: number,
-  bucketEquityFractionOverrides: Record<string, number> = {},
-): { shares: number; safetyNote?: string } {
-  if (requestedShares <= 0 || price <= 0) {
-    return { shares: Math.max(0, requestedShares) };
-  }
-
+  bucketEquityFractionOverrides: Record<string, number>,
+): {
+  bucketId: string | undefined;
+  bucketExposure: number;
+  bucketCapValue: number;
+  remainingBucketCapacity: number;
+} {
   const bucketId = tickerToBucket[ticker.toUpperCase()];
   if (!bucketId) {
-    return { shares: requestedShares };
+    return {
+      bucketId: undefined,
+      bucketExposure: 0,
+      bucketCapValue: 0,
+      remainingBucketCapacity: Infinity,
+    };
   }
 
   let bucketExposure = 0;
@@ -585,6 +612,36 @@ export function getSafeBuySharesForBucketCap(
     bucketEquityFractionOverrides[bucketId] ?? defaultMaxBucketEquityFraction;
   const bucketCapValue = portfolio.equity * maxBucketEquityFraction;
   const remainingBucketCapacity = Math.max(0, bucketCapValue - bucketExposure);
+
+  return { bucketId, bucketExposure, bucketCapValue, remainingBucketCapacity };
+}
+
+export function getSafeBuySharesForBucketCap(
+  ticker: string,
+  requestedShares: number,
+  price: number,
+  portfolio: PortfolioSnapshot,
+  tickerToBucket: Record<string, string>,
+  defaultMaxBucketEquityFraction: number,
+  bucketEquityFractionOverrides: Record<string, number> = {},
+): { shares: number; safetyNote?: string } {
+  if (requestedShares <= 0 || price <= 0) {
+    return { shares: Math.max(0, requestedShares) };
+  }
+
+  const { bucketId, bucketExposure, bucketCapValue, remainingBucketCapacity } =
+    getRemainingBucketCapacity(
+      ticker,
+      portfolio,
+      tickerToBucket,
+      defaultMaxBucketEquityFraction,
+      bucketEquityFractionOverrides,
+    );
+
+  if (!bucketId) {
+    return { shares: requestedShares };
+  }
+
   const maxSharesForBucket = Math.floor(remainingBucketCapacity / price);
   const safeShares = Math.min(requestedShares, Math.max(0, maxSharesForBucket));
 
@@ -598,6 +655,54 @@ export function getSafeBuySharesForBucketCap(
   }
 
   return { shares: safeShares };
+}
+
+// Notional counterpart for the fractional-fallback BUY path (see
+// strategyEngine.ts's allowFractionalShares) - same bucket-capacity rule
+// as getSafeBuySharesForBucketCap above, but capping a dollar amount
+// directly instead of a share count, so there's no price-division/floor
+// step to lose precision on.
+export function getSafeBuyNotionalForBucketCap(
+  ticker: string,
+  requestedNotional: number,
+  portfolio: PortfolioSnapshot,
+  tickerToBucket: Record<string, string>,
+  defaultMaxBucketEquityFraction: number,
+  bucketEquityFractionOverrides: Record<string, number> = {},
+): { notional: number; safetyNote?: string } {
+  if (requestedNotional <= 0) {
+    return { notional: Math.max(0, requestedNotional) };
+  }
+
+  const { bucketId, bucketExposure, bucketCapValue, remainingBucketCapacity } =
+    getRemainingBucketCapacity(
+      ticker,
+      portfolio,
+      tickerToBucket,
+      defaultMaxBucketEquityFraction,
+      bucketEquityFractionOverrides,
+    );
+
+  if (!bucketId) {
+    return { notional: requestedNotional };
+  }
+
+  const safeNotional = Number(
+    Math.min(requestedNotional, Math.max(0, remainingBucketCapacity)).toFixed(
+      2,
+    ),
+  );
+
+  if (safeNotional < requestedNotional) {
+    return {
+      notional: safeNotional,
+      safetyNote: `Bucket cap: reduced BUY from $${requestedNotional.toFixed(2)} to $${safeNotional.toFixed(2)} (${bucketId} bucket at ${bucketExposure.toFixed(
+        2,
+      )} of ${bucketCapValue.toFixed(2)} cap).`,
+    };
+  }
+
+  return { notional: safeNotional };
 }
 
 function shouldBlockNormalSellBelowAverageEntry({
@@ -630,7 +735,7 @@ function appendSafetyNote(
   return `${existingNote} | ${nextNote}`;
 }
 
-function isSignalReadyDecision(decision: AutopilotDecisionLog): boolean {
+export function isSignalReadyDecision(decision: AutopilotDecisionLog): boolean {
   if (typeof decision.isSignalReady === "boolean") {
     return decision.isSignalReady;
   }
@@ -638,7 +743,7 @@ function isSignalReadyDecision(decision: AutopilotDecisionLog): boolean {
   return (
     decision.action !== "HOLD" &&
     decision.confidence >= AUTOPILOT_MIN_CONFIDENCE &&
-    decision.suggestedShares > 0 &&
+    (decision.suggestedShares > 0 || (decision.suggestedNotional ?? 0) > 0) &&
     !decision.skippedReason
   );
 }
@@ -821,6 +926,9 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       bollingerUpper: bb.upper,
       barsSinceLastBuy,
       entryAtrPercent,
+      config: {
+        allowFractionalShares: AUTOPILOT_ALLOW_FRACTIONAL_SHARES_ENABLED,
+      },
     });
 
     let safeSuggestedShares = decision.suggestedShares;
@@ -854,6 +962,24 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       }
     }
 
+    let safeSuggestedNotional = decision.suggestedNotional ?? 0;
+
+    if (decision.action === "BUY" && safeSuggestedNotional > 0) {
+      const notionalBucketCap = getSafeBuyNotionalForBucketCap(
+        ticker,
+        safeSuggestedNotional,
+        portfolio,
+        TICKER_TO_BUCKET,
+        AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION,
+        BUCKET_EQUITY_FRACTION_OVERRIDES,
+      );
+
+      safeSuggestedNotional = notionalBucketCap.notional;
+      if (notionalBucketCap.safetyNote) {
+        safetyNote = appendSafetyNote(safetyNote, notionalBucketCap.safetyNote);
+      }
+    }
+
     const log: AutopilotDecisionLog = {
       ticker,
       timestamp: new Date().toISOString(),
@@ -869,6 +995,13 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       originalSuggestedShares:
         safeSuggestedShares !== decision.suggestedShares
           ? decision.suggestedShares
+          : undefined,
+      suggestedNotional:
+        safeSuggestedNotional > 0 ? safeSuggestedNotional : undefined,
+      originalSuggestedNotional:
+        safeSuggestedNotional > 0 &&
+        safeSuggestedNotional !== decision.suggestedNotional
+          ? decision.suggestedNotional
           : undefined,
       reasonType: decision.reasonType,
       reason: decision.reason,
@@ -1027,7 +1160,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       return log;
     }
 
-    if (safeSuggestedShares <= 0) {
+    if (safeSuggestedShares <= 0 && safeSuggestedNotional <= 0) {
       log.finalStatus = "blocked";
       log.signalStatus = "blocked";
       log.executionStatus = "not_attempted";
@@ -1038,6 +1171,8 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       log.skippedReason = "No positive safe share quantity suggested.";
       return log;
     }
+
+    const isFractionalOrder = safeSuggestedShares <= 0 && safeSuggestedNotional > 0;
 
     log.finalStatus = "signal_ready";
     log.signalStatus = "ready";
@@ -1087,8 +1222,12 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     const useAtrForOrder =
       DEFAULT_STRATEGY_CONFIG.useAtrStops && atrPercent > 0;
 
+    // Fractional/notional BUYs don't get a bracket order (see
+    // strategyEngine.ts's allowFractionalShares doc comment - unconfirmed
+    // whether Alpaca supports brackets with notional sizing), so no
+    // stop_loss/take_profit legs are attached for that case.
     const stopLoss =
-      decision.action === "BUY"
+      decision.action === "BUY" && !isFractionalOrder
         ? Number(
             (
               price *
@@ -1101,7 +1240,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         : undefined;
 
     const takeProfit =
-      decision.action === "BUY"
+      decision.action === "BUY" && !isFractionalOrder
         ? Number(
             (
               price *
@@ -1121,6 +1260,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       undefined,
       stopLoss,
       takeProfit,
+      isFractionalOrder ? safeSuggestedNotional : undefined,
     );
 
     log.result = result;
@@ -1135,7 +1275,9 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
 
         const previousPositionCost = averageEntryPrice * sharesOwned;
         const previousAtrWeight = entryAtrPercent * previousPositionCost;
-        const newBuyCost = price * safeSuggestedShares;
+        const newBuyCost = isFractionalOrder
+          ? safeSuggestedNotional
+          : price * safeSuggestedShares;
         const newPositionCost = previousPositionCost + newBuyCost;
 
         entryAtrPercentByTicker.set(
@@ -1187,8 +1329,11 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         ? ` original=${decision.originalSuggestedShares}`
         : "";
       const safety = decision.safetyNote ? ` | ${decision.safetyNote}` : "";
+      const quantity = decision.suggestedNotional
+        ? `$${decision.suggestedNotional.toFixed(2)} (fractional)`
+        : `${decision.suggestedShares}`;
 
-      return `${decision.ticker}: ${decision.action} ${decision.suggestedShares}${original}, confidence=${decision.confidence}, executed=${decision.executed}, reason=${decision.reason}${safety}`;
+      return `${decision.ticker}: ${decision.action} ${quantity}${original}, confidence=${decision.confidence}, executed=${decision.executed}, reason=${decision.reason}${safety}`;
     });
 
     await options.sendTelegramAlert(

@@ -73,9 +73,14 @@ export function LastAutopilotDecisions({
                   <div className="rounded-lg bg-slate-900/70 border border-slate-800 p-2">
                     <span className="text-slate-500">Suggested</span>
                     <div className="font-bold text-white">
-                      {decision.suggestedShares} shares
+                      {decision.suggestedNotional
+                        ? `${formatMoney(decision.suggestedNotional)} (fractional)`
+                        : `${decision.suggestedShares} shares`}
                       {decision.originalSuggestedShares
                         ? ` / original ${decision.originalSuggestedShares}`
+                        : ""}
+                      {decision.originalSuggestedNotional
+                        ? ` / original ${formatMoney(decision.originalSuggestedNotional)}`
                         : ""}
                     </div>
                   </div>

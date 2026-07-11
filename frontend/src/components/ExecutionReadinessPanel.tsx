@@ -93,6 +93,12 @@ function formatMoney(value: number): string {
   return `$${value.toFixed(2)}`;
 }
 
+function formatQuantity(decision: AutopilotDecision): string {
+  return decision.suggestedNotional
+    ? `${formatMoney(decision.suggestedNotional)} (fractional)`
+    : `${decision.suggestedShares}`;
+}
+
 function getExecutionPreview(
   decision: AutopilotDecision | null,
   status: AutopilotStatus,
@@ -112,7 +118,7 @@ function getExecutionPreview(
     return {
       tone: "blocked",
       title: "Stale signal risk",
-      detail: `${decision.action} ${decision.suggestedShares} ${
+      detail: `${decision.action} ${formatQuantity(decision)} ${
         decision.ticker
       } was signal-ready, but the signal age is ${formatAge(
         signalAgeMs,
@@ -124,7 +130,7 @@ function getExecutionPreview(
     return {
       tone: "blocked",
       title: "Order blocked: not paper mode",
-      detail: `${decision.action} ${decision.suggestedShares} ${decision.ticker} would not be submitted because tradeMode is ${status.tradeMode}.`,
+      detail: `${decision.action} ${formatQuantity(decision)} ${decision.ticker} would not be submitted because tradeMode is ${status.tradeMode}.`,
     };
   }
 
@@ -132,7 +138,7 @@ function getExecutionPreview(
     return {
       tone: "safe",
       title: "Dry-run only",
-      detail: `${decision.action} ${decision.suggestedShares} ${decision.ticker} at approx ${formatMoney(
+      detail: `${decision.action} ${formatQuantity(decision)} ${decision.ticker} at approx ${formatMoney(
         decision.price,
       )} is signal-ready, but execution is disabled.`,
     };
@@ -157,7 +163,7 @@ function getExecutionPreview(
   return {
     tone: "warn",
     title: "Paper order would be submitted",
-    detail: `${decision.action} ${decision.suggestedShares} ${decision.ticker} at approx ${formatMoney(
+    detail: `${decision.action} ${formatQuantity(decision)} ${decision.ticker} at approx ${formatMoney(
       decision.price,
     )}. Verify this carefully before enabling execution.`,
   };
@@ -411,7 +417,7 @@ export function ExecutionReadinessPanel({
             <div className="rounded-lg bg-slate-950/40 border border-slate-700 p-2">
               <div className="text-slate-500 font-black uppercase">Shares</div>
               <div className="font-mono font-black text-white">
-                {latestSignalReadyDecision.suggestedShares}
+                {formatQuantity(latestSignalReadyDecision)}
               </div>
             </div>
             <div className="rounded-lg bg-slate-950/40 border border-slate-700 p-2">

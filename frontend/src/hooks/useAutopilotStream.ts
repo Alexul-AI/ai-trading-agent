@@ -61,8 +61,11 @@ export function useAutopilotStream({
 
         if (data.type === "autopilot_signal" && data.data) {
           const decision = data.data;
+          const quantity = decision.suggestedNotional
+            ? `$${decision.suggestedNotional.toFixed(2)} (fractional)`
+            : `${decision.suggestedShares}`;
           addAutopilotLog(
-            `${decision.ticker}: ${decision.action} ${decision.suggestedShares} / conf ${decision.confidence}.`,
+            `${decision.ticker}: ${decision.action} ${quantity} / conf ${decision.confidence}.`,
           );
           setAutopilotStatus((prev) => ({
             ...prev,

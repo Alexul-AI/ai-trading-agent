@@ -36,6 +36,7 @@ interface ChartSignalMarker {
   confidence: number;
   suggestedShares: number;
   originalSuggestedShares?: number;
+  suggestedNotional?: number;
   reasonType: string;
   executed: boolean;
   skippedReason?: string;
@@ -257,6 +258,7 @@ export function TickerChartPanel({
           confidence: decision.confidence,
           suggestedShares: decision.suggestedShares,
           originalSuggestedShares: decision.originalSuggestedShares,
+          suggestedNotional: decision.suggestedNotional,
           reasonType: decision.reasonType,
           executed: decision.executed,
           skippedReason: decision.skippedReason,
@@ -454,7 +456,9 @@ export function TickerChartPanel({
             </div>
 
             <div className="text-[10px] text-slate-500">
-              {selectedDecision.suggestedShares} shares
+              {selectedDecision.suggestedNotional
+                ? `${formatMoney(selectedDecision.suggestedNotional)} (fractional)`
+                : `${selectedDecision.suggestedShares} shares`}
               {selectedDecision.originalSuggestedShares
                 ? ` / original ${selectedDecision.originalSuggestedShares}`
                 : ""}
@@ -771,7 +775,9 @@ export function TickerChartPanel({
                         conf {marker.confidence}
                       </span>
                       <span className="text-slate-400">
-                        {marker.suggestedShares} shares
+                        {marker.suggestedNotional
+                          ? `${formatMoney(marker.suggestedNotional)} (fractional)`
+                          : `${marker.suggestedShares} shares`}
                         {marker.originalSuggestedShares
                           ? ` / original ${marker.originalSuggestedShares}`
                           : ""}

@@ -94,6 +94,8 @@ export interface AutopilotDecision {
   confidence: number;
   suggestedShares: number;
   originalSuggestedShares?: number;
+  suggestedNotional?: number;
+  originalSuggestedNotional?: number;
   reasonType: ReasonType;
   reason: string;
   safetyNote?: string;

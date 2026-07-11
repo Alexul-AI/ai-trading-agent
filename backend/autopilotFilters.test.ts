@@ -4,7 +4,10 @@ import {
   buildSignalKey,
   evaluateInsiderVeto,
   evaluateSentimentVeto,
+  getSafeBuyNotionalForBucketCap,
   getSafeBuySharesForBucketCap,
+  getSafeSellShares,
+  isSignalReadyDecision,
   type AutopilotDecisionLog,
   type PortfolioSnapshot,
 } from "./autopilotWorker.js";
@@ -225,6 +228,154 @@ describe("getSafeBuySharesForBucketCap", () => {
     );
 
     expect(result.shares).toBe(20); // 4000 / 100 cap, well above requested
+  });
+});
+
+describe("getSafeBuyNotionalForBucketCap", () => {
+  it("does not reduce when the bucket has plenty of room", () => {
+    const portfolio = makePortfolio(10000);
+
+    const result = getSafeBuyNotionalForBucketCap(
+      "AAA",
+      20,
+      portfolio,
+      TICKER_TO_BUCKET,
+      0.4,
+    );
+
+    expect(result.notional).toBe(20);
+    expect(result.safetyNote).toBeUndefined();
+  });
+
+  it("clamps to the remaining bucket capacity in dollar terms, no price/floor step needed", () => {
+    // Bucket b1 cap = 10000 * 0.4 = 4000. BBB already holds 3990 of it,
+    // leaving 10 - a notional order can use that $10 exactly, unlike the
+    // share-based cap which would floor away any partial-share remainder.
+    const portfolio = makePortfolio(10000, {
+      BBB: { shares: 39.9, currentPrice: 100 },
+    });
+
+    const result = getSafeBuyNotionalForBucketCap(
+      "AAA",
+      20,
+      portfolio,
+      TICKER_TO_BUCKET,
+      0.4,
+    );
+
+    expect(result.notional).toBe(10);
+    expect(result.safetyNote).toContain("Bucket cap");
+  });
+
+  it("returns 0 when the bucket is already at or over its cap", () => {
+    const portfolio = makePortfolio(10000, {
+      BBB: { shares: 50, currentPrice: 100 }, // 5000 > 4000 cap
+    });
+
+    const result = getSafeBuyNotionalForBucketCap(
+      "AAA",
+      20,
+      portfolio,
+      TICKER_TO_BUCKET,
+      0.4,
+    );
+
+    expect(result.notional).toBe(0);
+  });
+
+  it("is a no-op for a ticker with no bucket mapping", () => {
+    const portfolio = makePortfolio(10000, {
+      BBB: { shares: 100, currentPrice: 100 },
+    });
+
+    const result = getSafeBuyNotionalForBucketCap(
+      "ZZZ",
+      20,
+      portfolio,
+      TICKER_TO_BUCKET,
+      0.4,
+    );
+
+    expect(result.notional).toBe(20);
+  });
+
+  it("uses a per-bucket override instead of the default fraction when one is set", () => {
+    // b1 override cap = 10000 * 0.1 = 1000, tighter than the 0.4 default
+    // (4000) - the $2000 request should clamp to the override, not the
+    // looser default.
+    const portfolio = makePortfolio(10000);
+
+    const result = getSafeBuyNotionalForBucketCap(
+      "AAA",
+      2000,
+      portfolio,
+      TICKER_TO_BUCKET,
+      0.4,
+      { b1: 0.1 },
+    );
+
+    expect(result.notional).toBe(1000);
+    expect(result.safetyNote).toContain("Bucket cap");
+  });
+});
+
+describe("getSafeSellShares", () => {
+  it("caps a fractional position's partial sell using the fraction directly, without forcing a minimum of a full share", () => {
+    // sharesOwned < 1, so the Math.max(1, ...) whole-share floor must not
+    // apply - it would otherwise force a "minimum" sell larger than the
+    // 25% default max-sell-fraction actually allows.
+    const result = getSafeSellShares("SELL_SIGNAL", 0.35, 0.35);
+
+    expect(result.shares).toBeCloseTo(0.0875); // 0.35 * 0.25 default fraction
+    expect(result.shares).toBeLessThan(0.35);
+    expect(result.safetyNote).toContain("Safety cap");
+  });
+
+  it("still allows STOP_LOSS to sell a full fractional position", () => {
+    const result = getSafeSellShares("STOP_LOSS", 0.35, 0.35);
+
+    expect(result.shares).toBe(0.35);
+  });
+
+  it("keeps the existing whole-share behavior unchanged (no regression)", () => {
+    const result = getSafeSellShares("SELL_SIGNAL", 10, 10);
+
+    // Math.max(1, Math.floor(10 * 0.25)) = 2
+    expect(result.shares).toBe(2);
+  });
+});
+
+describe("isSignalReadyDecision", () => {
+  it("treats a fractional-only BUY (0 suggestedShares, positive suggestedNotional) as ready", () => {
+    const decision = makeDecision({
+      action: "BUY",
+      suggestedShares: 0,
+      suggestedNotional: 20,
+      confidence: 0.8,
+    });
+
+    expect(isSignalReadyDecision(decision)).toBe(true);
+  });
+
+  it("is not ready when both suggestedShares and suggestedNotional are 0", () => {
+    const decision = makeDecision({
+      action: "BUY",
+      suggestedShares: 0,
+      suggestedNotional: undefined,
+      confidence: 0.8,
+    });
+
+    expect(isSignalReadyDecision(decision)).toBe(false);
+  });
+
+  it("respects an explicit isSignalReady flag over the suggestedShares/suggestedNotional fallback", () => {
+    const decision = makeDecision({
+      suggestedShares: 0,
+      suggestedNotional: undefined,
+      isSignalReady: true,
+    });
+
+    expect(isSignalReadyDecision(decision)).toBe(true);
   });
 });
 

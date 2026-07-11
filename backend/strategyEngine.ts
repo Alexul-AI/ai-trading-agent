@@ -24,6 +24,21 @@ export interface StrategyConfig {
   useAtrStops: boolean;
   atrStopMultiplier: number;
   atrTakeProfitMultiplier: number;
+
+  /**
+   * Off by default: whole-share sizing (Math.floor(cash / price)) yields 0
+   * shares for most/all tickers below roughly $1,000-3,000 of capital, so
+   * the bot silently can't act on a BUY signal at low account sizes. When
+   * enabled, a BUY that would otherwise size to 0 whole shares falls back
+   * to a fractional/notional order instead - but that order does NOT get
+   * Alpaca's broker-side bracket stop_loss/take_profit (unconfirmed
+   * whether brackets work with fractional/notional sizing), so it relies
+   * solely on decideTradeSignal's own cycle-based STOP_LOSS/TAKE_PROFIT
+   * re-evaluation. A real, knowingly-accepted reduction in protection for
+   * these specific positions - opt-in, not a pure risk reduction.
+   */
+  allowFractionalShares: boolean;
+  minFractionalNotionalUsd: number;
   buyRsiThreshold: number;
   buyRsiWithMomentumThreshold: number;
   sellRsiThreshold: number;
@@ -67,6 +82,12 @@ export interface StrategyInput {
 export interface StrategyDecision {
   action: StrategyAction;
   suggestedShares: number;
+  /**
+   * Set only for the fractional-fallback BUY case (allowFractionalShares
+   * on, whole-share sizing yields 0, cash room clears the minimum). Dollar
+   * amount to buy via a notional order, not a share count.
+   */
+  suggestedNotional?: number;
   confidence: number;
   reasonType: StrategyReasonType;
   reason: string;
@@ -109,6 +130,12 @@ export const DEFAULT_STRATEGY_CONFIG: StrategyConfig = {
   // promising on one backtest window and didn't hold up.
   atrStopMultiplier: 3.5,
   atrTakeProfitMultiplier: 6,
+
+  allowFractionalShares: false,
+  // Alpaca's own minimum fractional order is $1 notional; $5 avoids
+  // dust-sized orders that aren't worth the order-management overhead.
+  minFractionalNotionalUsd: 5,
+
   buyRsiThreshold: 38,
   buyRsiWithMomentumThreshold: 46,
   sellRsiThreshold: 65,
@@ -204,6 +231,13 @@ export function decideTradeSignal(input: StrategyInput): StrategyDecision {
 
   const maxSharesToBuy =
     input.price > 0 ? Math.floor(cashAllowedForBuy / input.price) : 0;
+
+  const suggestedNotionalForFractionalBuy =
+    config.allowFractionalShares &&
+    maxSharesToBuy === 0 &&
+    cashAllowedForBuy >= config.minFractionalNotionalUsd
+      ? Number(cashAllowedForBuy.toFixed(2))
+      : undefined;
 
   const positionReturn =
     input.sharesOwned > 0 && input.averageEntryPrice > 0
@@ -350,7 +384,7 @@ export function decideTradeSignal(input: StrategyInput): StrategyDecision {
     };
   }
 
-  if (maxSharesToBuy <= 0) {
+  if (maxSharesToBuy <= 0 && suggestedNotionalForFractionalBuy === undefined) {
     const positionCapValue =
       input.portfolioValue * config.maxPositionEquityFraction;
 
@@ -386,6 +420,7 @@ export function decideTradeSignal(input: StrategyInput): StrategyDecision {
     return {
       action: "BUY",
       suggestedShares: maxSharesToBuy,
+      suggestedNotional: suggestedNotionalForFractionalBuy,
       confidence: clampConfidence(confidence),
       reasonType: "BUY_SIGNAL",
       reason: `Buy signal for ${input.ticker}: buyScore=${buySignal.score}, buyReasons=${buySignal.reasons.join(

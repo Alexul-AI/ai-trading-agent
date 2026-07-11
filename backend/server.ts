@@ -212,6 +212,7 @@ let transactionHistory: Array<{
   ticker: string;
   action: "BUY" | "SELL";
   shares: number;
+  notional?: number;
   price: number;
   orderId?: string;
 }> = [];
@@ -403,14 +404,29 @@ async function executeSafeTrade(
   limitPrice?: number,
   stopLoss?: number,
   takeProfit?: number,
+  rawNotional?: number,
 ) {
   try {
     const ticker = rawTicker.trim().toUpperCase();
     const action = rawAction.toUpperCase() as "BUY" | "SELL";
     const requestedShares = Number(rawRequestedShares);
     const orderType = rawOrderType.toLowerCase();
+    const requestedNotional =
+      rawNotional !== undefined &&
+      Number.isFinite(rawNotional) &&
+      rawNotional > 0
+        ? Number(rawNotional)
+        : undefined;
+    // Fractional-fallback BUY (see strategyEngine.ts's allowFractionalShares):
+    // requestedShares is 0 in this case, a notional dollar amount drives
+    // sizing instead.
+    const isNotionalOrder = requestedNotional !== undefined && requestedShares <= 0;
 
-    if (!ticker || !Number.isFinite(requestedShares) || requestedShares <= 0) {
+    if (
+      !ticker ||
+      (!isNotionalOrder &&
+        (!Number.isFinite(requestedShares) || requestedShares <= 0))
+    ) {
       return {
         status: "rejected",
         reason: "Invalid ticker or share quantity.",
@@ -486,8 +502,9 @@ async function executeSafeTrade(
       {
         ticker,
         action,
-        requestedShares,
+        requestedShares: isNotionalOrder ? 0 : requestedShares,
         estimatedPrice,
+        requestedNotional: isNotionalOrder ? requestedNotional : undefined,
       },
       accountState,
     );
@@ -510,17 +527,30 @@ async function executeSafeTrade(
     }
 
     const finalShares = riskResult.adjustedShares;
+    const finalNotional = riskResult.adjustedNotional;
 
     const clientOrderId = clientOrderIdTracker.getOrCreate(ticker, action);
 
     const orderPayload: UnknownRecord = {
       symbol: ticker,
-      qty: finalShares,
       side: action.toLowerCase(),
       type: orderType,
-      time_in_force: orderType === "limit" ? "gtc" : "day",
+      // Alpaca requires time_in_force=day for fractional/notional orders
+      // (no gtc/ioc/fok/opg/cls) - forced regardless of orderType here.
+      time_in_force:
+        finalNotional !== undefined
+          ? "day"
+          : orderType === "limit"
+            ? "gtc"
+            : "day",
       client_order_id: clientOrderId,
     };
+
+    if (finalNotional !== undefined) {
+      orderPayload.notional = finalNotional;
+    } else {
+      orderPayload.qty = finalShares;
+    }
 
     if (orderType === "limit") {
       if (!limitPrice || limitPrice <= 0) {
@@ -533,7 +563,14 @@ async function executeSafeTrade(
       orderPayload.limit_price = limitPrice;
     }
 
-    if (action === "BUY" && (stopLoss || takeProfit)) {
+    // No bracket for fractional/notional orders - Alpaca's docs don't
+    // confirm order_class=bracket works with notional sizing, so we don't
+    // assume it does (see strategyEngine.ts's allowFractionalShares).
+    if (
+      action === "BUY" &&
+      finalNotional === undefined &&
+      (stopLoss || takeProfit)
+    ) {
       orderPayload.order_class = "bracket";
 
       if (takeProfit && takeProfit > 0) {
@@ -581,12 +618,17 @@ async function executeSafeTrade(
     }
 
     const orderId = toStringValue(createdOrder.id);
+    const quantityLabel =
+      finalNotional !== undefined
+        ? `$${finalNotional.toFixed(2)} (fractional)`
+        : `${finalShares}`;
 
     transactionHistory.push({
       timestamp: new Date().toISOString(),
       ticker,
       action,
       shares: finalShares,
+      notional: finalNotional,
       price: estimatedPrice,
       orderId,
     });
@@ -597,19 +639,21 @@ async function executeSafeTrade(
         ticker,
         action,
         shares: finalShares,
+        notional: finalNotional,
         price: estimatedPrice,
         orderId,
       },
     });
 
     await sendTelegramAlert(
-      `ORDER ${action} ${finalShares} ${ticker} @ approx $${estimatedPrice}`,
+      `ORDER ${action} ${quantityLabel} ${ticker} @ approx $${estimatedPrice}`,
     );
 
     return {
       status: "success",
       order: createdOrder,
       adjustedShares: finalShares,
+      adjustedNotional: finalNotional,
     };
   } catch (error) {
     const message =

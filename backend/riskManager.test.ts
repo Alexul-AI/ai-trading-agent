@@ -147,3 +147,62 @@ describe("evaluateTrade - BUY position sizing", () => {
     expect(result.adjustedShares).toBe(3);
   });
 });
+
+describe("evaluateTrade - BUY notional (fractional-fallback) sizing", () => {
+  it("approves the full requested notional when it fits comfortably", () => {
+    const result = evaluateTrade(
+      baseOrder({ action: "BUY", requestedShares: 0, requestedNotional: 20 }),
+      baseAccount({ equity: 10000, cash: 10000 }),
+    );
+
+    expect(result.approved).toBe(true);
+    expect(result.adjustedShares).toBe(0);
+    expect(result.adjustedNotional).toBe(20);
+    expect(result.reason).toContain("APPROVED");
+  });
+
+  it("reduces the notional to fit within available cash", () => {
+    const result = evaluateTrade(
+      baseOrder({ action: "BUY", requestedShares: 0, requestedNotional: 50 }),
+      baseAccount({ equity: 10000, cash: 15 }),
+    );
+
+    expect(result.approved).toBe(true);
+    expect(result.adjustedNotional).toBe(15);
+    expect(result.reason).toContain("MODIFIED");
+  });
+
+  it("reduces the notional to fit within the remaining position cap", () => {
+    const result = evaluateTrade(
+      baseOrder({ action: "BUY", requestedShares: 0, requestedNotional: 50 }),
+      baseAccount({
+        equity: 10000, // cap = 2000
+        cash: 10000,
+        currentPositions: [{ ticker: "AAPL", shares: 1, marketValue: 1990 }], // 10 left
+      }),
+    );
+
+    expect(result.approved).toBe(true);
+    expect(result.adjustedNotional).toBe(10);
+  });
+
+  it("rejects a notional BUY when there's no cash room", () => {
+    const result = evaluateTrade(
+      baseOrder({ action: "BUY", requestedShares: 0, requestedNotional: 20 }),
+      baseAccount({ equity: 10000, cash: 0 }),
+    );
+
+    expect(result.approved).toBe(false);
+    expect(result.reason).toContain("Insufficient safe capital");
+  });
+
+  it("still blocks a notional BUY when daily drawdown exceeds the limit", () => {
+    const result = evaluateTrade(
+      baseOrder({ action: "BUY", requestedShares: 0, requestedNotional: 20 }),
+      baseAccount({ dailyDrawdownPercent: -0.06 }),
+    );
+
+    expect(result.approved).toBe(false);
+    expect(result.reason).toContain("FATAL RISK");
+  });
+});

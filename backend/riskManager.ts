@@ -9,6 +9,13 @@ export interface OrderRequest {
   action: "BUY" | "SELL";
   requestedShares: number;
   estimatedPrice: number;
+  /**
+   * Set only for the fractional-fallback BUY case (see
+   * strategyEngine.ts's allowFractionalShares) - a dollar amount to buy
+   * via a notional order instead of a whole-share quantity. When set,
+   * requestedShares is ignored for BUY sizing.
+   */
+  requestedNotional?: number;
 }
 
 export interface AccountState {
@@ -21,6 +28,8 @@ export interface AccountState {
 export interface RiskResult {
   approved: boolean;
   adjustedShares: number;
+  /** Set only when the approved BUY is a fractional/notional order. */
+  adjustedNotional?: number;
   reason: string;
 }
 
@@ -99,6 +108,36 @@ export function evaluateTrade(
     const availableCashToUse = profile.allowMargin
       ? remainingAllowedValue
       : Math.min(account.cash, remainingAllowedValue);
+
+    if (order.requestedNotional !== undefined) {
+      const safeNotionalToBuy = Number(
+        Math.min(availableCashToUse, order.requestedNotional).toFixed(2),
+      );
+
+      if (safeNotionalToBuy <= 0) {
+        return {
+          approved: false,
+          adjustedShares: 0,
+          reason: `REJECTED: Insufficient safe capital to buy ${order.ticker}. Order exceeds cash limits or portfolio concentration rules.`,
+        };
+      }
+
+      if (safeNotionalToBuy < order.requestedNotional) {
+        return {
+          approved: true,
+          adjustedShares: 0,
+          adjustedNotional: safeNotionalToBuy,
+          reason: `MODIFIED: Buy order reduced from $${order.requestedNotional.toFixed(2)} to $${safeNotionalToBuy.toFixed(2)} to respect the 20% portfolio limit and prevent margin debt.`,
+        };
+      }
+
+      return {
+        approved: true,
+        adjustedShares: 0,
+        adjustedNotional: safeNotionalToBuy,
+        reason: `APPROVED: Buy order for $${safeNotionalToBuy.toFixed(2)} of ${order.ticker} fits within all risk parameters.`,
+      };
+    }
 
     // Calculate how many shares we can ACTUALLY buy safely
     let safeSharesToBuy = Math.floor(availableCashToUse / order.estimatedPrice);

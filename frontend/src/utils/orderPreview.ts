@@ -7,6 +7,7 @@ export interface SafeTradeCallPreview {
   ticker: string;
   action: AutopilotDecision["action"];
   requestedShares: number;
+  requestedNotional: number | null;
   orderType: "market";
   limitPrice: null;
   stopLoss: number | null;
@@ -16,7 +17,8 @@ export interface SafeTradeCallPreview {
 export interface BrokerStylePayloadPreview {
   symbol: string;
   side: BrokerOrderSide | null;
-  qty: number;
+  qty: number | null;
+  notional: number | null;
   type: "market";
   time_in_force: "day";
   extended_hours: false;
@@ -68,12 +70,16 @@ export function buildOrderPreviewPlan(
     "takeProfitPercent",
     0.15,
   );
+  // Fractional/notional BUYs don't get a bracket order (see
+  // strategyEngine.ts's allowFractionalShares) - no stop_loss/take_profit
+  // preview for that case, matching what would actually be submitted.
+  const isFractional = decision.suggestedShares <= 0 && !!decision.suggestedNotional;
   const stopLoss =
-    decision.action === "BUY"
+    decision.action === "BUY" && !isFractional
       ? Number((decision.price * (1 - stopLossPercent)).toFixed(2))
       : null;
   const takeProfit =
-    decision.action === "BUY"
+    decision.action === "BUY" && !isFractional
       ? Number((decision.price * (1 + takeProfitPercent)).toFixed(2))
       : null;
 
@@ -88,11 +94,13 @@ export function buildOrderPreviewPlan(
     blockedBy.push("SELL_DISABLED");
   }
   if (side === null) blockedBy.push("NOT_BUY_OR_SELL");
-  if (decision.suggestedShares <= 0) blockedBy.push("NO_SHARES");
+  if (decision.suggestedShares <= 0 && !decision.suggestedNotional) {
+    blockedBy.push("NO_SHARES");
+  }
 
-  const estimatedNotional = Number(
-    (decision.price * decision.suggestedShares).toFixed(2),
-  );
+  const estimatedNotional =
+    decision.suggestedNotional ??
+    Number((decision.price * decision.suggestedShares).toFixed(2));
 
   return {
     gate: blockedBy.length === 0 ? "WOULD_SUBMIT_PAPER_ORDER" : "BLOCKED",
@@ -104,6 +112,7 @@ export function buildOrderPreviewPlan(
       ticker: decision.ticker,
       action: decision.action,
       requestedShares: decision.suggestedShares,
+      requestedNotional: isFractional ? (decision.suggestedNotional ?? null) : null,
       orderType: "market",
       limitPrice: null,
       stopLoss,
@@ -112,7 +121,8 @@ export function buildOrderPreviewPlan(
     brokerStylePayload: {
       symbol: decision.ticker,
       side,
-      qty: decision.suggestedShares,
+      qty: isFractional ? null : decision.suggestedShares,
+      notional: isFractional ? (decision.suggestedNotional ?? null) : null,
       type: "market",
       time_in_force: "day",
       extended_hours: false,
