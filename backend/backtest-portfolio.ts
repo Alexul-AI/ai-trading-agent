@@ -1,0 +1,852 @@
+import dotenv from "dotenv";
+
+import {
+  calculateATR,
+  calculateBollingerBands,
+  calculateMACD,
+  calculateRSI,
+} from "./indicators.js";
+import {
+  DEFAULT_STRATEGY_CONFIG,
+  decideTradeSignal,
+  type StrategyReasonType,
+} from "./strategyEngine.js";
+import {
+  getSafeBuySharesForBucketCap,
+  getSafeSellShares,
+  type PortfolioSnapshot,
+} from "./src/strategy/portfolioSafety.js";
+import {
+  evaluatePortfolioDrawdown,
+  getMaxDrawdownFromPeakPercent,
+} from "./portfolioCircuitBreaker.js";
+import { evaluateTrade, type AccountState } from "./riskManager.js";
+
+dotenv.config();
+
+interface AlpacaBar {
+  t: string;
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;
+}
+
+interface AlpacaBarsResponse {
+  bars?: AlpacaBar[];
+  next_page_token?: string | null;
+}
+
+const APCA_API_KEY_ID = process.env.APCA_API_KEY_ID ?? "";
+const APCA_API_SECRET_KEY = process.env.APCA_API_SECRET_KEY ?? "";
+
+if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY) {
+  console.error(
+    "Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY in backend/.env",
+  );
+  process.exit(1);
+}
+
+const TICKERS = (
+  process.env.BACKTEST_TICKERS ||
+  "AMD,NVDA,AAPL,MSFT,TSLA,JPM,JNJ,XOM,PG,SPY,GLD,TLT,EFA"
+)
+  .split(",")
+  .map((t) => t.trim().toUpperCase())
+  .filter(Boolean);
+
+// Must stay identical to autopilotWorker.ts's TICKER_TO_BUCKET /
+// BUCKET_EQUITY_FRACTION_OVERRIDES - data duplicated here (not imported),
+// same convention as TICKER_TO_REGIME_BUCKET in backtest-sweep.ts. The
+// *logic* that uses this data (getSafeBuySharesForBucketCap) is imported
+// for real, not duplicated - only this flat mapping is copied.
+const TICKER_TO_BUCKET: Record<string, string> = {
+  AAPL: "us_broad",
+  MSFT: "us_broad",
+  JPM: "us_broad",
+  JNJ: "us_broad",
+  XOM: "us_broad",
+  PG: "us_broad",
+  SPY: "us_broad",
+  EFA: "international",
+  TLT: "bonds",
+  GLD: "commodities",
+  AMD: "high_beta_growth",
+  NVDA: "high_beta_growth",
+  TSLA: "high_beta_growth",
+};
+
+const AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION = Number.parseFloat(
+  process.env.AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION || "0.4",
+);
+const BUCKET_EQUITY_FRACTION_OVERRIDES: Record<string, number> = {
+  high_beta_growth: Number.parseFloat(
+    process.env.AUTOPILOT_HIGH_BETA_BUCKET_EQUITY_FRACTION || "0.2",
+  ),
+};
+
+const DAYS = Number.parseInt(process.env.BACKTEST_DAYS || "365", 10);
+const STARTING_CAPITAL = Number.parseFloat(
+  process.env.BACKTEST_STARTING_CAPITAL || "10000",
+);
+const FEED = process.env.ALPACA_DATA_FEED || "iex";
+const SLIPPAGE_PERCENT = 0.0005;
+const COMMISSION_PER_TRADE = 0;
+
+// RSI (Wilder smoothing) and MACD (EMA) are seeded from bars[0] and only
+// converge to accurate values after ~100+ bars - matches backtest-sweep.ts.
+const WARMUP_BARS = 210;
+
+// Lets a run end on a historical date instead of always "today" - same
+// convention as backtest-sweep.ts.
+const END_DAYS_AGO = Number.parseInt(
+  process.env.BACKTEST_END_DAYS_AGO || "0",
+  10,
+);
+
+function toIsoDate(date: Date): string {
+  return date.toISOString().split("T")[0] ?? date.toISOString();
+}
+
+function dateKeyOf(bar: AlpacaBar): string {
+  return bar.t.split("T")[0] ?? bar.t;
+}
+
+async function fetchAlpacaBars(
+  ticker: string,
+  days: number,
+): Promise<AlpacaBar[]> {
+  const endDate = new Date();
+  endDate.setDate(endDate.getDate() - END_DAYS_AGO);
+  const startDate = new Date(endDate);
+  startDate.setDate(endDate.getDate() - days);
+
+  const allBars: AlpacaBar[] = [];
+  let pageToken: string | undefined;
+
+  do {
+    const url = new URL(`https://data.alpaca.markets/v2/stocks/${ticker}/bars`);
+    url.searchParams.set("timeframe", "1Day");
+    url.searchParams.set("start", toIsoDate(startDate));
+    url.searchParams.set("end", toIsoDate(endDate));
+    url.searchParams.set("adjustment", "raw");
+    url.searchParams.set("feed", FEED);
+    url.searchParams.set("limit", "1000");
+    if (pageToken) url.searchParams.set("page_token", pageToken);
+
+    const response = await fetch(url.toString(), {
+      headers: {
+        "APCA-API-KEY-ID": APCA_API_KEY_ID,
+        "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
+      },
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(
+        `Alpaca bars request failed for ${ticker}: HTTP ${response.status} ${body}`,
+      );
+    }
+
+    const data = (await response.json()) as AlpacaBarsResponse;
+    if (data.bars) allBars.push(...data.bars);
+    pageToken = data.next_page_token || undefined;
+  } while (pageToken);
+
+  return allBars.sort(
+    (a, b) => new Date(a.t).getTime() - new Date(b.t).getTime(),
+  );
+}
+
+// --- Date alignment: intersection of trading dates, per-ticker index lookup ---
+//
+// Each ticker's own bars[] array is kept untouched - indicators are always
+// computed from a ticker's own full history, sliced by that ticker's own
+// index. The intersection is only used to pick which dates the day-loop
+// below visits. Slicing/rebuilding a shared array to the intersection
+// would silently corrupt Wilder-smoothed indicators for tickers that had
+// no gap of their own, by feeding them a gapped series.
+
+interface Alignment {
+  commonDates: string[];
+  indexByTickerByDate: Map<string, Map<string, number>>;
+}
+
+function alignByIntersection(
+  barsByTicker: Map<string, AlpacaBar[]>,
+  tickers: string[],
+): Alignment {
+  const indexByTickerByDate = new Map<string, Map<string, number>>();
+
+  for (const ticker of tickers) {
+    const bars = barsByTicker.get(ticker) ?? [];
+    const indexByDate = new Map<string, number>();
+    bars.forEach((bar, i) => indexByDate.set(dateKeyOf(bar), i));
+    indexByTickerByDate.set(ticker, indexByDate);
+  }
+
+  const unionDates = new Set<string>();
+  for (const indexByDate of indexByTickerByDate.values()) {
+    for (const date of indexByDate.keys()) unionDates.add(date);
+  }
+
+  const missingCountByTicker = new Map<string, number>(
+    tickers.map((t) => [t, 0]),
+  );
+  const commonDates: string[] = [];
+
+  for (const date of unionDates) {
+    const missingTickers = tickers.filter(
+      (t) => !indexByTickerByDate.get(t)!.has(date),
+    );
+
+    if (missingTickers.length === 0) {
+      commonDates.push(date);
+    } else {
+      for (const ticker of missingTickers) {
+        missingCountByTicker.set(
+          ticker,
+          (missingCountByTicker.get(ticker) ?? 0) + 1,
+        );
+      }
+    }
+  }
+
+  commonDates.sort();
+
+  const totalDropped = unionDates.size - commonDates.length;
+  if (totalDropped > 0) {
+    console.log(
+      `Date alignment: ${totalDropped} of ${unionDates.size} union dates dropped (not present for every ticker).`,
+    );
+    for (const [ticker, count] of missingCountByTicker) {
+      if (count > 0) console.log(`  ${ticker}: missing on ${count} dates`);
+    }
+    console.log("");
+  }
+
+  return { commonDates, indexByTickerByDate };
+}
+
+function findSimStartIndex(
+  commonDates: string[],
+  indexByTickerByDate: Map<string, Map<string, number>>,
+  tickers: string[],
+): number {
+  for (let d = 0; d < commonDates.length; d += 1) {
+    const date = commonDates[d]!;
+    const allWarm = tickers.every(
+      (t) => (indexByTickerByDate.get(t)!.get(date) ?? -1) >= WARMUP_BARS,
+    );
+    if (allWarm) return d;
+  }
+  return commonDates.length;
+}
+
+// --- Portfolio-level day-loop simulation ---
+
+interface TickerState {
+  shares: number;
+  averageEntryPrice: number;
+  entryAtrPercent: number;
+  lastBuyOwnIndex: number;
+  lastStopLossOwnIndex: number;
+}
+
+interface TradeLogEntry {
+  date: string;
+  ticker: string;
+  action: "BUY" | "SELL";
+  shares: number;
+  executionPrice: number;
+  reasonType: StrategyReasonType;
+  realizedPnl?: number;
+}
+
+interface PerTickerSummary {
+  trades: number;
+  finalShares: number;
+  realizedPnl: number;
+}
+
+interface PortfolioSimResult {
+  finalEquity: number;
+  totalPnlPercent: number;
+  maxDrawdownPercent: number;
+  circuitBreakerTrippedAt: string | null;
+  daysTrippedCount: number;
+  totalSimDays: number;
+  bucketCapReductionCount: number;
+  circuitBreakerBlockedBuyCount: number;
+  executionTimeReductionCount: number;
+  executionTimeRejectionCount: number;
+  trades: TradeLogEntry[];
+  perTicker: Map<string, PerTickerSummary>;
+}
+
+interface StagedDecision {
+  ticker: string;
+  action: "BUY" | "SELL";
+  shares: number;
+  reasonType: StrategyReasonType;
+  price: number;
+  atrPercent: number;
+}
+
+function runPortfolioSimulation(
+  barsByTicker: Map<string, AlpacaBar[]>,
+  tickers: string[],
+  commonDates: string[],
+  indexByTickerByDate: Map<string, Map<string, number>>,
+  simStartIndex: number,
+): PortfolioSimResult {
+  let cash = STARTING_CAPITAL;
+  const stateByTicker = new Map<string, TickerState>(
+    tickers.map((t) => [
+      t,
+      {
+        shares: 0,
+        averageEntryPrice: 0,
+        entryAtrPercent: 0,
+        lastBuyOwnIndex: -999,
+        lastStopLossOwnIndex: -999,
+      },
+    ]),
+  );
+
+  const trades: TradeLogEntry[] = [];
+  const perTicker = new Map<string, PerTickerSummary>(
+    tickers.map((t) => [t, { trades: 0, finalShares: 0, realizedPnl: 0 }]),
+  );
+
+  let peakEquity = 0;
+  let previousDayEquity = 0;
+  let circuitBreakerTripped = false;
+  let circuitBreakerTrippedAt: string | null = null;
+  let daysTrippedCount = 0;
+  let bucketCapReductionCount = 0;
+  let circuitBreakerBlockedBuyCount = 0;
+  let executionTimeReductionCount = 0;
+  let executionTimeRejectionCount = 0;
+  let finalEquity = STARTING_CAPITAL;
+  let maxDrawdown = 0;
+  let runningPeakForDrawdown = 0;
+
+  const maxDrawdownFromPeakPercent = getMaxDrawdownFromPeakPercent();
+
+  function priceOf(ticker: string, date: string): number | null {
+    const idx = indexByTickerByDate.get(ticker)!.get(date);
+    if (idx === undefined) return null;
+    const bar = barsByTicker.get(ticker)![idx];
+    return bar ? Number(bar.c.toFixed(2)) : null;
+  }
+
+  function computeEquity(pricesToday: Map<string, number>): number {
+    let total = cash;
+    for (const ticker of tickers) {
+      const state = stateByTicker.get(ticker)!;
+      if (state.shares <= 0) continue;
+      const price = pricesToday.get(ticker) ?? state.averageEntryPrice;
+      total += state.shares * price;
+    }
+    return total;
+  }
+
+  for (let d = simStartIndex; d < commonDates.length; d += 1) {
+    const date = commonDates[d]!;
+    const pricesToday = new Map<string, number>();
+    for (const ticker of tickers) {
+      const p = priceOf(ticker, date);
+      if (p !== null) pricesToday.set(ticker, p);
+    }
+
+    const preTradeEquity = computeEquity(pricesToday);
+    if (preTradeEquity > peakEquity) peakEquity = preTradeEquity;
+
+    // Sticky - mirrors updatePortfolioCircuitBreaker's `tripped:
+    // evaluation.tripped || wasTripped` (never auto-recovers without a
+    // human reset in live).
+    if (!circuitBreakerTripped) {
+      const evaluation = evaluatePortfolioDrawdown(
+        preTradeEquity,
+        peakEquity,
+        maxDrawdownFromPeakPercent,
+      );
+      if (evaluation.tripped) {
+        circuitBreakerTripped = true;
+        circuitBreakerTrippedAt = date;
+      }
+    }
+    if (circuitBreakerTripped) daysTrippedCount += 1;
+
+    // --- SIZING pass: every ticker reads the same frozen start-of-day snapshot ---
+    const sizingSnapshot: PortfolioSnapshot = {
+      balance: cash,
+      equity: preTradeEquity,
+      currency: "USD",
+      positions: Object.fromEntries(
+        tickers
+          .filter((t) => stateByTicker.get(t)!.shares > 0)
+          .map((t) => {
+            const state = stateByTicker.get(t)!;
+            const price = pricesToday.get(t) ?? state.averageEntryPrice;
+            return [
+              t,
+              {
+                shares: state.shares,
+                avgPrice: state.averageEntryPrice,
+                currentPrice: price,
+                pnl: 0,
+                pnlPercent: 0,
+              },
+            ];
+          }),
+      ),
+    };
+
+    const staged: StagedDecision[] = [];
+
+    for (const ticker of tickers) {
+      const price = pricesToday.get(ticker);
+      if (price === undefined) continue;
+
+      const ownIndex = indexByTickerByDate.get(ticker)!.get(date)!;
+      const bars = barsByTicker.get(ticker)!;
+      const state = stateByTicker.get(ticker)!;
+
+      const priceSeries = bars.slice(0, ownIndex + 1).map((b) => b.c);
+      const previousPriceSeries = bars.slice(0, ownIndex).map((b) => b.c);
+      const rsi = calculateRSI(priceSeries, 14);
+      const macd = calculateMACD(priceSeries);
+      const previousMacd = calculateMACD(previousPriceSeries);
+      const bb = calculateBollingerBands(priceSeries, 20, 2);
+      const atr = calculateATR(bars.slice(0, ownIndex + 1), 14);
+      const atrPercent = price > 0 ? atr / price : 0;
+
+      const decision = decideTradeSignal({
+        ticker,
+        price,
+        cash: sizingSnapshot.balance,
+        portfolioValue: sizingSnapshot.equity,
+        sharesOwned: state.shares,
+        averageEntryPrice: state.averageEntryPrice,
+        rsi,
+        macdHistogram: macd.histogram,
+        previousMacdHistogram: previousMacd.histogram,
+        bollingerLower: bb.lower,
+        bollingerUpper: bb.upper,
+        barsSinceLastBuy: ownIndex - state.lastBuyOwnIndex,
+        entryAtrPercent: state.entryAtrPercent,
+        config: DEFAULT_STRATEGY_CONFIG,
+      });
+
+      if (decision.action === "SELL" && decision.suggestedShares > 0) {
+        const safeSell = getSafeSellShares(
+          decision.reasonType,
+          decision.suggestedShares,
+          state.shares,
+        );
+        if (safeSell.shares > 0) {
+          staged.push({
+            ticker,
+            action: "SELL",
+            shares: safeSell.shares,
+            reasonType: decision.reasonType,
+            price,
+            atrPercent,
+          });
+        }
+      } else if (decision.action === "BUY" && decision.suggestedShares > 0) {
+        if (circuitBreakerTripped) {
+          circuitBreakerBlockedBuyCount += 1;
+        } else {
+          const bucketCap = getSafeBuySharesForBucketCap(
+            ticker,
+            decision.suggestedShares,
+            price,
+            sizingSnapshot,
+            TICKER_TO_BUCKET,
+            AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION,
+            BUCKET_EQUITY_FRACTION_OVERRIDES,
+          );
+
+          if (bucketCap.shares < decision.suggestedShares) {
+            bucketCapReductionCount += 1;
+          }
+
+          if (bucketCap.shares > 0) {
+            staged.push({
+              ticker,
+              action: "BUY",
+              shares: bucketCap.shares,
+              reasonType: decision.reasonType,
+              price,
+              atrPercent,
+            });
+          }
+        }
+      }
+    }
+
+    // --- EXECUTION pass: sequential, real cash/position state re-checked per order ---
+    for (const item of staged) {
+      const state = stateByTicker.get(item.ticker)!;
+      const currentPositions = tickers
+        .filter((t) => stateByTicker.get(t)!.shares > 0)
+        .map((t) => {
+          const s = stateByTicker.get(t)!;
+          const p = pricesToday.get(t) ?? s.averageEntryPrice;
+          return { ticker: t, shares: s.shares, marketValue: s.shares * p };
+        });
+      const currentEquityNow =
+        cash + currentPositions.reduce((sum, p) => sum + p.marketValue, 0);
+      const dailyDrawdownNow =
+        previousDayEquity > 0
+          ? (currentEquityNow - previousDayEquity) / previousDayEquity
+          : 0;
+
+      const accountState: AccountState = {
+        equity: currentEquityNow,
+        cash,
+        dailyDrawdownPercent: dailyDrawdownNow,
+        currentPositions,
+      };
+
+      const executionPrice =
+        item.action === "BUY"
+          ? Number((item.price * (1 + SLIPPAGE_PERCENT)).toFixed(4))
+          : Number((item.price * (1 - SLIPPAGE_PERCENT)).toFixed(4));
+
+      const riskResult = evaluateTrade(
+        {
+          ticker: item.ticker,
+          action: item.action,
+          requestedShares: item.shares,
+          estimatedPrice: executionPrice,
+        },
+        accountState,
+      );
+
+      if (!riskResult.approved) {
+        executionTimeRejectionCount += 1;
+        continue;
+      }
+
+      const finalShares = riskResult.adjustedShares;
+      if (finalShares < item.shares) executionTimeReductionCount += 1;
+      if (finalShares <= 0) continue;
+
+      if (item.action === "BUY") {
+        const cost = executionPrice * finalShares + COMMISSION_PER_TRADE;
+        const previousPositionCost = state.averageEntryPrice * state.shares;
+        const previousAtrWeight = state.entryAtrPercent * previousPositionCost;
+        const newBuyCost = executionPrice * finalShares;
+
+        cash -= cost;
+        state.shares += finalShares;
+        state.averageEntryPrice =
+          state.shares > 0
+            ? (previousPositionCost + newBuyCost) / state.shares
+            : 0;
+        state.entryAtrPercent =
+          state.shares > 0
+            ? (previousAtrWeight + item.atrPercent * newBuyCost) /
+              (previousPositionCost + newBuyCost)
+            : 0;
+        state.lastBuyOwnIndex = indexByTickerByDate
+          .get(item.ticker)!
+          .get(date)!;
+
+        perTicker.get(item.ticker)!.trades += 1;
+        trades.push({
+          date,
+          ticker: item.ticker,
+          action: "BUY",
+          shares: finalShares,
+          executionPrice,
+          reasonType: item.reasonType,
+        });
+      } else {
+        const sharesToSell = Math.min(finalShares, state.shares);
+        const revenue = executionPrice * sharesToSell - COMMISSION_PER_TRADE;
+        const realizedPnl =
+          (executionPrice - state.averageEntryPrice) * sharesToSell -
+          COMMISSION_PER_TRADE;
+
+        cash += revenue;
+        state.shares -= sharesToSell;
+        perTicker.get(item.ticker)!.realizedPnl += realizedPnl;
+        perTicker.get(item.ticker)!.trades += 1;
+
+        if (state.shares === 0) {
+          state.averageEntryPrice = 0;
+          state.entryAtrPercent = 0;
+        }
+        if (item.reasonType === "STOP_LOSS") {
+          state.lastStopLossOwnIndex = indexByTickerByDate
+            .get(item.ticker)!
+            .get(date)!;
+        }
+
+        trades.push({
+          date,
+          ticker: item.ticker,
+          action: "SELL",
+          shares: sharesToSell,
+          executionPrice,
+          reasonType: item.reasonType,
+          realizedPnl,
+        });
+      }
+    }
+
+    const postTradeEquity = computeEquity(pricesToday);
+    if (postTradeEquity > runningPeakForDrawdown) {
+      runningPeakForDrawdown = postTradeEquity;
+    }
+    if (runningPeakForDrawdown > 0) {
+      const dd = (postTradeEquity - runningPeakForDrawdown) / runningPeakForDrawdown;
+      if (dd < maxDrawdown) maxDrawdown = dd;
+    }
+
+    previousDayEquity = postTradeEquity;
+    finalEquity = postTradeEquity;
+  }
+
+  for (const ticker of tickers) {
+    perTicker.get(ticker)!.finalShares = stateByTicker.get(ticker)!.shares;
+  }
+
+  return {
+    finalEquity,
+    totalPnlPercent: ((finalEquity - STARTING_CAPITAL) / STARTING_CAPITAL) * 100,
+    maxDrawdownPercent: maxDrawdown * 100,
+    circuitBreakerTrippedAt,
+    daysTrippedCount,
+    totalSimDays: commonDates.length - simStartIndex,
+    bucketCapReductionCount,
+    circuitBreakerBlockedBuyCount,
+    executionTimeReductionCount,
+    executionTimeRejectionCount,
+    trades,
+    perTicker,
+  };
+}
+
+// --- Equal-weighted buy & hold benchmark, anchored to the sim's own start date ---
+
+function computeEqualWeightBuyAndHold(
+  barsByTicker: Map<string, AlpacaBar[]>,
+  tickers: string[],
+  commonDates: string[],
+  indexByTickerByDate: Map<string, Map<string, number>>,
+  simStartIndex: number,
+): number {
+  const perTickerCapital = STARTING_CAPITAL / tickers.length;
+  const startDate = commonDates[simStartIndex];
+  const endDate = commonDates[commonDates.length - 1];
+  if (!startDate || !endDate) return 0;
+
+  let totalFinalValue = 0;
+
+  for (const ticker of tickers) {
+    const bars = barsByTicker.get(ticker)!;
+    const startIdx = indexByTickerByDate.get(ticker)!.get(startDate)!;
+    const endIdx = indexByTickerByDate.get(ticker)!.get(endDate)!;
+    const startPrice = bars[startIdx]?.c ?? 0;
+    const endPrice = bars[endIdx]?.c ?? 0;
+    const shares = startPrice > 0 ? Math.floor(perTickerCapital / startPrice) : 0;
+    const leftoverCash = perTickerCapital - shares * startPrice;
+    totalFinalValue += leftoverCash + shares * endPrice;
+  }
+
+  return ((totalFinalValue - STARTING_CAPITAL) / STARTING_CAPITAL) * 100;
+}
+
+// --- Independent per-ticker baseline (backtest-sweep.ts's model: each
+// ticker gets its own $STARTING_CAPITAL, no portfolio-level caps at all) -
+// a stripped-down local reimplementation rather than importing
+// backtest-sweep.ts, which runs its own main()/network fetch as a side
+// effect of being imported and isn't safe to pull in as a library. ---
+
+function simulateIndependent(bars: AlpacaBar[]): number {
+  let cash = STARTING_CAPITAL;
+  let sharesOwned = 0;
+  let averageEntryPrice = 0;
+  let lastBuyIndex = -999;
+
+  for (let i = WARMUP_BARS; i < bars.length; i += 1) {
+    const currentBar = bars[i];
+    if (!currentBar) continue;
+
+    const currentPrice = Number(currentBar.c.toFixed(2));
+    const prices = bars.slice(0, i + 1).map((b) => b.c);
+    const previousPrices = bars.slice(0, i).map((b) => b.c);
+
+    const rsi = calculateRSI(prices, 14);
+    const macd = calculateMACD(prices);
+    const previousMacd = calculateMACD(previousPrices);
+    const bb = calculateBollingerBands(prices, 20, 2);
+
+    const portfolioValue = cash + sharesOwned * currentPrice;
+
+    const decision = decideTradeSignal({
+      ticker: "INDEPENDENT",
+      price: currentPrice,
+      cash,
+      portfolioValue,
+      sharesOwned,
+      averageEntryPrice,
+      rsi,
+      macdHistogram: macd.histogram,
+      previousMacdHistogram: previousMacd.histogram,
+      bollingerLower: bb.lower,
+      bollingerUpper: bb.upper,
+      barsSinceLastBuy: i - lastBuyIndex,
+      config: DEFAULT_STRATEGY_CONFIG,
+    });
+
+    if (decision.action === "BUY" && decision.suggestedShares > 0) {
+      const executionPrice = Number((currentPrice * (1 + SLIPPAGE_PERCENT)).toFixed(4));
+      const cost = executionPrice * decision.suggestedShares + COMMISSION_PER_TRADE;
+
+      if (cash >= cost) {
+        const previousPositionCost = averageEntryPrice * sharesOwned;
+        const newBuyCost = executionPrice * decision.suggestedShares;
+
+        cash -= cost;
+        sharesOwned += decision.suggestedShares;
+        averageEntryPrice =
+          sharesOwned > 0 ? (previousPositionCost + newBuyCost) / sharesOwned : 0;
+        lastBuyIndex = i;
+      }
+    } else if (decision.action === "SELL" && decision.suggestedShares > 0) {
+      const sharesToSell = Math.min(decision.suggestedShares, sharesOwned);
+      const executionPrice = Number((currentPrice * (1 - SLIPPAGE_PERCENT)).toFixed(4));
+      const revenue = executionPrice * sharesToSell - COMMISSION_PER_TRADE;
+
+      if (sharesToSell > 0) {
+        cash += revenue;
+        sharesOwned -= sharesToSell;
+        if (sharesOwned === 0) averageEntryPrice = 0;
+      }
+    }
+  }
+
+  const finalPrice = bars[bars.length - 1]?.c ?? 0;
+  const finalValue = cash + sharesOwned * finalPrice;
+  return ((finalValue - STARTING_CAPITAL) / STARTING_CAPITAL) * 100;
+}
+
+function pad(value: string, width: number): string {
+  return value.padStart(width);
+}
+
+async function main() {
+  console.log(
+    `Portfolio backtest: ${TICKERS.length} tickers | Days: ${DAYS} | Starting capital: $${STARTING_CAPITAL} (shared, not per-ticker)`,
+  );
+  console.log(`Tickers: ${TICKERS.join(", ")}`);
+  console.log("");
+
+  const barsByTicker = new Map<string, AlpacaBar[]>();
+  for (const ticker of TICKERS) {
+    console.log(`Fetching ${ticker}...`);
+    barsByTicker.set(ticker, await fetchAlpacaBars(ticker, DAYS));
+  }
+  console.log("");
+
+  const { commonDates, indexByTickerByDate } = alignByIntersection(
+    barsByTicker,
+    TICKERS,
+  );
+  const simStartIndex = findSimStartIndex(
+    commonDates,
+    indexByTickerByDate,
+    TICKERS,
+  );
+
+  if (simStartIndex >= commonDates.length) {
+    console.error(
+      "Not enough shared history to clear the warmup window for all tickers - try a larger BACKTEST_DAYS.",
+    );
+    process.exit(1);
+  }
+
+  const result = runPortfolioSimulation(
+    barsByTicker,
+    TICKERS,
+    commonDates,
+    indexByTickerByDate,
+    simStartIndex,
+  );
+
+  const buyAndHoldPercent = computeEqualWeightBuyAndHold(
+    barsByTicker,
+    TICKERS,
+    commonDates,
+    indexByTickerByDate,
+    simStartIndex,
+  );
+
+  const independentAverages = TICKERS.map((ticker) =>
+    simulateIndependent(barsByTicker.get(ticker)!),
+  );
+  const independentAveragePercent =
+    independentAverages.reduce((sum, v) => sum + v, 0) / independentAverages.length;
+
+  console.log("=== Portfolio-level result (shared cash pool + all caps) ===");
+  console.log(`Simulated days: ${result.totalSimDays} (${commonDates[simStartIndex]} to ${commonDates[commonDates.length - 1]})`);
+  console.log(`Total return: ${result.totalPnlPercent.toFixed(2)}%`);
+  console.log(`Max drawdown: ${result.maxDrawdownPercent.toFixed(2)}%`);
+  console.log(
+    `Circuit breaker: ${
+      result.circuitBreakerTrippedAt
+        ? `tripped on ${result.circuitBreakerTrippedAt}, stayed tripped for ${result.daysTrippedCount}/${result.totalSimDays} days (${((result.daysTrippedCount / result.totalSimDays) * 100).toFixed(1)}%) - sticky, no auto-recovery modeled, matching live`
+        : "never tripped"
+    }`,
+  );
+  console.log(`BUYs blocked by tripped circuit breaker: ${result.circuitBreakerBlockedBuyCount}`);
+  console.log(`BUYs reduced by bucket cap: ${result.bucketCapReductionCount}`);
+  console.log(`Orders reduced at execution time (same-day cash/position competition): ${result.executionTimeReductionCount}`);
+  console.log(`Orders rejected at execution time (daily -5% kill switch or no cash left): ${result.executionTimeRejectionCount}`);
+  console.log("");
+
+  console.log("=== Benchmarks ===");
+  console.log(`Equal-weighted buy & hold (all ${TICKERS.length} tickers, $${(STARTING_CAPITAL / TICKERS.length).toFixed(0)} each): ${buyAndHoldPercent.toFixed(2)}%`);
+  console.log(
+    `Independent per-ticker average (backtest-sweep.ts-style, $${STARTING_CAPITAL} EACH, no portfolio caps): ${independentAveragePercent.toFixed(2)}%`,
+  );
+  console.log(
+    "  Note: this compares average %% return, not dollar totals. Some of the gap vs. the portfolio result",
+  );
+  console.log(
+    "  above is whole-share rounding being worse at 1/13th the capital, not purely caps/competition.",
+  );
+  console.log("");
+
+  console.log("=== Per-ticker breakdown ===");
+  console.log(
+    "ticker".padEnd(8) +
+      pad("trades", 8) +
+      pad("final shares", 14) +
+      pad("realized PnL", 14) +
+      pad("independent %", 16),
+  );
+  TICKERS.forEach((ticker, i) => {
+    const summary = result.perTicker.get(ticker)!;
+    console.log(
+      ticker.padEnd(8) +
+        pad(String(summary.trades), 8) +
+        pad(String(summary.finalShares), 14) +
+        pad(summary.realizedPnl.toFixed(2), 14) +
+        pad(independentAverages[i]!.toFixed(2), 16),
+    );
+  });
+}
+
+main().catch((error: unknown) => {
+  console.error(error);
+  process.exit(1);
+});
