@@ -1,3 +1,5 @@
+import { promises as fs } from "fs";
+import path from "path";
 import dotenv from "dotenv";
 
 import {
@@ -12,15 +14,18 @@ import {
   type StrategyReasonType,
 } from "./strategyEngine.js";
 import {
+  getRemainingBucketCapacity,
   getSafeBuySharesForBucketCap,
   getSafeSellShares,
   type PortfolioSnapshot,
 } from "./src/strategy/portfolioSafety.js";
 import {
+  applyStickyTrip,
   evaluatePortfolioDrawdown,
   getMaxDrawdownFromPeakPercent,
 } from "./portfolioCircuitBreaker.js";
-import { evaluateTrade, type AccountState } from "./riskManager.js";
+import { evaluateTrade, type AccountState, type RiskProfile } from "./riskManager.js";
+import { createStrategyConfigHash } from "./decisionJournal.js";
 
 dotenv.config();
 
@@ -104,6 +109,25 @@ const END_DAYS_AGO = Number.parseInt(
   process.env.BACKTEST_END_DAYS_AGO || "0",
   10,
 );
+
+// Full-system config, matching what's actually shipped live today
+// (default RiskProfile in riskManager.ts). Variants B/C swap in a version
+// of this with maxDailyDrawdownPercent forced to -1 (never triggers) to
+// isolate the effect of the -5% daily kill switch specifically, while
+// still keeping the cash-sufficiency/position-cap checks evaluateTrade
+// also performs (skipping it entirely could let the sim spend more cash
+// than it has).
+const FULL_RISK_PROFILE: RiskProfile = {
+  maxDailyDrawdownPercent: -0.05,
+  maxPositionSizePercent: 0.2,
+  allowMargin: false,
+};
+const NO_DAILY_KILL_RISK_PROFILE: RiskProfile = {
+  ...FULL_RISK_PROFILE,
+  maxDailyDrawdownPercent: -1,
+};
+
+const REPORT_DIR = path.resolve(process.cwd(), "data", "backtest-reports");
 
 function toIsoDate(date: Date): string {
   return date.toISOString().split("T")[0] ?? date.toISOString();
@@ -246,6 +270,40 @@ function findSimStartIndex(
 
 // --- Portfolio-level day-loop simulation ---
 
+interface SimVariantConfig {
+  label: string;
+  useBucketCap: boolean;
+  useCircuitBreaker: boolean;
+  useDailyKillAndSellThrottle: boolean;
+}
+
+const VARIANTS: SimVariantConfig[] = [
+  {
+    label: "A: no bucket cap, no circuit breaker, no daily kill/sell throttle",
+    useBucketCap: false,
+    useCircuitBreaker: false,
+    useDailyKillAndSellThrottle: false,
+  },
+  {
+    label: "B: bucket cap only",
+    useBucketCap: true,
+    useCircuitBreaker: false,
+    useDailyKillAndSellThrottle: false,
+  },
+  {
+    label: "C: bucket cap + circuit breaker",
+    useBucketCap: true,
+    useCircuitBreaker: true,
+    useDailyKillAndSellThrottle: false,
+  },
+  {
+    label: "D: full system (+ daily kill switch + sell throttle) - matches live",
+    useBucketCap: true,
+    useCircuitBreaker: true,
+    useDailyKillAndSellThrottle: true,
+  },
+];
+
 interface TickerState {
   shares: number;
   averageEntryPrice: number;
@@ -259,9 +317,30 @@ interface TradeLogEntry {
   ticker: string;
   action: "BUY" | "SELL";
   shares: number;
-  executionPrice: number;
+  price: number;
+  notional: number;
   reasonType: StrategyReasonType;
+  equityAfter: number;
+  cashAfter: number;
   realizedPnl?: number;
+}
+
+interface BlockedSignalEntry {
+  date: string;
+  ticker: string;
+  action: "BUY";
+  blockReason: "bucket_cap" | "circuit_breaker" | "execution_time";
+  bucket: string | undefined;
+  currentBucketExposure: number;
+  price: number;
+}
+
+interface EquityCurvePoint {
+  date: string;
+  equity: number;
+  cash: number;
+  exposurePercent: number;
+  drawdownPercent: number;
 }
 
 interface PerTickerSummary {
@@ -274,6 +353,7 @@ interface PortfolioSimResult {
   finalEquity: number;
   totalPnlPercent: number;
   maxDrawdownPercent: number;
+  avgExposurePercent: number;
   circuitBreakerTrippedAt: string | null;
   daysTrippedCount: number;
   totalSimDays: number;
@@ -281,8 +361,12 @@ interface PortfolioSimResult {
   circuitBreakerBlockedBuyCount: number;
   executionTimeReductionCount: number;
   executionTimeRejectionCount: number;
+  blockedBuyCount: number;
+  totalTrades: number;
   trades: TradeLogEntry[];
   perTicker: Map<string, PerTickerSummary>;
+  equityCurve: EquityCurvePoint[];
+  blockedSignals: BlockedSignalEntry[];
 }
 
 interface StagedDecision {
@@ -300,6 +384,7 @@ function runPortfolioSimulation(
   commonDates: string[],
   indexByTickerByDate: Map<string, Map<string, number>>,
   simStartIndex: number,
+  variant: SimVariantConfig,
 ): PortfolioSimResult {
   let cash = STARTING_CAPITAL;
   const stateByTicker = new Map<string, TickerState>(
@@ -316,6 +401,8 @@ function runPortfolioSimulation(
   );
 
   const trades: TradeLogEntry[] = [];
+  const blockedSignals: BlockedSignalEntry[] = [];
+  const equityCurve: EquityCurvePoint[] = [];
   const perTicker = new Map<string, PerTickerSummary>(
     tickers.map((t) => [t, { trades: 0, finalShares: 0, realizedPnl: 0 }]),
   );
@@ -332,8 +419,12 @@ function runPortfolioSimulation(
   let finalEquity = STARTING_CAPITAL;
   let maxDrawdown = 0;
   let runningPeakForDrawdown = 0;
+  let exposureSum = 0;
 
   const maxDrawdownFromPeakPercent = getMaxDrawdownFromPeakPercent();
+  const riskProfile = variant.useDailyKillAndSellThrottle
+    ? FULL_RISK_PROFILE
+    : NO_DAILY_KILL_RISK_PROFILE;
 
   function priceOf(ticker: string, date: string): number | null {
     const idx = indexByTickerByDate.get(ticker)!.get(date);
@@ -364,19 +455,20 @@ function runPortfolioSimulation(
     const preTradeEquity = computeEquity(pricesToday);
     if (preTradeEquity > peakEquity) peakEquity = preTradeEquity;
 
-    // Sticky - mirrors updatePortfolioCircuitBreaker's `tripped:
-    // evaluation.tripped || wasTripped` (never auto-recovers without a
-    // human reset in live).
-    if (!circuitBreakerTripped) {
+    // Sticky - mirrors updatePortfolioCircuitBreaker's applyStickyTrip
+    // (never auto-recovers without a human reset in live). Skipped
+    // entirely when this variant doesn't model the circuit breaker.
+    if (variant.useCircuitBreaker && !circuitBreakerTripped) {
       const evaluation = evaluatePortfolioDrawdown(
         preTradeEquity,
         peakEquity,
         maxDrawdownFromPeakPercent,
       );
-      if (evaluation.tripped) {
-        circuitBreakerTripped = true;
-        circuitBreakerTrippedAt = date;
-      }
+      circuitBreakerTripped = applyStickyTrip(
+        evaluation.tripped,
+        circuitBreakerTripped,
+      );
+      if (circuitBreakerTripped) circuitBreakerTrippedAt = date;
     }
     if (circuitBreakerTripped) daysTrippedCount += 1;
 
@@ -442,25 +534,47 @@ function runPortfolioSimulation(
       });
 
       if (decision.action === "SELL" && decision.suggestedShares > 0) {
-        const safeSell = getSafeSellShares(
-          decision.reasonType,
-          decision.suggestedShares,
-          state.shares,
-        );
-        if (safeSell.shares > 0) {
+        const safeShares = variant.useDailyKillAndSellThrottle
+          ? getSafeSellShares(decision.reasonType, decision.suggestedShares, state.shares).shares
+          : Math.min(decision.suggestedShares, state.shares);
+
+        if (safeShares > 0) {
           staged.push({
             ticker,
             action: "SELL",
-            shares: safeSell.shares,
+            shares: safeShares,
             reasonType: decision.reasonType,
             price,
             atrPercent,
           });
         }
       } else if (decision.action === "BUY" && decision.suggestedShares > 0) {
-        if (circuitBreakerTripped) {
+        const bucketId = TICKER_TO_BUCKET[ticker.toUpperCase()];
+        const bucketInfo = getRemainingBucketCapacity(
+          ticker,
+          sizingSnapshot,
+          TICKER_TO_BUCKET,
+          AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION,
+          BUCKET_EQUITY_FRACTION_OVERRIDES,
+        );
+
+        if (variant.useCircuitBreaker && circuitBreakerTripped) {
           circuitBreakerBlockedBuyCount += 1;
-        } else {
+          blockedSignals.push({
+            date,
+            ticker,
+            action: "BUY",
+            blockReason: "circuit_breaker",
+            bucket: bucketId,
+            currentBucketExposure: bucketInfo.bucketExposure,
+            price,
+          });
+          continue;
+        }
+
+        let sharesToStage = decision.suggestedShares;
+
+        if (variant.useBucketCap) {
           const bucketCap = getSafeBuySharesForBucketCap(
             ticker,
             decision.suggestedShares,
@@ -474,23 +588,41 @@ function runPortfolioSimulation(
           if (bucketCap.shares < decision.suggestedShares) {
             bucketCapReductionCount += 1;
           }
+          sharesToStage = bucketCap.shares;
 
-          if (bucketCap.shares > 0) {
-            staged.push({
+          if (sharesToStage <= 0) {
+            blockedSignals.push({
+              date,
               ticker,
               action: "BUY",
-              shares: bucketCap.shares,
-              reasonType: decision.reasonType,
+              blockReason: "bucket_cap",
+              bucket: bucketId,
+              currentBucketExposure: bucketInfo.bucketExposure,
               price,
-              atrPercent,
             });
           }
+        }
+
+        if (sharesToStage > 0) {
+          staged.push({
+            ticker,
+            action: "BUY",
+            shares: sharesToStage,
+            reasonType: decision.reasonType,
+            price,
+            atrPercent,
+          });
         }
       }
     }
 
-    // --- EXECUTION pass: sequential, real cash/position state re-checked per order ---
-    for (const item of staged) {
+    // --- EXECUTION pass: SELLs before BUYs, sequential real cash/position re-check per order ---
+    const orderedStaged = [
+      ...staged.filter((s) => s.action === "SELL"),
+      ...staged.filter((s) => s.action === "BUY"),
+    ];
+
+    for (const item of orderedStaged) {
       const state = stateByTicker.get(item.ticker)!;
       const currentPositions = tickers
         .filter((t) => stateByTicker.get(t)!.shares > 0)
@@ -526,10 +658,23 @@ function runPortfolioSimulation(
           estimatedPrice: executionPrice,
         },
         accountState,
+        riskProfile,
       );
 
       if (!riskResult.approved) {
         executionTimeRejectionCount += 1;
+        if (item.action === "BUY") {
+          const bucketId = TICKER_TO_BUCKET[item.ticker.toUpperCase()];
+          blockedSignals.push({
+            date,
+            ticker: item.ticker,
+            action: "BUY",
+            blockReason: "execution_time",
+            bucket: bucketId,
+            currentBucketExposure: 0,
+            price: item.price,
+          });
+        }
         continue;
       }
 
@@ -564,8 +709,11 @@ function runPortfolioSimulation(
           ticker: item.ticker,
           action: "BUY",
           shares: finalShares,
-          executionPrice,
+          price: executionPrice,
+          notional: newBuyCost,
           reasonType: item.reasonType,
+          equityAfter: computeEquity(pricesToday),
+          cashAfter: cash,
         });
       } else {
         const sharesToSell = Math.min(finalShares, state.shares);
@@ -594,8 +742,11 @@ function runPortfolioSimulation(
           ticker: item.ticker,
           action: "SELL",
           shares: sharesToSell,
-          executionPrice,
+          price: executionPrice,
+          notional: sharesToSell * executionPrice,
           reasonType: item.reasonType,
+          equityAfter: computeEquity(pricesToday),
+          cashAfter: cash,
           realizedPnl,
         });
       }
@@ -605,10 +756,23 @@ function runPortfolioSimulation(
     if (postTradeEquity > runningPeakForDrawdown) {
       runningPeakForDrawdown = postTradeEquity;
     }
-    if (runningPeakForDrawdown > 0) {
-      const dd = (postTradeEquity - runningPeakForDrawdown) / runningPeakForDrawdown;
-      if (dd < maxDrawdown) maxDrawdown = dd;
-    }
+    const dayDrawdownPercent =
+      runningPeakForDrawdown > 0
+        ? (postTradeEquity - runningPeakForDrawdown) / runningPeakForDrawdown
+        : 0;
+    if (dayDrawdownPercent < maxDrawdown) maxDrawdown = dayDrawdownPercent;
+
+    const exposurePercent =
+      postTradeEquity > 0 ? ((postTradeEquity - cash) / postTradeEquity) * 100 : 0;
+    exposureSum += exposurePercent;
+
+    equityCurve.push({
+      date,
+      equity: postTradeEquity,
+      cash,
+      exposurePercent,
+      drawdownPercent: dayDrawdownPercent * 100,
+    });
 
     previousDayEquity = postTradeEquity;
     finalEquity = postTradeEquity;
@@ -618,20 +782,49 @@ function runPortfolioSimulation(
     perTicker.get(ticker)!.finalShares = stateByTicker.get(ticker)!.shares;
   }
 
+  const totalSimDays = commonDates.length - simStartIndex;
+  const totalTrades = trades.length;
+  const blockedBuyCount = blockedSignals.length;
+
   return {
     finalEquity,
     totalPnlPercent: ((finalEquity - STARTING_CAPITAL) / STARTING_CAPITAL) * 100,
     maxDrawdownPercent: maxDrawdown * 100,
+    avgExposurePercent: totalSimDays > 0 ? exposureSum / totalSimDays : 0,
     circuitBreakerTrippedAt,
     daysTrippedCount,
-    totalSimDays: commonDates.length - simStartIndex,
+    totalSimDays,
     bucketCapReductionCount,
     circuitBreakerBlockedBuyCount,
     executionTimeReductionCount,
     executionTimeRejectionCount,
+    blockedBuyCount,
+    totalTrades,
     trades,
     perTicker,
+    equityCurve,
+    blockedSignals,
   };
+}
+
+// --- Post-pass: forward returns for blocked signals (own-index lookup, never a shared array) ---
+
+function forwardReturn(
+  barsByTicker: Map<string, AlpacaBar[]>,
+  indexByTickerByDate: Map<string, Map<string, number>>,
+  ticker: string,
+  date: string,
+  aheadBars: number,
+): number | null {
+  const ownIndex = indexByTickerByDate.get(ticker)?.get(date);
+  if (ownIndex === undefined) return null;
+
+  const bars = barsByTicker.get(ticker)!;
+  const startPrice = bars[ownIndex]?.c;
+  const futurePrice = bars[ownIndex + aheadBars]?.c;
+  if (!startPrice || !futurePrice) return null;
+
+  return ((futurePrice - startPrice) / startPrice) * 100;
 }
 
 // --- Equal-weighted buy & hold benchmark, anchored to the sim's own start date ---
@@ -664,11 +857,77 @@ function computeEqualWeightBuyAndHold(
   return ((totalFinalValue - STARTING_CAPITAL) / STARTING_CAPITAL) * 100;
 }
 
+function computeSingleTickerBuyAndHold(
+  barsByTicker: Map<string, AlpacaBar[]>,
+  ticker: string,
+  commonDates: string[],
+  indexByTickerByDate: Map<string, Map<string, number>>,
+  simStartIndex: number,
+): number | null {
+  const startDate = commonDates[simStartIndex];
+  const endDate = commonDates[commonDates.length - 1];
+  if (!startDate || !endDate) return null;
+
+  const bars = barsByTicker.get(ticker);
+  const indexByDate = indexByTickerByDate.get(ticker);
+  if (!bars || !indexByDate) return null;
+
+  const startIdx = indexByDate.get(startDate);
+  const endIdx = indexByDate.get(endDate);
+  if (startIdx === undefined || endIdx === undefined) return null;
+
+  const startPrice = bars[startIdx]?.c ?? 0;
+  const endPrice = bars[endIdx]?.c ?? 0;
+  if (startPrice <= 0) return null;
+
+  return ((endPrice - startPrice) / startPrice) * 100;
+}
+
+function computeEqualWeightBuyAndHoldCurve(
+  barsByTicker: Map<string, AlpacaBar[]>,
+  tickers: string[],
+  commonDates: string[],
+  indexByTickerByDate: Map<string, Map<string, number>>,
+  simStartIndex: number,
+): Map<string, number> {
+  const perTickerCapital = STARTING_CAPITAL / tickers.length;
+  const startDate = commonDates[simStartIndex];
+  const curve = new Map<string, number>();
+  if (!startDate) return curve;
+
+  const sharesByTicker = new Map<string, number>();
+  const leftoverCashByTicker = new Map<string, number>();
+
+  for (const ticker of tickers) {
+    const bars = barsByTicker.get(ticker)!;
+    const startIdx = indexByTickerByDate.get(ticker)!.get(startDate)!;
+    const startPrice = bars[startIdx]?.c ?? 0;
+    const shares = startPrice > 0 ? Math.floor(perTickerCapital / startPrice) : 0;
+    sharesByTicker.set(ticker, shares);
+    leftoverCashByTicker.set(ticker, perTickerCapital - shares * startPrice);
+  }
+
+  for (let d = simStartIndex; d < commonDates.length; d += 1) {
+    const date = commonDates[d]!;
+    let total = 0;
+    for (const ticker of tickers) {
+      const bars = barsByTicker.get(ticker)!;
+      const idx = indexByTickerByDate.get(ticker)!.get(date);
+      const price = idx !== undefined ? bars[idx]?.c ?? 0 : 0;
+      total += (leftoverCashByTicker.get(ticker) ?? 0) + (sharesByTicker.get(ticker) ?? 0) * price;
+    }
+    curve.set(date, total);
+  }
+
+  return curve;
+}
+
 // --- Independent per-ticker baseline (backtest-sweep.ts's model: each
-// ticker gets its own $STARTING_CAPITAL, no portfolio-level caps at all) -
-// a stripped-down local reimplementation rather than importing
-// backtest-sweep.ts, which runs its own main()/network fetch as a side
-// effect of being imported and isn't safe to pull in as a library. ---
+// ticker gets its own $STARTING_CAPITAL, no portfolio-level caps at all,
+// no shared cash pool) - a stripped-down local reimplementation rather
+// than importing backtest-sweep.ts, which runs its own main()/network
+// fetch as a side effect of being imported and isn't safe to pull in as a
+// library. ---
 
 function simulateIndependent(bars: AlpacaBar[]): number {
   let cash = STARTING_CAPITAL;
@@ -743,6 +1002,131 @@ function pad(value: string, width: number): string {
   return value.padStart(width);
 }
 
+// --- Report/CSV generation (variant D only) ---
+
+function csvEscape(value: string | number): string {
+  const str = String(value);
+  return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+}
+
+function toCsv(rows: (string | number)[][]): string {
+  return rows.map((row) => row.map(csvEscape).join(",")).join("\n") + "\n";
+}
+
+async function writeReportsForFullSystem(
+  result: PortfolioSimResult,
+  barsByTicker: Map<string, AlpacaBar[]>,
+  indexByTickerByDate: Map<string, Map<string, number>>,
+  commonDates: string[],
+  simStartIndex: number,
+  buyAndHoldPercent: number,
+  spyBuyAndHoldPercent: number | null,
+  buyAndHoldCurve: Map<string, number>,
+) {
+  await fs.mkdir(REPORT_DIR, { recursive: true });
+
+  const configHash = createStrategyConfigHash(DEFAULT_STRATEGY_CONFIG);
+
+  const reportMd = `# Portfolio backtest report
+
+Generated: ${new Date().toISOString()}
+
+## Run configuration
+- Window: ${result.totalSimDays} simulated days (${commonDates[simStartIndex]} to ${commonDates[commonDates.length - 1]})
+- Tickers: ${TICKERS.length} (${TICKERS.join(", ")})
+- Starting capital: $${STARTING_CAPITAL} (shared, not per-ticker)
+- Execution model: signal on close[t], executed at close[t] with slippage - a same-bar assumption, not open[t+1]. This matches backtest.ts/backtest-sweep.ts's existing convention in this repo, it is not unique to this script. A structural fix (execute at open[t+1]) would need to touch all three backtest scripts and would shift every historical number already referenced in CLAUDE.md/GOLIVE_CRITERIA.md - tracked as a separate follow-up, not done here.
+- Slippage: ${(SLIPPAGE_PERCENT * 100).toFixed(2)}%
+- Fractional/notional shares: off - not supported by this script (whole shares only, same as backtest.ts/backtest-sweep.ts)
+- Strategy config hash: ${configHash}
+
+## Result (full system: bucket cap + circuit breaker + daily kill switch + sell throttle)
+- Total return: ${result.totalPnlPercent.toFixed(2)}%
+- Max drawdown: ${result.maxDrawdownPercent.toFixed(2)}%
+- Average exposure: ${result.avgExposurePercent.toFixed(1)}%
+- Total trades: ${result.totalTrades}
+- Bucket cap binds: ${result.bucketCapReductionCount}
+- Circuit breaker trips: ${result.circuitBreakerTrippedAt ? `1 (on ${result.circuitBreakerTrippedAt}, stayed tripped ${result.daysTrippedCount}/${result.totalSimDays} days - sticky, no auto-recovery modeled)` : 0}
+- Daily kill switch / execution-time rejections: ${result.executionTimeRejectionCount}
+- Execution-time reductions (same-day cash/position competition): ${result.executionTimeReductionCount}
+
+## Benchmarks
+- Equal-weighted buy & hold (all ${TICKERS.length} tickers): ${buyAndHoldPercent.toFixed(2)}%
+- SPY buy & hold: ${spyBuyAndHoldPercent !== null ? `${spyBuyAndHoldPercent.toFixed(2)}%` : "n/a (SPY not in ticker list)"}
+`;
+
+  await fs.writeFile(path.join(REPORT_DIR, "portfolio-backtest-report.md"), reportMd, "utf-8");
+
+  const blockedRows: (string | number)[][] = [
+    [
+      "date",
+      "ticker",
+      "action",
+      "block_reason",
+      "bucket",
+      "current_bucket_exposure",
+      "price",
+      "next_5d_return",
+      "next_20d_return",
+    ],
+  ];
+  for (const signal of result.blockedSignals) {
+    const next5d = forwardReturn(barsByTicker, indexByTickerByDate, signal.ticker, signal.date, 5);
+    const next20d = forwardReturn(barsByTicker, indexByTickerByDate, signal.ticker, signal.date, 20);
+    blockedRows.push([
+      signal.date,
+      signal.ticker,
+      signal.action,
+      signal.blockReason,
+      signal.bucket ?? "",
+      signal.currentBucketExposure.toFixed(2),
+      signal.price.toFixed(2),
+      next5d !== null ? next5d.toFixed(2) : "",
+      next20d !== null ? next20d.toFixed(2) : "",
+    ]);
+  }
+  await fs.writeFile(
+    path.join(REPORT_DIR, "blocked-signals.csv"),
+    toCsv(blockedRows),
+    "utf-8",
+  );
+
+  const tradeRows: (string | number)[][] = [
+    ["date", "ticker", "side", "shares", "price", "notional", "reason", "equity_after", "cash_after"],
+  ];
+  for (const trade of result.trades) {
+    tradeRows.push([
+      trade.date,
+      trade.ticker,
+      trade.action,
+      trade.shares,
+      trade.price.toFixed(4),
+      trade.notional.toFixed(2),
+      trade.reasonType,
+      trade.equityAfter.toFixed(2),
+      trade.cashAfter.toFixed(2),
+    ]);
+  }
+  await fs.writeFile(path.join(REPORT_DIR, "trades.csv"), toCsv(tradeRows), "utf-8");
+
+  const equityRows: (string | number)[][] = [
+    ["date", "equity", "cash", "exposure", "drawdown", "buy_and_hold_equity"],
+  ];
+  for (const point of result.equityCurve) {
+    equityRows.push([
+      point.date,
+      point.equity.toFixed(2),
+      point.cash.toFixed(2),
+      point.exposurePercent.toFixed(2),
+      point.drawdownPercent.toFixed(2),
+      (buyAndHoldCurve.get(point.date) ?? 0).toFixed(2),
+    ]);
+  }
+  await fs.writeFile(path.join(REPORT_DIR, "equity-curve.csv"), toCsv(equityRows), "utf-8");
+
+  console.log(`Reports written to ${REPORT_DIR}`);
+}
+
 async function main() {
   console.log(
     `Portfolio backtest: ${TICKERS.length} tickers | Days: ${DAYS} | Starting capital: $${STARTING_CAPITAL} (shared, not per-ticker)`,
@@ -774,15 +1158,61 @@ async function main() {
     process.exit(1);
   }
 
-  const result = runPortfolioSimulation(
+  console.log(
+    `Simulated window: ${commonDates.length - simStartIndex} days (${commonDates[simStartIndex]} to ${commonDates[commonDates.length - 1]})`,
+  );
+  console.log("");
+
+  console.log("=== Variant ablation (isolating each safety layer's effect) ===");
+  console.log(
+    "variant".padEnd(56) +
+      pad("return%", 10) +
+      pad("maxDD%", 10) +
+      pad("trades", 9) +
+      pad("exposure%", 11) +
+      pad("blocked", 9),
+  );
+
+  let fullSystemResult: PortfolioSimResult | null = null;
+
+  for (const variant of VARIANTS) {
+    const result = runPortfolioSimulation(
+      barsByTicker,
+      TICKERS,
+      commonDates,
+      indexByTickerByDate,
+      simStartIndex,
+      variant,
+    );
+
+    console.log(
+      variant.label.padEnd(56) +
+        pad(result.totalPnlPercent.toFixed(2), 10) +
+        pad(result.maxDrawdownPercent.toFixed(2), 10) +
+        pad(String(result.totalTrades), 9) +
+        pad(result.avgExposurePercent.toFixed(1), 11) +
+        pad(String(result.blockedBuyCount), 9),
+    );
+
+    if (variant.useBucketCap && variant.useCircuitBreaker && variant.useDailyKillAndSellThrottle) {
+      fullSystemResult = result;
+    }
+  }
+  console.log("");
+
+  const result = fullSystemResult!;
+
+  const buyAndHoldPercent = computeEqualWeightBuyAndHold(
     barsByTicker,
     TICKERS,
     commonDates,
     indexByTickerByDate,
     simStartIndex,
   );
-
-  const buyAndHoldPercent = computeEqualWeightBuyAndHold(
+  const spyBuyAndHoldPercent = TICKERS.includes("SPY")
+    ? computeSingleTickerBuyAndHold(barsByTicker, "SPY", commonDates, indexByTickerByDate, simStartIndex)
+    : null;
+  const buyAndHoldCurve = computeEqualWeightBuyAndHoldCurve(
     barsByTicker,
     TICKERS,
     commonDates,
@@ -796,10 +1226,10 @@ async function main() {
   const independentAveragePercent =
     independentAverages.reduce((sum, v) => sum + v, 0) / independentAverages.length;
 
-  console.log("=== Portfolio-level result (shared cash pool + all caps) ===");
-  console.log(`Simulated days: ${result.totalSimDays} (${commonDates[simStartIndex]} to ${commonDates[commonDates.length - 1]})`);
+  console.log("=== Full-system result (variant D - matches live) ===");
   console.log(`Total return: ${result.totalPnlPercent.toFixed(2)}%`);
   console.log(`Max drawdown: ${result.maxDrawdownPercent.toFixed(2)}%`);
+  console.log(`Average exposure: ${result.avgExposurePercent.toFixed(1)}%`);
   console.log(
     `Circuit breaker: ${
       result.circuitBreakerTrippedAt
@@ -815,6 +1245,9 @@ async function main() {
 
   console.log("=== Benchmarks ===");
   console.log(`Equal-weighted buy & hold (all ${TICKERS.length} tickers, $${(STARTING_CAPITAL / TICKERS.length).toFixed(0)} each): ${buyAndHoldPercent.toFixed(2)}%`);
+  if (spyBuyAndHoldPercent !== null) {
+    console.log(`SPY buy & hold: ${spyBuyAndHoldPercent.toFixed(2)}%`);
+  }
   console.log(
     `Independent per-ticker average (backtest-sweep.ts-style, $${STARTING_CAPITAL} EACH, no portfolio caps): ${independentAveragePercent.toFixed(2)}%`,
   );
@@ -826,7 +1259,7 @@ async function main() {
   );
   console.log("");
 
-  console.log("=== Per-ticker breakdown ===");
+  console.log("=== Per-ticker breakdown (full system) ===");
   console.log(
     "ticker".padEnd(8) +
       pad("trades", 8) +
@@ -844,6 +1277,18 @@ async function main() {
         pad(independentAverages[i]!.toFixed(2), 16),
     );
   });
+  console.log("");
+
+  await writeReportsForFullSystem(
+    result,
+    barsByTicker,
+    indexByTickerByDate,
+    commonDates,
+    simStartIndex,
+    buyAndHoldPercent,
+    spyBuyAndHoldPercent,
+    buyAndHoldCurve,
+  );
 }
 
 main().catch((error: unknown) => {

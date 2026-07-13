@@ -1,9 +1,32 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  applyStickyTrip,
   evaluatePortfolioDrawdown,
   findPeakSinceTracking,
 } from "./portfolioCircuitBreaker.js";
+
+describe("applyStickyTrip", () => {
+  it("stays tripped even when a fresh evaluation says recovered", () => {
+    // Equity climbed to a new post-trip high, so evaluatePortfolioDrawdown
+    // would report tripped=false again - the sticky rule must override
+    // that and keep the breaker tripped, matching live's no-auto-recovery
+    // behavior (only a manual reset clears it).
+    expect(applyStickyTrip(false, true)).toBe(true);
+  });
+
+  it("trips fresh when the evaluation trips and nothing was tripped before", () => {
+    expect(applyStickyTrip(true, false)).toBe(true);
+  });
+
+  it("stays tripped when both the evaluation and prior state are tripped", () => {
+    expect(applyStickyTrip(true, true)).toBe(true);
+  });
+
+  it("stays untripped when neither the evaluation nor prior state is tripped", () => {
+    expect(applyStickyTrip(false, false)).toBe(false);
+  });
+});
 
 describe("evaluatePortfolioDrawdown", () => {
   it("does not trip when equity is at a new peak", () => {

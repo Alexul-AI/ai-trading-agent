@@ -52,6 +52,19 @@ export type FetchEquityHistory = (
 // Pure decision rule, kept separate from the file read/write orchestration
 // below so it's testable without touching disk - same pattern as
 // evaluateSentimentVeto/evaluateInsiderVeto in autopilotWorker.ts.
+// Sticky by design: once tripped, stays tripped regardless of what a
+// fresh evaluation says (e.g. equity recovering to a new post-trip high
+// would make evaluatePortfolioDrawdown report tripped=false again - this
+// function is what prevents that from silently un-tripping the breaker).
+// Shared by updatePortfolioCircuitBreaker below and backtest-portfolio.ts,
+// so live and backtest can't silently diverge on this rule.
+export function applyStickyTrip(
+  evaluationTripped: boolean,
+  wasTripped: boolean,
+): boolean {
+  return evaluationTripped || wasTripped;
+}
+
 export function evaluatePortfolioDrawdown(
   currentEquity: number,
   peakEquity: number,
@@ -177,7 +190,7 @@ export async function updatePortfolioCircuitBreaker(
     trackingStartDate,
     peakEquity,
     peakEquityAt,
-    tripped: evaluation.tripped || wasTripped,
+    tripped: applyStickyTrip(evaluation.tripped, wasTripped),
     trippedAt: justTripped ? now : (existing?.trippedAt ?? null),
     dataStale,
   };
