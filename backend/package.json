@@ -11,6 +11,7 @@
     "test:backtest": "tsx backtest.ts",
     "test:backtest-sweep": "tsx backtest-sweep.ts",
     "test:backtest-portfolio": "tsx backtest-portfolio.ts",
+    "test:backtest-portfolio-multiwindow": "tsx backtest-portfolio-multiwindow.ts",
     "test": "vitest run"
   },
   "dependencies": {

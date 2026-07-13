@@ -53,7 +53,7 @@ if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY) {
   process.exit(1);
 }
 
-const TICKERS = (
+export const TICKERS = (
   process.env.BACKTEST_TICKERS ||
   "AMD,NVDA,AAPL,MSFT,TSLA,JPM,JNJ,XOM,PG,SPY,GLD,TLT,EFA"
 )
@@ -129,7 +129,7 @@ const NO_DAILY_KILL_RISK_PROFILE: RiskProfile = {
 
 const REPORT_DIR = path.resolve(process.cwd(), "data", "backtest-reports");
 
-type ExecutionModel = "close_to_close" | "next_open";
+export type ExecutionModel = "close_to_close" | "next_open";
 
 function toIsoDate(date: Date): string {
   return date.toISOString().split("T")[0] ?? date.toISOString();
@@ -142,9 +142,10 @@ function dateKeyOf(bar: AlpacaBar): string {
 async function fetchAlpacaBars(
   ticker: string,
   days: number,
+  endDaysAgo: number,
 ): Promise<AlpacaBar[]> {
   const endDate = new Date();
-  endDate.setDate(endDate.getDate() - END_DAYS_AGO);
+  endDate.setDate(endDate.getDate() - endDaysAgo);
   const startDate = new Date(endDate);
   startDate.setDate(endDate.getDate() - days);
 
@@ -274,14 +275,14 @@ function findSimStartIndex(
 
 // --- Portfolio-level day-loop simulation ---
 
-interface SimVariantConfig {
+export interface SimVariantConfig {
   label: string;
   useBucketCap: boolean;
   useCircuitBreaker: boolean;
   useDailyKillAndSellThrottle: boolean;
 }
 
-const VARIANTS: SimVariantConfig[] = [
+export const VARIANTS: SimVariantConfig[] = [
   {
     label: "A: no bucket cap, no circuit breaker, no daily kill/sell throttle",
     useBucketCap: false,
@@ -312,7 +313,7 @@ const VARIANTS: SimVariantConfig[] = [
 // observed run (it matches B exactly in every result so far), and
 // close_to_close's breaker never trips either. Running these against a
 // breaker that never fires would just reproduce D0's number five times.
-interface CircuitBreakerPolicy {
+export interface CircuitBreakerPolicy {
   label: string;
   /** D2: reset N trading days after the trip, regardless of recovery. */
   resetAfterTradingDays?: number;
@@ -391,7 +392,7 @@ interface UnexecutedPendingOrder {
   signalDate: string;
 }
 
-interface PortfolioSimResult {
+export interface PortfolioSimResult {
   finalEquity: number;
   totalPnlPercent: number;
   maxDrawdownPercent: number;
@@ -1388,19 +1389,52 @@ and the independent-per-ticker baseline have no signal-to-execution lag concept.
   console.log(`Reports written to ${reportDir}`);
 }
 
-async function main() {
-  console.log(
-    `Portfolio backtest: ${TICKERS.length} tickers | Days: ${DAYS} | Starting capital: $${STARTING_CAPITAL} (shared, not per-ticker)`,
-  );
-  console.log(`Tickers: ${TICKERS.join(", ")}`);
-  console.log("");
+export interface PolicyResultEntry {
+  policy: CircuitBreakerPolicy;
+  result: PortfolioSimResult;
+  avgBlockedBuyFwd20dReturn: number | null;
+}
+
+export interface WindowAnalysisResult {
+  label: string;
+  requestedDays: number;
+  requestedEndDaysAgo: number;
+  startDate: string;
+  endDate: string;
+  simDays: number;
+  barsByTicker: Map<string, AlpacaBar[]>;
+  indexByTickerByDate: Map<string, Map<string, number>>;
+  commonDates: string[];
+  simStartIndex: number;
+  resultsByModel: Map<ExecutionModel, { variant: SimVariantConfig; result: PortfolioSimResult }[]>;
+  policyResults: PolicyResultEntry[];
+  buyAndHoldPercent: number;
+  spyBuyAndHoldPercent: number | null;
+  buyAndHoldCurve: Map<string, number>;
+  independentAverages: number[];
+  independentAveragePercent: number;
+}
+
+// Reusable "run one window" unit - everything from fetch through
+// benchmarks, minus console-printing and report-file-writing (those stay
+// caller-specific: main() below reproduces today's single-window output
+// exactly, backtest-portfolio-multiwindow.ts prints its own summary
+// tables instead). Fetch-progress logging is the one exception kept in
+// here rather than pushed to callers - both callers want it, and without
+// it a multi-window run (5 x 13 tickers of fetching, sometimes hitting
+// Alpaca connect timeouts) would give zero feedback for minutes at a time.
+export async function runWindowAnalysis(options: {
+  label: string;
+  days: number;
+  endDaysAgo: number;
+}): Promise<WindowAnalysisResult> {
+  const { label, days, endDaysAgo } = options;
 
   const barsByTicker = new Map<string, AlpacaBar[]>();
   for (const ticker of TICKERS) {
-    console.log(`Fetching ${ticker}...`);
-    barsByTicker.set(ticker, await fetchAlpacaBars(ticker, DAYS));
+    console.log(`[${label}] Fetching ${ticker}...`);
+    barsByTicker.set(ticker, await fetchAlpacaBars(ticker, days, endDaysAgo));
   }
-  console.log("");
 
   const { commonDates, indexByTickerByDate } = alignByIntersection(
     barsByTicker,
@@ -1413,16 +1447,14 @@ async function main() {
   );
 
   if (simStartIndex >= commonDates.length) {
-    console.error(
-      "Not enough shared history to clear the warmup window for all tickers - try a larger BACKTEST_DAYS.",
+    throw new Error(
+      `[${label}] Not enough shared history to clear the warmup window for all tickers - try a larger days value.`,
     );
-    process.exit(1);
   }
 
-  console.log(
-    `Simulated window: ${commonDates.length - simStartIndex} days (${commonDates[simStartIndex]} to ${commonDates[commonDates.length - 1]})`,
-  );
-  console.log("");
+  const startDate = commonDates[simStartIndex]!;
+  const endDate = commonDates[commonDates.length - 1]!;
+  const simDays = commonDates.length - simStartIndex;
 
   const executionModels: ExecutionModel[] = ["close_to_close", "next_open"];
   const resultsByModel = new Map<
@@ -1444,68 +1476,12 @@ async function main() {
       ),
     }));
     resultsByModel.set(executionModel, resultsByVariant);
-
-    printAblationTable(
-      `=== Variant ablation - ${executionModel.toUpperCase()} ===`,
-      resultsByVariant,
-    );
   }
 
-  console.log(
-    '"0-share buys" = BUY signals that executed literally 0 shares, for any reason (bucket cap, circuit',
-  );
-  console.log(
-    "breaker, or execution-time rejection). Not the same as \"reduced by bucket cap\" in the full report,",
-  );
-  console.log(
-    "which also counts requests that were shrunk but still executed with a positive share count.",
-  );
-  console.log("");
-  console.log(
-    "Caveat: full-system (D) isn't the most conservative variant - it has more trades and a higher return",
-  );
-  console.log(
-    "than B/C because the sell-fraction throttle changes exit dynamics (partial exits instead of one full",
-  );
-  console.log(
-    "exit let this window's winners keep running). That's an observed result in this specific window,",
-  );
-  console.log("not yet a validated edge - see CLAUDE.md.");
-  console.log("");
-
-  const closeToCloseD = resultsByModel
-    .get("close_to_close")!
-    .find((r) => r.variant.useDailyKillAndSellThrottle)!.result;
-  const nextOpenD = resultsByModel
-    .get("next_open")!
-    .find((r) => r.variant.useDailyKillAndSellThrottle)!.result;
-
-  console.log("=== Execution drag (variant D, full system) ===");
-  console.log(
-    `Close-to-close return: ${closeToCloseD.totalPnlPercent.toFixed(2)}%  |  Next-open return: ${nextOpenD.totalPnlPercent.toFixed(2)}%  |  Drag: ${(closeToCloseD.totalPnlPercent - nextOpenD.totalPnlPercent).toFixed(2)} pts`,
-  );
-  console.log(
-    `Close-to-close max drawdown: ${closeToCloseD.maxDrawdownPercent.toFixed(2)}%  |  Next-open max drawdown: ${nextOpenD.maxDrawdownPercent.toFixed(2)}%`,
-  );
-  console.log("");
-
-  // --- Circuit-breaker intervention scenarios (next_open, variant D only -
-  // C never trips in any observed run and close_to_close's breaker never
-  // trips either, so this axis is only informative there). ---
+  // Circuit-breaker intervention scenarios (next_open, variant D only - C
+  // never trips in any observed run and close_to_close's breaker never
+  // trips either, so this axis is only informative there).
   const variantD = VARIANTS.find((v) => v.useDailyKillAndSellThrottle)!;
-  const policyResults = CIRCUIT_BREAKER_POLICIES.map((policy) => ({
-    policy,
-    result: runPortfolioSimulation(
-      barsByTicker,
-      TICKERS,
-      commonDates,
-      indexByTickerByDate,
-      simStartIndex,
-      variantD,
-      "next_open",
-      policy,
-    ),
-  }));
 
   function avgBlockedBuyForward20d(result: PortfolioSimResult): number | null {
     const returns = result.blockedSignals
@@ -1516,56 +1492,24 @@ async function main() {
     return returns.reduce((sum, r) => sum + r, 0) / returns.length;
   }
 
-  console.log("=== Circuit-breaker intervention scenarios (NEXT_OPEN, variant D) ===");
-  console.log(
-    "scenario".padEnd(56) +
-      pad("return%", 10) +
-      pad("maxDD%", 10) +
-      pad("halt days", 11) +
-      pad("blocked", 9) +
-      pad("resets", 8) +
-      pad("avg fwd20d%", 13),
-  );
-  for (const { policy, result } of policyResults) {
-    const avgFwd = avgBlockedBuyForward20d(result);
-    console.log(
-      policy.label.padEnd(56) +
-        pad(result.totalPnlPercent.toFixed(2), 10) +
-        pad(result.maxDrawdownPercent.toFixed(2), 10) +
-        pad(String(result.daysTrippedCount), 11) +
-        pad(String(result.circuitBreakerBlockedBuyCount), 9) +
-        pad(String(result.resetCount), 8) +
-        pad(avgFwd !== null ? avgFwd.toFixed(2) : "n/a", 13),
-    );
-  }
-  console.log(
-    "Backtest-only research - none of these reset policies exist live. D0 is the current, unchanged",
-  );
-  console.log(
-    "live behavior (sticky, no auto-recovery) and must stay reproducible at the number reported above.",
-  );
-  console.log("");
-
-  await fs.mkdir(path.join(REPORT_DIR, "next_open"), { recursive: true });
-  const policyRows: (string | number)[][] = [
-    ["scenario", "return_pct", "max_dd_pct", "halt_days", "buys_blocked_by_breaker", "reset_count", "avg_blocked_buy_fwd_20d_return_pct"],
-  ];
-  for (const { policy, result } of policyResults) {
-    const avgFwd = avgBlockedBuyForward20d(result);
-    policyRows.push([
-      policy.label,
-      result.totalPnlPercent.toFixed(2),
-      result.maxDrawdownPercent.toFixed(2),
-      result.daysTrippedCount,
-      result.circuitBreakerBlockedBuyCount,
-      result.resetCount,
-      avgFwd !== null ? avgFwd.toFixed(2) : "",
-    ]);
-  }
-  await fs.writeFile(
-    path.join(REPORT_DIR, "next_open", "circuit-breaker-policy-comparison.csv"),
-    toCsv(policyRows),
-    "utf-8",
+  const policyResults: PolicyResultEntry[] = CIRCUIT_BREAKER_POLICIES.map(
+    (policy) => {
+      const result = runPortfolioSimulation(
+        barsByTicker,
+        TICKERS,
+        commonDates,
+        indexByTickerByDate,
+        simStartIndex,
+        variantD,
+        "next_open",
+        policy,
+      );
+      return {
+        policy,
+        result,
+        avgBlockedBuyFwd20dReturn: avgBlockedBuyForward20d(result),
+      };
+    },
   );
 
   const buyAndHoldPercent = computeEqualWeightBuyAndHold(
@@ -1592,18 +1536,155 @@ async function main() {
   const independentAveragePercent =
     independentAverages.reduce((sum, v) => sum + v, 0) / independentAverages.length;
 
-  console.log("=== Benchmarks (always close-to-close-anchored) ===");
-  console.log(`Equal-weighted buy & hold (all ${TICKERS.length} tickers, $${(STARTING_CAPITAL / TICKERS.length).toFixed(0)} each): ${buyAndHoldPercent.toFixed(2)}%`);
-  if (spyBuyAndHoldPercent !== null) {
-    console.log(`SPY buy & hold: ${spyBuyAndHoldPercent.toFixed(2)}%`);
+  return {
+    label,
+    requestedDays: days,
+    requestedEndDaysAgo: endDaysAgo,
+    startDate,
+    endDate,
+    simDays,
+    barsByTicker,
+    indexByTickerByDate,
+    commonDates,
+    simStartIndex,
+    resultsByModel,
+    policyResults,
+    buyAndHoldPercent,
+    spyBuyAndHoldPercent,
+    buyAndHoldCurve,
+    independentAverages,
+    independentAveragePercent,
+  };
+}
+
+async function main() {
+  console.log(
+    `Portfolio backtest: ${TICKERS.length} tickers | Days: ${DAYS} | Starting capital: $${STARTING_CAPITAL} (shared, not per-ticker)`,
+  );
+  console.log(`Tickers: ${TICKERS.join(", ")}`);
+  console.log("");
+
+  const analysis = await runWindowAnalysis({
+    label: "current",
+    days: DAYS,
+    endDaysAgo: END_DAYS_AGO,
+  });
+  console.log("");
+
+  console.log(
+    `Simulated window: ${analysis.simDays} days (${analysis.startDate} to ${analysis.endDate})`,
+  );
+  console.log("");
+
+  const executionModels: ExecutionModel[] = ["close_to_close", "next_open"];
+
+  for (const executionModel of executionModels) {
+    printAblationTable(
+      `=== Variant ablation - ${executionModel.toUpperCase()} ===`,
+      analysis.resultsByModel.get(executionModel)!,
+    );
+  }
+
+  console.log(
+    '"0-share buys" = BUY signals that executed literally 0 shares, for any reason (bucket cap, circuit',
+  );
+  console.log(
+    "breaker, or execution-time rejection). Not the same as \"reduced by bucket cap\" in the full report,",
+  );
+  console.log(
+    "which also counts requests that were shrunk but still executed with a positive share count.",
+  );
+  console.log("");
+  console.log(
+    "Caveat: full-system (D) isn't the most conservative variant - it has more trades and a higher return",
+  );
+  console.log(
+    "than B/C because the sell-fraction throttle changes exit dynamics (partial exits instead of one full",
+  );
+  console.log(
+    "exit let this window's winners keep running). That's an observed result in this specific window,",
+  );
+  console.log("not yet a validated edge - see CLAUDE.md.");
+  console.log("");
+
+  const closeToCloseD = analysis.resultsByModel
+    .get("close_to_close")!
+    .find((r) => r.variant.useDailyKillAndSellThrottle)!.result;
+  const nextOpenD = analysis.resultsByModel
+    .get("next_open")!
+    .find((r) => r.variant.useDailyKillAndSellThrottle)!.result;
+
+  console.log("=== Execution drag (variant D, full system) ===");
+  console.log(
+    `Close-to-close return: ${closeToCloseD.totalPnlPercent.toFixed(2)}%  |  Next-open return: ${nextOpenD.totalPnlPercent.toFixed(2)}%  |  Drag: ${(closeToCloseD.totalPnlPercent - nextOpenD.totalPnlPercent).toFixed(2)} pts`,
+  );
+  console.log(
+    `Close-to-close max drawdown: ${closeToCloseD.maxDrawdownPercent.toFixed(2)}%  |  Next-open max drawdown: ${nextOpenD.maxDrawdownPercent.toFixed(2)}%`,
+  );
+  console.log("");
+
+  console.log("=== Circuit-breaker intervention scenarios (NEXT_OPEN, variant D) ===");
+  console.log(
+    "scenario".padEnd(56) +
+      pad("return%", 10) +
+      pad("maxDD%", 10) +
+      pad("halt days", 11) +
+      pad("blocked", 9) +
+      pad("resets", 8) +
+      pad("avg fwd20d%", 13),
+  );
+  for (const { policy, result, avgBlockedBuyFwd20dReturn } of analysis.policyResults) {
+    console.log(
+      policy.label.padEnd(56) +
+        pad(result.totalPnlPercent.toFixed(2), 10) +
+        pad(result.maxDrawdownPercent.toFixed(2), 10) +
+        pad(String(result.daysTrippedCount), 11) +
+        pad(String(result.circuitBreakerBlockedBuyCount), 9) +
+        pad(String(result.resetCount), 8) +
+        pad(avgBlockedBuyFwd20dReturn !== null ? avgBlockedBuyFwd20dReturn.toFixed(2) : "n/a", 13),
+    );
   }
   console.log(
-    `Independent per-ticker average (backtest-sweep.ts-style, $${STARTING_CAPITAL} EACH, no portfolio caps): ${independentAveragePercent.toFixed(2)}%`,
+    "Backtest-only research - none of these reset policies exist live. D0 is the current, unchanged",
+  );
+  console.log(
+    "live behavior (sticky, no auto-recovery) and must stay reproducible at the number reported above.",
+  );
+  console.log("");
+
+  await fs.mkdir(path.join(REPORT_DIR, "next_open"), { recursive: true });
+  const policyRows: (string | number)[][] = [
+    ["scenario", "return_pct", "max_dd_pct", "halt_days", "buys_blocked_by_breaker", "reset_count", "avg_blocked_buy_fwd_20d_return_pct"],
+  ];
+  for (const { policy, result, avgBlockedBuyFwd20dReturn } of analysis.policyResults) {
+    policyRows.push([
+      policy.label,
+      result.totalPnlPercent.toFixed(2),
+      result.maxDrawdownPercent.toFixed(2),
+      result.daysTrippedCount,
+      result.circuitBreakerBlockedBuyCount,
+      result.resetCount,
+      avgBlockedBuyFwd20dReturn !== null ? avgBlockedBuyFwd20dReturn.toFixed(2) : "",
+    ]);
+  }
+  await fs.writeFile(
+    path.join(REPORT_DIR, "next_open", "circuit-breaker-policy-comparison.csv"),
+    toCsv(policyRows),
+    "utf-8",
+  );
+
+  console.log("=== Benchmarks (always close-to-close-anchored) ===");
+  console.log(`Equal-weighted buy & hold (all ${TICKERS.length} tickers, $${(STARTING_CAPITAL / TICKERS.length).toFixed(0)} each): ${analysis.buyAndHoldPercent.toFixed(2)}%`);
+  if (analysis.spyBuyAndHoldPercent !== null) {
+    console.log(`SPY buy & hold: ${analysis.spyBuyAndHoldPercent.toFixed(2)}%`);
+  }
+  console.log(
+    `Independent per-ticker average (backtest-sweep.ts-style, $${STARTING_CAPITAL} EACH, no portfolio caps): ${analysis.independentAveragePercent.toFixed(2)}%`,
   );
   console.log("");
 
   for (const executionModel of executionModels) {
-    const result = resultsByModel
+    const result = analysis.resultsByModel
       .get(executionModel)!
       .find((r) => r.variant.useDailyKillAndSellThrottle)!.result;
 
@@ -1622,20 +1703,20 @@ async function main() {
           pad(String(summary.trades), 8) +
           pad(String(summary.finalShares), 14) +
           pad(summary.realizedPnl.toFixed(2), 14) +
-          pad(independentAverages[i]!.toFixed(2), 16),
+          pad(analysis.independentAverages[i]!.toFixed(2), 16),
       );
     });
     console.log("");
 
     await writeReportsForFullSystem(
       result,
-      barsByTicker,
-      indexByTickerByDate,
-      commonDates,
-      simStartIndex,
-      buyAndHoldPercent,
-      spyBuyAndHoldPercent,
-      buyAndHoldCurve,
+      analysis.barsByTicker,
+      analysis.indexByTickerByDate,
+      analysis.commonDates,
+      analysis.simStartIndex,
+      analysis.buyAndHoldPercent,
+      analysis.spyBuyAndHoldPercent,
+      analysis.buyAndHoldCurve,
       executionModel,
     );
   }
