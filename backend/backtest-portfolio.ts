@@ -357,10 +357,14 @@ interface PortfolioSimResult {
   circuitBreakerTrippedAt: string | null;
   daysTrippedCount: number;
   totalSimDays: number;
+  /** Times the bucket cap reduced a BUY request, partially OR all the way to 0 shares. */
   bucketCapReductionCount: number;
+  /** Subset of bucketCapReductionCount that was reduced all the way to 0 shares (fully blocked, not just shrunk). */
+  bucketCapFullyBlockedCount: number;
   circuitBreakerBlockedBuyCount: number;
   executionTimeReductionCount: number;
   executionTimeRejectionCount: number;
+  /** BUY signals that executed literally 0 shares, for ANY reason (bucket cap, circuit breaker, or execution-time rejection) - not the same number as bucketCapReductionCount, which also counts partial reductions. */
   blockedBuyCount: number;
   totalTrades: number;
   trades: TradeLogEntry[];
@@ -785,6 +789,9 @@ function runPortfolioSimulation(
   const totalSimDays = commonDates.length - simStartIndex;
   const totalTrades = trades.length;
   const blockedBuyCount = blockedSignals.length;
+  const bucketCapFullyBlockedCount = blockedSignals.filter(
+    (s) => s.blockReason === "bucket_cap",
+  ).length;
 
   return {
     finalEquity,
@@ -795,6 +802,7 @@ function runPortfolioSimulation(
     daysTrippedCount,
     totalSimDays,
     bucketCapReductionCount,
+    bucketCapFullyBlockedCount,
     circuitBreakerBlockedBuyCount,
     executionTimeReductionCount,
     executionTimeRejectionCount,
@@ -1035,7 +1043,7 @@ Generated: ${new Date().toISOString()}
 - Window: ${result.totalSimDays} simulated days (${commonDates[simStartIndex]} to ${commonDates[commonDates.length - 1]})
 - Tickers: ${TICKERS.length} (${TICKERS.join(", ")})
 - Starting capital: $${STARTING_CAPITAL} (shared, not per-ticker)
-- Execution model: signal on close[t], executed at close[t] with slippage - a same-bar assumption, not open[t+1]. This matches backtest.ts/backtest-sweep.ts's existing convention in this repo, it is not unique to this script. A structural fix (execute at open[t+1]) would need to touch all three backtest scripts and would shift every historical number already referenced in CLAUDE.md/GOLIVE_CRITERIA.md - tracked as a separate follow-up, not done here.
+- Execution model: signal on close[t], executed at close[t] with slippage - a same-bar assumption, not open[t+1]. This matches backtest.ts/backtest-sweep.ts's existing convention in this repo, it is not unique to this script. A structural fix (execute at open[t+1]) would need to touch all three backtest scripts and would shift every historical number already referenced in CLAUDE.md/GOLIVE_CRITERIA.md - tracked as a separate follow-up, not done here. **Because of this, none of the return numbers below should be read as a realistic live return forecast** - they're only valid for comparing variants against each other, since every variant shares the identical close-to-close assumption and its bias should apply roughly equally to all of them.
 - Slippage: ${(SLIPPAGE_PERCENT * 100).toFixed(2)}%
 - Fractional/notional shares: off - not supported by this script (whole shares only, same as backtest.ts/backtest-sweep.ts)
 - Strategy config hash: ${configHash}
@@ -1045,7 +1053,8 @@ Generated: ${new Date().toISOString()}
 - Max drawdown: ${result.maxDrawdownPercent.toFixed(2)}%
 - Average exposure: ${result.avgExposurePercent.toFixed(1)}%
 - Total trades: ${result.totalTrades}
-- Bucket cap binds: ${result.bucketCapReductionCount}
+- Bucket cap reduced a BUY request (partially or fully) ${result.bucketCapReductionCount} times; of those, ${result.bucketCapFullyBlockedCount} were cut all the way to 0 shares (fully blocked)
+- BUY signals that executed 0 shares for any reason (bucket cap, circuit breaker, or execution-time rejection): ${result.blockedBuyCount}
 - Circuit breaker trips: ${result.circuitBreakerTrippedAt ? `1 (on ${result.circuitBreakerTrippedAt}, stayed tripped ${result.daysTrippedCount}/${result.totalSimDays} days - sticky, no auto-recovery modeled)` : 0}
 - Daily kill switch / execution-time rejections: ${result.executionTimeRejectionCount}
 - Execution-time reductions (same-day cash/position competition): ${result.executionTimeReductionCount}
@@ -1053,6 +1062,14 @@ Generated: ${new Date().toISOString()}
 ## Benchmarks
 - Equal-weighted buy & hold (all ${TICKERS.length} tickers): ${buyAndHoldPercent.toFixed(2)}%
 - SPY buy & hold: ${spyBuyAndHoldPercent !== null ? `${spyBuyAndHoldPercent.toFixed(2)}%` : "n/a (SPY not in ticker list)"}
+
+## Caveats
+- The full-system variant (D) is not the most conservative variant in the ablation table - it has more
+  trades and a higher return than bucket-cap-only (B) or +circuit-breaker (C), because the sell-fraction
+  throttle changes exit dynamics (partial exits instead of one full exit let this window's winners keep
+  running). This is an observed result in this specific window, not a validated edge.
+- See "Execution model" above: these return numbers are for comparing variants against each other, not
+  for forecasting live returns.
 `;
 
   await fs.writeFile(path.join(REPORT_DIR, "portfolio-backtest-report.md"), reportMd, "utf-8");
@@ -1170,7 +1187,7 @@ async function main() {
       pad("maxDD%", 10) +
       pad("trades", 9) +
       pad("exposure%", 11) +
-      pad("blocked", 9),
+      pad("0-share buys", 14),
   );
 
   let fullSystemResult: PortfolioSimResult | null = null;
@@ -1191,13 +1208,33 @@ async function main() {
         pad(result.maxDrawdownPercent.toFixed(2), 10) +
         pad(String(result.totalTrades), 9) +
         pad(result.avgExposurePercent.toFixed(1), 11) +
-        pad(String(result.blockedBuyCount), 9),
+        pad(String(result.blockedBuyCount), 14),
     );
 
     if (variant.useBucketCap && variant.useCircuitBreaker && variant.useDailyKillAndSellThrottle) {
       fullSystemResult = result;
     }
   }
+  console.log(
+    '"0-share buys" = BUY signals that executed literally 0 shares, for any reason (bucket cap, circuit',
+  );
+  console.log(
+    "breaker, or execution-time rejection). Not the same as \"reduced by bucket cap\" below, which also",
+  );
+  console.log(
+    "counts requests that were shrunk but still executed with a positive share count.",
+  );
+  console.log("");
+  console.log(
+    "Caveat: D isn't the most conservative variant here - it has more trades and a higher return than",
+  );
+  console.log(
+    "B/C because the sell-fraction throttle changes exit dynamics (partial exits instead of one full",
+  );
+  console.log(
+    "exit let this window's winners keep running). That's an observed result in this specific window,",
+  );
+  console.log("not yet a validated edge - see CLAUDE.md.");
   console.log("");
 
   const result = fullSystemResult!;
@@ -1238,7 +1275,9 @@ async function main() {
     }`,
   );
   console.log(`BUYs blocked by tripped circuit breaker: ${result.circuitBreakerBlockedBuyCount}`);
-  console.log(`BUYs reduced by bucket cap: ${result.bucketCapReductionCount}`);
+  console.log(
+    `BUYs reduced by bucket cap: ${result.bucketCapReductionCount} (partial or full reduction; of these, ${result.bucketCapFullyBlockedCount} were cut all the way to 0 shares)`,
+  );
   console.log(`Orders reduced at execution time (same-day cash/position competition): ${result.executionTimeReductionCount}`);
   console.log(`Orders rejected at execution time (daily -5% kill switch or no cash left): ${result.executionTimeRejectionCount}`);
   console.log("");
