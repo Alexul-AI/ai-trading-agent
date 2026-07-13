@@ -308,6 +308,34 @@ const VARIANTS: SimVariantConfig[] = [
   },
 ];
 
+// Only matters for variant D under next_open - C never trips in any
+// observed run (it matches B exactly in every result so far), and
+// close_to_close's breaker never trips either. Running these against a
+// breaker that never fires would just reproduce D0's number five times.
+interface CircuitBreakerPolicy {
+  label: string;
+  /** D2: reset N trading days after the trip, regardless of recovery. */
+  resetAfterTradingDays?: number;
+  /** D3: reset once drawdown-from-peak improves above this (less negative) threshold, e.g. -0.10. */
+  resetOnRecoveryFromPeakPercent?: number;
+}
+
+const DEFAULT_CIRCUIT_BREAKER_POLICY: CircuitBreakerPolicy = {
+  label: "D0: sticky, no reset (current)",
+};
+
+const CIRCUIT_BREAKER_POLICIES: CircuitBreakerPolicy[] = [
+  DEFAULT_CIRCUIT_BREAKER_POLICY,
+  { label: "D2: reset 1 trading day after trip", resetAfterTradingDays: 1 },
+  { label: "D2: reset 3 trading days after trip", resetAfterTradingDays: 3 },
+  { label: "D2: reset 5 trading days after trip", resetAfterTradingDays: 5 },
+  { label: "D2: reset 10 trading days after trip", resetAfterTradingDays: 10 },
+  {
+    label: "D3: reset once drawdown recovers above -10% from peak",
+    resetOnRecoveryFromPeakPercent: -0.1,
+  },
+];
+
 interface TickerState {
   shares: number;
   averageEntryPrice: number;
@@ -370,6 +398,9 @@ interface PortfolioSimResult {
   avgExposurePercent: number;
   circuitBreakerTrippedAt: string | null;
   daysTrippedCount: number;
+  /** Times the circuit breaker was reset (D0's policy never resets, so this stays 0 there). */
+  resetCount: number;
+  resetEvents: { date: string; reason: "recovery" | "day_limit" }[];
   totalSimDays: number;
   /** Times the bucket cap reduced a BUY request, partially OR all the way to 0 shares. */
   bucketCapReductionCount: number;
@@ -409,6 +440,7 @@ function runPortfolioSimulation(
   simStartIndex: number,
   variant: SimVariantConfig,
   executionModel: ExecutionModel,
+  circuitBreakerPolicy: CircuitBreakerPolicy = DEFAULT_CIRCUIT_BREAKER_POLICY,
 ): PortfolioSimResult {
   let cash = STARTING_CAPITAL;
   const stateByTicker = new Map<string, TickerState>(
@@ -436,6 +468,9 @@ function runPortfolioSimulation(
   let circuitBreakerTripped = false;
   let circuitBreakerTrippedAt: string | null = null;
   let daysTrippedCount = 0;
+  let daysSinceTripped = 0;
+  let resetCount = 0;
+  const resetEvents: { date: string; reason: "recovery" | "day_limit" }[] = [];
   let bucketCapReductionCount = 0;
   let circuitBreakerBlockedBuyCount = 0;
   let executionTimeReductionCount = 0;
@@ -662,13 +697,49 @@ function runPortfolioSimulation(
     const preSizingEquity = computeEquity(closePricesToday);
     if (preSizingEquity > peakEquity) peakEquity = preSizingEquity;
 
+    // Intervention research only (default policy never resets, matching
+    // live's actual sticky/no-auto-recovery design exactly). When a reset
+    // condition fires, rebase peakEquity to *now* - matching live's real
+    // resetPortfolioCircuitBreaker(currentEquity), which rebases to the
+    // equity at reset time, not the original pre-trip peak. A naive
+    // "just clear the tripped flag" without rebasing would immediately
+    // re-trip on the very next evaluation in most realistic cases.
+    if (variant.useCircuitBreaker && circuitBreakerTripped) {
+      daysSinceTripped += 1;
+
+      const recovered =
+        circuitBreakerPolicy.resetOnRecoveryFromPeakPercent !== undefined &&
+        !evaluatePortfolioDrawdown(
+          preSizingEquity,
+          peakEquity,
+          circuitBreakerPolicy.resetOnRecoveryFromPeakPercent,
+        ).tripped;
+      const dayLimitReached =
+        circuitBreakerPolicy.resetAfterTradingDays !== undefined &&
+        daysSinceTripped >= circuitBreakerPolicy.resetAfterTradingDays;
+
+      if (recovered || dayLimitReached) {
+        circuitBreakerTripped = false;
+        peakEquity = preSizingEquity;
+        daysSinceTripped = 0;
+        resetCount += 1;
+        resetEvents.push({
+          date,
+          reason: recovered ? "recovery" : "day_limit",
+        });
+      }
+    }
+
     // Sticky - mirrors updatePortfolioCircuitBreaker's applyStickyTrip
-    // (never auto-recovers without a human reset in live). Skipped
-    // entirely when this variant doesn't model the circuit breaker.
-    // Reading circuitBreakerTripped's carried-over value here (before
-    // this iteration updates it) is already the correct "most recently
-    // known" gate for this morning's pending BUYs too - no separate
-    // re-check needed for the trip flag itself.
+    // (never auto-recovers without a human reset in live, i.e. without a
+    // reset condition firing above). Skipped entirely when this variant
+    // doesn't model the circuit breaker. Reading circuitBreakerTripped's
+    // carried-over value here (before this iteration updates it) is
+    // already the correct "most recently known" gate for this morning's
+    // pending BUYs too - no separate re-check needed for the trip flag
+    // itself. A reset above doesn't grant immunity - this evaluation can
+    // re-trip immediately if still warranted, which is useful information
+    // (resetCount captures how often that happens).
     if (variant.useCircuitBreaker && !circuitBreakerTripped) {
       const evaluation = evaluatePortfolioDrawdown(
         preSizingEquity,
@@ -894,6 +965,8 @@ function runPortfolioSimulation(
     avgExposurePercent: totalSimDays > 0 ? exposureSum / totalSimDays : 0,
     circuitBreakerTrippedAt,
     daysTrippedCount,
+    resetCount,
+    resetEvents,
     totalSimDays,
     bucketCapReductionCount,
     bucketCapFullyBlockedCount,
@@ -1201,7 +1274,11 @@ Generated: ${new Date().toISOString()}
 - Total trades: ${result.totalTrades}
 - Bucket cap reduced a BUY request (partially or fully) ${result.bucketCapReductionCount} times; of those, ${result.bucketCapFullyBlockedCount} were cut all the way to 0 shares (fully blocked)
 - BUY signals that executed 0 shares for any reason (bucket cap, circuit breaker, or execution-time rejection): ${result.blockedBuyCount}
-- Circuit breaker trips: ${result.circuitBreakerTrippedAt ? `1 (on ${result.circuitBreakerTrippedAt}, stayed tripped ${result.daysTrippedCount}/${result.totalSimDays} days - sticky, no auto-recovery modeled)` : 0}
+- Circuit breaker trips: ${result.circuitBreakerTrippedAt ? `1 (on ${result.circuitBreakerTrippedAt}, stayed tripped ${result.daysTrippedCount}/${result.totalSimDays} days - sticky, no auto-recovery modeled)` : 0}${
+    result.circuitBreakerTrippedAt
+      ? `\n- This is the baseline "nobody noticed the halt" scenario (D0) - see \`circuit-breaker-policy-comparison.csv\` (next_open only) for what several reset/recovery intervention policies would have produced instead, and \`blocked-signals.csv\`'s forward-return columns for what those ${result.circuitBreakerBlockedBuyCount} blocked BUYs would have returned had a human noticed the alert and reset sooner`
+      : ""
+  }
 - Daily kill switch / execution-time rejections: ${result.executionTimeRejectionCount}
 - Execution-time reductions (same-day cash/position competition): ${result.executionTimeReductionCount}
 - Orders staged on the last simulated day with no following day to execute on (window-edge effect, not a strategy signal): ${result.unexecutedPendingOrders.length}${
@@ -1411,6 +1488,85 @@ async function main() {
     `Close-to-close max drawdown: ${closeToCloseD.maxDrawdownPercent.toFixed(2)}%  |  Next-open max drawdown: ${nextOpenD.maxDrawdownPercent.toFixed(2)}%`,
   );
   console.log("");
+
+  // --- Circuit-breaker intervention scenarios (next_open, variant D only -
+  // C never trips in any observed run and close_to_close's breaker never
+  // trips either, so this axis is only informative there). ---
+  const variantD = VARIANTS.find((v) => v.useDailyKillAndSellThrottle)!;
+  const policyResults = CIRCUIT_BREAKER_POLICIES.map((policy) => ({
+    policy,
+    result: runPortfolioSimulation(
+      barsByTicker,
+      TICKERS,
+      commonDates,
+      indexByTickerByDate,
+      simStartIndex,
+      variantD,
+      "next_open",
+      policy,
+    ),
+  }));
+
+  function avgBlockedBuyForward20d(result: PortfolioSimResult): number | null {
+    const returns = result.blockedSignals
+      .filter((s) => s.blockReason === "circuit_breaker")
+      .map((s) => forwardReturn(barsByTicker, indexByTickerByDate, s.ticker, s.date, 20))
+      .filter((r): r is number => r !== null);
+    if (returns.length === 0) return null;
+    return returns.reduce((sum, r) => sum + r, 0) / returns.length;
+  }
+
+  console.log("=== Circuit-breaker intervention scenarios (NEXT_OPEN, variant D) ===");
+  console.log(
+    "scenario".padEnd(56) +
+      pad("return%", 10) +
+      pad("maxDD%", 10) +
+      pad("halt days", 11) +
+      pad("blocked", 9) +
+      pad("resets", 8) +
+      pad("avg fwd20d%", 13),
+  );
+  for (const { policy, result } of policyResults) {
+    const avgFwd = avgBlockedBuyForward20d(result);
+    console.log(
+      policy.label.padEnd(56) +
+        pad(result.totalPnlPercent.toFixed(2), 10) +
+        pad(result.maxDrawdownPercent.toFixed(2), 10) +
+        pad(String(result.daysTrippedCount), 11) +
+        pad(String(result.circuitBreakerBlockedBuyCount), 9) +
+        pad(String(result.resetCount), 8) +
+        pad(avgFwd !== null ? avgFwd.toFixed(2) : "n/a", 13),
+    );
+  }
+  console.log(
+    "Backtest-only research - none of these reset policies exist live. D0 is the current, unchanged",
+  );
+  console.log(
+    "live behavior (sticky, no auto-recovery) and must stay reproducible at the number reported above.",
+  );
+  console.log("");
+
+  await fs.mkdir(path.join(REPORT_DIR, "next_open"), { recursive: true });
+  const policyRows: (string | number)[][] = [
+    ["scenario", "return_pct", "max_dd_pct", "halt_days", "buys_blocked_by_breaker", "reset_count", "avg_blocked_buy_fwd_20d_return_pct"],
+  ];
+  for (const { policy, result } of policyResults) {
+    const avgFwd = avgBlockedBuyForward20d(result);
+    policyRows.push([
+      policy.label,
+      result.totalPnlPercent.toFixed(2),
+      result.maxDrawdownPercent.toFixed(2),
+      result.daysTrippedCount,
+      result.circuitBreakerBlockedBuyCount,
+      result.resetCount,
+      avgFwd !== null ? avgFwd.toFixed(2) : "",
+    ]);
+  }
+  await fs.writeFile(
+    path.join(REPORT_DIR, "next_open", "circuit-breaker-policy-comparison.csv"),
+    toCsv(policyRows),
+    "utf-8",
+  );
 
   const buyAndHoldPercent = computeEqualWeightBuyAndHold(
     barsByTicker,
