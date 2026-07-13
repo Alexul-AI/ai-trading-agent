@@ -129,6 +129,8 @@ const NO_DAILY_KILL_RISK_PROFILE: RiskProfile = {
 
 const REPORT_DIR = path.resolve(process.cwd(), "data", "backtest-reports");
 
+type ExecutionModel = "close_to_close" | "next_open";
+
 function toIsoDate(date: Date): string {
   return date.toISOString().split("T")[0] ?? date.toISOString();
 }
@@ -190,7 +192,9 @@ async function fetchAlpacaBars(
 // index. The intersection is only used to pick which dates the day-loop
 // below visits. Slicing/rebuilding a shared array to the intersection
 // would silently corrupt Wilder-smoothed indicators for tickers that had
-// no gap of their own, by feeding them a gapped series.
+// no gap of their own, by feeding them a gapped series. Since every date
+// visited is in the intersection, every ticker is guaranteed to have a
+// bar (hence both a valid open and close) on every date the loop visits.
 
 interface Alignment {
   commonDates: string[];
@@ -314,10 +318,12 @@ interface TickerState {
 
 interface TradeLogEntry {
   date: string;
+  signalDate: string;
   ticker: string;
   action: "BUY" | "SELL";
   shares: number;
   price: number;
+  signalPrice: number;
   notional: number;
   reasonType: StrategyReasonType;
   equityAfter: number;
@@ -349,6 +355,14 @@ interface PerTickerSummary {
   realizedPnl: number;
 }
 
+interface UnexecutedPendingOrder {
+  ticker: string;
+  action: "BUY" | "SELL";
+  shares: number;
+  reasonType: StrategyReasonType;
+  signalDate: string;
+}
+
 interface PortfolioSimResult {
   finalEquity: number;
   totalPnlPercent: number;
@@ -371,6 +385,8 @@ interface PortfolioSimResult {
   perTicker: Map<string, PerTickerSummary>;
   equityCurve: EquityCurvePoint[];
   blockedSignals: BlockedSignalEntry[];
+  /** Orders staged on the last simulated day (next_open only) that never got a following day to execute on - logged, not silently dropped. */
+  unexecutedPendingOrders: UnexecutedPendingOrder[];
 }
 
 interface StagedDecision {
@@ -378,6 +394,9 @@ interface StagedDecision {
   action: "BUY" | "SELL";
   shares: number;
   reasonType: StrategyReasonType;
+  /** The day the signal was generated - always the execution day under close_to_close, may be one day earlier under next_open. */
+  signalDate: string;
+  /** Signal-day close price - diagnostic/ATR-weighting basis only. NOT the fill basis (see executeStagedOrders, which looks up a fresh execution-day price). */
   price: number;
   atrPercent: number;
 }
@@ -389,6 +408,7 @@ function runPortfolioSimulation(
   indexByTickerByDate: Map<string, Map<string, number>>,
   simStartIndex: number,
   variant: SimVariantConfig,
+  executionModel: ExecutionModel,
 ): PortfolioSimResult {
   let cash = STARTING_CAPITAL;
   const stateByTicker = new Map<string, TickerState>(
@@ -424,47 +444,234 @@ function runPortfolioSimulation(
   let maxDrawdown = 0;
   let runningPeakForDrawdown = 0;
   let exposureSum = 0;
+  let pendingOrders: StagedDecision[] = [];
 
   const maxDrawdownFromPeakPercent = getMaxDrawdownFromPeakPercent();
   const riskProfile = variant.useDailyKillAndSellThrottle
     ? FULL_RISK_PROFILE
     : NO_DAILY_KILL_RISK_PROFILE;
 
-  function priceOf(ticker: string, date: string): number | null {
+  function priceOf(
+    ticker: string,
+    date: string,
+    field: "o" | "c" = "c",
+  ): number | null {
     const idx = indexByTickerByDate.get(ticker)!.get(date);
     if (idx === undefined) return null;
     const bar = barsByTicker.get(ticker)![idx];
-    return bar ? Number(bar.c.toFixed(2)) : null;
+    return bar ? Number(bar[field].toFixed(2)) : null;
   }
 
-  function computeEquity(pricesToday: Map<string, number>): number {
+  function computeEquity(prices: Map<string, number>): number {
     let total = cash;
     for (const ticker of tickers) {
       const state = stateByTicker.get(ticker)!;
       if (state.shares <= 0) continue;
-      const price = pricesToday.get(ticker) ?? state.averageEntryPrice;
+      const price = prices.get(ticker) ?? state.averageEntryPrice;
       total += state.shares * price;
     }
     return total;
   }
 
-  for (let d = simStartIndex; d < commonDates.length; d += 1) {
-    const date = commonDates[d]!;
-    const pricesToday = new Map<string, number>();
+  // Executes a batch of staged orders against a price map built fresh from
+  // executionDate + priceSource - NEVER the day-loop's outer close-price
+  // map. This is what actually removes the look-ahead: under next_open,
+  // this runs at the top of the FOLLOWING iteration using that day's open,
+  // so every equity mark computed in here (position values, the daily
+  // drawdown check, equityAfter logging) reflects only prices knowable at
+  // that moment, not the eventual close of the day the order fills on.
+  // Does its own sells-before-buys partition internally so every caller
+  // gets the same ordering guarantee for free.
+  function executeStagedOrders(
+    items: StagedDecision[],
+    executionDate: string,
+    priceSource: "open" | "close",
+  ): void {
+    if (items.length === 0) return;
+
+    const execPrices = new Map<string, number>();
     for (const ticker of tickers) {
-      const p = priceOf(ticker, date);
-      if (p !== null) pricesToday.set(ticker, p);
+      const p = priceOf(ticker, executionDate, priceSource === "open" ? "o" : "c");
+      if (p !== null) execPrices.set(ticker, p);
     }
 
-    const preTradeEquity = computeEquity(pricesToday);
-    if (preTradeEquity > peakEquity) peakEquity = preTradeEquity;
+    const orderedItems = [
+      ...items.filter((s) => s.action === "SELL"),
+      ...items.filter((s) => s.action === "BUY"),
+    ];
+
+    for (const item of orderedItems) {
+      const state = stateByTicker.get(item.ticker)!;
+      const basisPrice = execPrices.get(item.ticker);
+      if (basisPrice === undefined) continue; // defensive - shouldn't happen, commonDates is an intersection
+
+      const currentPositions = tickers
+        .filter((t) => stateByTicker.get(t)!.shares > 0)
+        .map((t) => {
+          const s = stateByTicker.get(t)!;
+          const p = execPrices.get(t) ?? s.averageEntryPrice;
+          return { ticker: t, shares: s.shares, marketValue: s.shares * p };
+        });
+      const currentEquityNow =
+        cash + currentPositions.reduce((sum, p) => sum + p.marketValue, 0);
+      const dailyDrawdownNow =
+        previousDayEquity > 0
+          ? (currentEquityNow - previousDayEquity) / previousDayEquity
+          : 0;
+
+      const accountState: AccountState = {
+        equity: currentEquityNow,
+        cash,
+        dailyDrawdownPercent: dailyDrawdownNow,
+        currentPositions,
+      };
+
+      const executionPrice =
+        item.action === "BUY"
+          ? Number((basisPrice * (1 + SLIPPAGE_PERCENT)).toFixed(4))
+          : Number((basisPrice * (1 - SLIPPAGE_PERCENT)).toFixed(4));
+
+      const riskResult = evaluateTrade(
+        {
+          ticker: item.ticker,
+          action: item.action,
+          requestedShares: item.shares,
+          estimatedPrice: executionPrice,
+        },
+        accountState,
+        riskProfile,
+      );
+
+      if (!riskResult.approved) {
+        executionTimeRejectionCount += 1;
+        if (item.action === "BUY") {
+          const bucketId = TICKER_TO_BUCKET[item.ticker.toUpperCase()];
+          blockedSignals.push({
+            date: item.signalDate,
+            ticker: item.ticker,
+            action: "BUY",
+            blockReason: "execution_time",
+            bucket: bucketId,
+            currentBucketExposure: 0,
+            price: item.price,
+          });
+        }
+        continue;
+      }
+
+      const finalShares = riskResult.adjustedShares;
+      if (finalShares < item.shares) executionTimeReductionCount += 1;
+      if (finalShares <= 0) continue;
+
+      if (item.action === "BUY") {
+        const cost = executionPrice * finalShares + COMMISSION_PER_TRADE;
+        const previousPositionCost = state.averageEntryPrice * state.shares;
+        const previousAtrWeight = state.entryAtrPercent * previousPositionCost;
+        const newBuyCost = executionPrice * finalShares;
+
+        cash -= cost;
+        state.shares += finalShares;
+        state.averageEntryPrice =
+          state.shares > 0
+            ? (previousPositionCost + newBuyCost) / state.shares
+            : 0;
+        state.entryAtrPercent =
+          state.shares > 0
+            ? (previousAtrWeight + item.atrPercent * newBuyCost) /
+              (previousPositionCost + newBuyCost)
+            : 0;
+        state.lastBuyOwnIndex = indexByTickerByDate
+          .get(item.ticker)!
+          .get(executionDate)!;
+
+        perTicker.get(item.ticker)!.trades += 1;
+        trades.push({
+          date: executionDate,
+          signalDate: item.signalDate,
+          ticker: item.ticker,
+          action: "BUY",
+          shares: finalShares,
+          price: executionPrice,
+          signalPrice: item.price,
+          notional: newBuyCost,
+          reasonType: item.reasonType,
+          equityAfter: computeEquity(execPrices),
+          cashAfter: cash,
+        });
+      } else {
+        const sharesToSell = Math.min(finalShares, state.shares);
+        const revenue = executionPrice * sharesToSell - COMMISSION_PER_TRADE;
+        const realizedPnl =
+          (executionPrice - state.averageEntryPrice) * sharesToSell -
+          COMMISSION_PER_TRADE;
+
+        cash += revenue;
+        state.shares -= sharesToSell;
+        perTicker.get(item.ticker)!.realizedPnl += realizedPnl;
+        perTicker.get(item.ticker)!.trades += 1;
+
+        if (state.shares === 0) {
+          state.averageEntryPrice = 0;
+          state.entryAtrPercent = 0;
+        }
+        if (item.reasonType === "STOP_LOSS") {
+          state.lastStopLossOwnIndex = indexByTickerByDate
+            .get(item.ticker)!
+            .get(executionDate)!;
+        }
+
+        trades.push({
+          date: executionDate,
+          signalDate: item.signalDate,
+          ticker: item.ticker,
+          action: "SELL",
+          shares: sharesToSell,
+          price: executionPrice,
+          signalPrice: item.price,
+          notional: sharesToSell * executionPrice,
+          reasonType: item.reasonType,
+          equityAfter: computeEquity(execPrices),
+          cashAfter: cash,
+          realizedPnl,
+        });
+      }
+    }
+  }
+
+  for (let d = simStartIndex; d < commonDates.length; d += 1) {
+    const date = commonDates[d]!;
+
+    // Under next_open, this morning's fill of yesterday's signals happens
+    // FIRST, at today's open - before today's own circuit-breaker check
+    // and sizing pass, so sizing reflects cash/positions as they actually
+    // are by the time today's close is observed (not stale pre-fill state).
+    if (executionModel === "next_open" && pendingOrders.length > 0) {
+      executeStagedOrders(pendingOrders, date, "open");
+      pendingOrders = [];
+    }
+
+    const closePricesToday = new Map<string, number>();
+    for (const ticker of tickers) {
+      const p = priceOf(ticker, date, "c");
+      if (p !== null) closePricesToday.set(ticker, p);
+    }
+
+    // Mark-to-market at today's close, reflecting this morning's fill (if
+    // any). Under next_open this is "start of sizing, after this
+    // morning's lagged fill" rather than pristine pre-market state.
+    const preSizingEquity = computeEquity(closePricesToday);
+    if (preSizingEquity > peakEquity) peakEquity = preSizingEquity;
 
     // Sticky - mirrors updatePortfolioCircuitBreaker's applyStickyTrip
     // (never auto-recovers without a human reset in live). Skipped
     // entirely when this variant doesn't model the circuit breaker.
+    // Reading circuitBreakerTripped's carried-over value here (before
+    // this iteration updates it) is already the correct "most recently
+    // known" gate for this morning's pending BUYs too - no separate
+    // re-check needed for the trip flag itself.
     if (variant.useCircuitBreaker && !circuitBreakerTripped) {
       const evaluation = evaluatePortfolioDrawdown(
-        preTradeEquity,
+        preSizingEquity,
         peakEquity,
         maxDrawdownFromPeakPercent,
       );
@@ -476,17 +683,17 @@ function runPortfolioSimulation(
     }
     if (circuitBreakerTripped) daysTrippedCount += 1;
 
-    // --- SIZING pass: every ticker reads the same frozen start-of-day snapshot ---
+    // --- SIZING pass: every ticker reads the same frozen snapshot ---
     const sizingSnapshot: PortfolioSnapshot = {
       balance: cash,
-      equity: preTradeEquity,
+      equity: preSizingEquity,
       currency: "USD",
       positions: Object.fromEntries(
         tickers
           .filter((t) => stateByTicker.get(t)!.shares > 0)
           .map((t) => {
             const state = stateByTicker.get(t)!;
-            const price = pricesToday.get(t) ?? state.averageEntryPrice;
+            const price = closePricesToday.get(t) ?? state.averageEntryPrice;
             return [
               t,
               {
@@ -504,7 +711,7 @@ function runPortfolioSimulation(
     const staged: StagedDecision[] = [];
 
     for (const ticker of tickers) {
-      const price = pricesToday.get(ticker);
+      const price = closePricesToday.get(ticker);
       if (price === undefined) continue;
 
       const ownIndex = indexByTickerByDate.get(ticker)!.get(date)!;
@@ -548,6 +755,7 @@ function runPortfolioSimulation(
             action: "SELL",
             shares: safeShares,
             reasonType: decision.reasonType,
+            signalDate: date,
             price,
             atrPercent,
           });
@@ -613,6 +821,7 @@ function runPortfolioSimulation(
             action: "BUY",
             shares: sharesToStage,
             reasonType: decision.reasonType,
+            signalDate: date,
             price,
             atrPercent,
           });
@@ -620,143 +829,13 @@ function runPortfolioSimulation(
       }
     }
 
-    // --- EXECUTION pass: SELLs before BUYs, sequential real cash/position re-check per order ---
-    const orderedStaged = [
-      ...staged.filter((s) => s.action === "SELL"),
-      ...staged.filter((s) => s.action === "BUY"),
-    ];
-
-    for (const item of orderedStaged) {
-      const state = stateByTicker.get(item.ticker)!;
-      const currentPositions = tickers
-        .filter((t) => stateByTicker.get(t)!.shares > 0)
-        .map((t) => {
-          const s = stateByTicker.get(t)!;
-          const p = pricesToday.get(t) ?? s.averageEntryPrice;
-          return { ticker: t, shares: s.shares, marketValue: s.shares * p };
-        });
-      const currentEquityNow =
-        cash + currentPositions.reduce((sum, p) => sum + p.marketValue, 0);
-      const dailyDrawdownNow =
-        previousDayEquity > 0
-          ? (currentEquityNow - previousDayEquity) / previousDayEquity
-          : 0;
-
-      const accountState: AccountState = {
-        equity: currentEquityNow,
-        cash,
-        dailyDrawdownPercent: dailyDrawdownNow,
-        currentPositions,
-      };
-
-      const executionPrice =
-        item.action === "BUY"
-          ? Number((item.price * (1 + SLIPPAGE_PERCENT)).toFixed(4))
-          : Number((item.price * (1 - SLIPPAGE_PERCENT)).toFixed(4));
-
-      const riskResult = evaluateTrade(
-        {
-          ticker: item.ticker,
-          action: item.action,
-          requestedShares: item.shares,
-          estimatedPrice: executionPrice,
-        },
-        accountState,
-        riskProfile,
-      );
-
-      if (!riskResult.approved) {
-        executionTimeRejectionCount += 1;
-        if (item.action === "BUY") {
-          const bucketId = TICKER_TO_BUCKET[item.ticker.toUpperCase()];
-          blockedSignals.push({
-            date,
-            ticker: item.ticker,
-            action: "BUY",
-            blockReason: "execution_time",
-            bucket: bucketId,
-            currentBucketExposure: 0,
-            price: item.price,
-          });
-        }
-        continue;
-      }
-
-      const finalShares = riskResult.adjustedShares;
-      if (finalShares < item.shares) executionTimeReductionCount += 1;
-      if (finalShares <= 0) continue;
-
-      if (item.action === "BUY") {
-        const cost = executionPrice * finalShares + COMMISSION_PER_TRADE;
-        const previousPositionCost = state.averageEntryPrice * state.shares;
-        const previousAtrWeight = state.entryAtrPercent * previousPositionCost;
-        const newBuyCost = executionPrice * finalShares;
-
-        cash -= cost;
-        state.shares += finalShares;
-        state.averageEntryPrice =
-          state.shares > 0
-            ? (previousPositionCost + newBuyCost) / state.shares
-            : 0;
-        state.entryAtrPercent =
-          state.shares > 0
-            ? (previousAtrWeight + item.atrPercent * newBuyCost) /
-              (previousPositionCost + newBuyCost)
-            : 0;
-        state.lastBuyOwnIndex = indexByTickerByDate
-          .get(item.ticker)!
-          .get(date)!;
-
-        perTicker.get(item.ticker)!.trades += 1;
-        trades.push({
-          date,
-          ticker: item.ticker,
-          action: "BUY",
-          shares: finalShares,
-          price: executionPrice,
-          notional: newBuyCost,
-          reasonType: item.reasonType,
-          equityAfter: computeEquity(pricesToday),
-          cashAfter: cash,
-        });
-      } else {
-        const sharesToSell = Math.min(finalShares, state.shares);
-        const revenue = executionPrice * sharesToSell - COMMISSION_PER_TRADE;
-        const realizedPnl =
-          (executionPrice - state.averageEntryPrice) * sharesToSell -
-          COMMISSION_PER_TRADE;
-
-        cash += revenue;
-        state.shares -= sharesToSell;
-        perTicker.get(item.ticker)!.realizedPnl += realizedPnl;
-        perTicker.get(item.ticker)!.trades += 1;
-
-        if (state.shares === 0) {
-          state.averageEntryPrice = 0;
-          state.entryAtrPercent = 0;
-        }
-        if (item.reasonType === "STOP_LOSS") {
-          state.lastStopLossOwnIndex = indexByTickerByDate
-            .get(item.ticker)!
-            .get(date)!;
-        }
-
-        trades.push({
-          date,
-          ticker: item.ticker,
-          action: "SELL",
-          shares: sharesToSell,
-          price: executionPrice,
-          notional: sharesToSell * executionPrice,
-          reasonType: item.reasonType,
-          equityAfter: computeEquity(pricesToday),
-          cashAfter: cash,
-          realizedPnl,
-        });
-      }
+    if (executionModel === "close_to_close") {
+      executeStagedOrders(staged, date, "close");
+    } else {
+      pendingOrders = staged;
     }
 
-    const postTradeEquity = computeEquity(pricesToday);
+    const postTradeEquity = computeEquity(closePricesToday);
     if (postTradeEquity > runningPeakForDrawdown) {
       runningPeakForDrawdown = postTradeEquity;
     }
@@ -781,6 +860,21 @@ function runPortfolioSimulation(
     previousDayEquity = postTradeEquity;
     finalEquity = postTradeEquity;
   }
+
+  // Whatever's left in pendingOrders after the loop exits never got a
+  // following day to execute on (next_open only - close_to_close never
+  // populates this). Logged, not silently dropped - a stranded SELL
+  // (e.g. an unexecuted STOP_LOSS) changes finalShares/realizedPnl purely
+  // from window-edge timing and matters more than a stranded BUY.
+  const unexecutedPendingOrders: UnexecutedPendingOrder[] = pendingOrders.map(
+    (o) => ({
+      ticker: o.ticker,
+      action: o.action,
+      shares: o.shares,
+      reasonType: o.reasonType,
+      signalDate: o.signalDate,
+    }),
+  );
 
   for (const ticker of tickers) {
     perTicker.get(ticker)!.finalShares = stateByTicker.get(ticker)!.shares;
@@ -812,6 +906,7 @@ function runPortfolioSimulation(
     perTicker,
     equityCurve,
     blockedSignals,
+    unexecutedPendingOrders,
   };
 }
 
@@ -835,7 +930,10 @@ function forwardReturn(
   return ((futurePrice - startPrice) / startPrice) * 100;
 }
 
-// --- Equal-weighted buy & hold benchmark, anchored to the sim's own start date ---
+// --- Equal-weighted buy & hold benchmark, anchored to the sim's own start
+// date. Always close-to-close-anchored regardless of which execution
+// model's report this is printed alongside - buy-and-hold has no
+// signal-to-execution lag concept. ---
 
 function computeEqualWeightBuyAndHold(
   barsByTicker: Map<string, AlpacaBar[]>,
@@ -935,7 +1033,9 @@ function computeEqualWeightBuyAndHoldCurve(
 // no shared cash pool) - a stripped-down local reimplementation rather
 // than importing backtest-sweep.ts, which runs its own main()/network
 // fetch as a side effect of being imported and isn't safe to pull in as a
-// library. ---
+// library. Always close-to-close, unconditionally - its entire purpose is
+// "what would the old script's methodology have said," so it doesn't get
+// a next_open variant. ---
 
 function simulateIndependent(bars: AlpacaBar[]): number {
   let cash = STARTING_CAPITAL;
@@ -1010,7 +1110,33 @@ function pad(value: string, width: number): string {
   return value.padStart(width);
 }
 
-// --- Report/CSV generation (variant D only) ---
+function printAblationTable(
+  title: string,
+  resultsByVariant: { variant: SimVariantConfig; result: PortfolioSimResult }[],
+) {
+  console.log(title);
+  console.log(
+    "variant".padEnd(56) +
+      pad("return%", 10) +
+      pad("maxDD%", 10) +
+      pad("trades", 9) +
+      pad("exposure%", 11) +
+      pad("0-share buys", 14),
+  );
+  for (const { variant, result } of resultsByVariant) {
+    console.log(
+      variant.label.padEnd(56) +
+        pad(result.totalPnlPercent.toFixed(2), 10) +
+        pad(result.maxDrawdownPercent.toFixed(2), 10) +
+        pad(String(result.totalTrades), 9) +
+        pad(result.avgExposurePercent.toFixed(1), 11) +
+        pad(String(result.blockedBuyCount), 14),
+    );
+  }
+  console.log("");
+}
+
+// --- Report/CSV generation (variant D only, per execution model) ---
 
 function csvEscape(value: string | number): string {
   const str = String(value);
@@ -1019,6 +1145,24 @@ function csvEscape(value: string | number): string {
 
 function toCsv(rows: (string | number)[][]): string {
   return rows.map((row) => row.map(csvEscape).join(",")).join("\n") + "\n";
+}
+
+function executionModelReportText(executionModel: ExecutionModel): string {
+  if (executionModel === "close_to_close") {
+    return `Execution model: CLOSE_TO_CLOSE
+
+Signal on close[t], executed at close[t] with slippage - a same-bar assumption. This matches backtest.ts/backtest-sweep.ts's existing convention in this repo. This script also runs a NEXT_OPEN companion model in the same invocation (see the next_open/ report) specifically to check whether this assumption is inflating the numbers below.
+
+**Because of this, none of the return numbers below should be read as a realistic live return forecast** - they're only valid for comparing variants against each other (and against the next_open companion run), since every close_to_close variant shares the identical execution-timing assumption.`;
+  }
+
+  return `Execution model: NEXT_OPEN
+
+Signals are generated using close[d] data and staged for execution at open[d+1]. Execution price, cash availability, and daily kill switch are evaluated at open[d+1].
+
+Bucket cap and portfolio circuit breaker are evaluated at signal time, not rechecked at execution time. This intentionally isolates the execution-price change from additional risk-policy changes. A future research variant may add execution-time revalidation for pending BUY orders.
+
+No intraday bracket fills are modeled - STOP_LOSS/TAKE_PROFIT decisions only ever compare close[d] to average entry price (same as close_to_close), they simply execute a day later at open[d+1] like every other order.`;
 }
 
 async function writeReportsForFullSystem(
@@ -1030,8 +1174,10 @@ async function writeReportsForFullSystem(
   buyAndHoldPercent: number,
   spyBuyAndHoldPercent: number | null,
   buyAndHoldCurve: Map<string, number>,
+  executionModel: ExecutionModel,
 ) {
-  await fs.mkdir(REPORT_DIR, { recursive: true });
+  const reportDir = path.join(REPORT_DIR, executionModel);
+  await fs.mkdir(reportDir, { recursive: true });
 
   const configHash = createStrategyConfigHash(DEFAULT_STRATEGY_CONFIG);
 
@@ -1043,7 +1189,7 @@ Generated: ${new Date().toISOString()}
 - Window: ${result.totalSimDays} simulated days (${commonDates[simStartIndex]} to ${commonDates[commonDates.length - 1]})
 - Tickers: ${TICKERS.length} (${TICKERS.join(", ")})
 - Starting capital: $${STARTING_CAPITAL} (shared, not per-ticker)
-- Execution model: signal on close[t], executed at close[t] with slippage - a same-bar assumption, not open[t+1]. This matches backtest.ts/backtest-sweep.ts's existing convention in this repo, it is not unique to this script. A structural fix (execute at open[t+1]) would need to touch all three backtest scripts and would shift every historical number already referenced in CLAUDE.md/GOLIVE_CRITERIA.md - tracked as a separate follow-up, not done here. **Because of this, none of the return numbers below should be read as a realistic live return forecast** - they're only valid for comparing variants against each other, since every variant shares the identical close-to-close assumption and its bias should apply roughly equally to all of them.
+- ${executionModelReportText(executionModel)}
 - Slippage: ${(SLIPPAGE_PERCENT * 100).toFixed(2)}%
 - Fractional/notional shares: off - not supported by this script (whole shares only, same as backtest.ts/backtest-sweep.ts)
 - Strategy config hash: ${configHash}
@@ -1058,8 +1204,15 @@ Generated: ${new Date().toISOString()}
 - Circuit breaker trips: ${result.circuitBreakerTrippedAt ? `1 (on ${result.circuitBreakerTrippedAt}, stayed tripped ${result.daysTrippedCount}/${result.totalSimDays} days - sticky, no auto-recovery modeled)` : 0}
 - Daily kill switch / execution-time rejections: ${result.executionTimeRejectionCount}
 - Execution-time reductions (same-day cash/position competition): ${result.executionTimeReductionCount}
+- Orders staged on the last simulated day with no following day to execute on (window-edge effect, not a strategy signal): ${result.unexecutedPendingOrders.length}${
+    result.unexecutedPendingOrders.length > 0
+      ? `\n${result.unexecutedPendingOrders.map((o) => `  - ${o.signalDate}: ${o.action} ${o.shares} ${o.ticker} (${o.reasonType})`).join("\n")}`
+      : ""
+  }
 
 ## Benchmarks
+(Always close-to-close-anchored, regardless of which execution model this report is for - buy-and-hold
+and the independent-per-ticker baseline have no signal-to-execution lag concept.)
 - Equal-weighted buy & hold (all ${TICKERS.length} tickers): ${buyAndHoldPercent.toFixed(2)}%
 - SPY buy & hold: ${spyBuyAndHoldPercent !== null ? `${spyBuyAndHoldPercent.toFixed(2)}%` : "n/a (SPY not in ticker list)"}
 
@@ -1068,11 +1221,11 @@ Generated: ${new Date().toISOString()}
   trades and a higher return than bucket-cap-only (B) or +circuit-breaker (C), because the sell-fraction
   throttle changes exit dynamics (partial exits instead of one full exit let this window's winners keep
   running). This is an observed result in this specific window, not a validated edge.
-- See "Execution model" above: these return numbers are for comparing variants against each other, not
+- These return numbers are for comparing variants (and the two execution models) against each other, not
   for forecasting live returns.
 `;
 
-  await fs.writeFile(path.join(REPORT_DIR, "portfolio-backtest-report.md"), reportMd, "utf-8");
+  await fs.writeFile(path.join(reportDir, "portfolio-backtest-report.md"), reportMd, "utf-8");
 
   const blockedRows: (string | number)[][] = [
     [
@@ -1103,28 +1256,42 @@ Generated: ${new Date().toISOString()}
     ]);
   }
   await fs.writeFile(
-    path.join(REPORT_DIR, "blocked-signals.csv"),
+    path.join(reportDir, "blocked-signals.csv"),
     toCsv(blockedRows),
     "utf-8",
   );
 
   const tradeRows: (string | number)[][] = [
-    ["date", "ticker", "side", "shares", "price", "notional", "reason", "equity_after", "cash_after"],
+    [
+      "date",
+      "signal_date",
+      "ticker",
+      "side",
+      "shares",
+      "price",
+      "signal_price",
+      "notional",
+      "reason",
+      "equity_after",
+      "cash_after",
+    ],
   ];
   for (const trade of result.trades) {
     tradeRows.push([
       trade.date,
+      trade.signalDate,
       trade.ticker,
       trade.action,
       trade.shares,
       trade.price.toFixed(4),
+      trade.signalPrice.toFixed(4),
       trade.notional.toFixed(2),
       trade.reasonType,
       trade.equityAfter.toFixed(2),
       trade.cashAfter.toFixed(2),
     ]);
   }
-  await fs.writeFile(path.join(REPORT_DIR, "trades.csv"), toCsv(tradeRows), "utf-8");
+  await fs.writeFile(path.join(reportDir, "trades.csv"), toCsv(tradeRows), "utf-8");
 
   const equityRows: (string | number)[][] = [
     ["date", "equity", "cash", "exposure", "drawdown", "buy_and_hold_equity"],
@@ -1139,9 +1306,9 @@ Generated: ${new Date().toISOString()}
       (buyAndHoldCurve.get(point.date) ?? 0).toFixed(2),
     ]);
   }
-  await fs.writeFile(path.join(REPORT_DIR, "equity-curve.csv"), toCsv(equityRows), "utf-8");
+  await fs.writeFile(path.join(reportDir, "equity-curve.csv"), toCsv(equityRows), "utf-8");
 
-  console.log(`Reports written to ${REPORT_DIR}`);
+  console.log(`Reports written to ${reportDir}`);
 }
 
 async function main() {
@@ -1180,56 +1347,48 @@ async function main() {
   );
   console.log("");
 
-  console.log("=== Variant ablation (isolating each safety layer's effect) ===");
-  console.log(
-    "variant".padEnd(56) +
-      pad("return%", 10) +
-      pad("maxDD%", 10) +
-      pad("trades", 9) +
-      pad("exposure%", 11) +
-      pad("0-share buys", 14),
-  );
+  const executionModels: ExecutionModel[] = ["close_to_close", "next_open"];
+  const resultsByModel = new Map<
+    ExecutionModel,
+    { variant: SimVariantConfig; result: PortfolioSimResult }[]
+  >();
 
-  let fullSystemResult: PortfolioSimResult | null = null;
-
-  for (const variant of VARIANTS) {
-    const result = runPortfolioSimulation(
-      barsByTicker,
-      TICKERS,
-      commonDates,
-      indexByTickerByDate,
-      simStartIndex,
+  for (const executionModel of executionModels) {
+    const resultsByVariant = VARIANTS.map((variant) => ({
       variant,
-    );
+      result: runPortfolioSimulation(
+        barsByTicker,
+        TICKERS,
+        commonDates,
+        indexByTickerByDate,
+        simStartIndex,
+        variant,
+        executionModel,
+      ),
+    }));
+    resultsByModel.set(executionModel, resultsByVariant);
 
-    console.log(
-      variant.label.padEnd(56) +
-        pad(result.totalPnlPercent.toFixed(2), 10) +
-        pad(result.maxDrawdownPercent.toFixed(2), 10) +
-        pad(String(result.totalTrades), 9) +
-        pad(result.avgExposurePercent.toFixed(1), 11) +
-        pad(String(result.blockedBuyCount), 14),
+    printAblationTable(
+      `=== Variant ablation - ${executionModel.toUpperCase()} ===`,
+      resultsByVariant,
     );
-
-    if (variant.useBucketCap && variant.useCircuitBreaker && variant.useDailyKillAndSellThrottle) {
-      fullSystemResult = result;
-    }
   }
+
   console.log(
     '"0-share buys" = BUY signals that executed literally 0 shares, for any reason (bucket cap, circuit',
   );
   console.log(
-    "breaker, or execution-time rejection). Not the same as \"reduced by bucket cap\" below, which also",
+    "breaker, or execution-time rejection). Not the same as \"reduced by bucket cap\" in the full report,",
   );
   console.log(
-    "counts requests that were shrunk but still executed with a positive share count.",
+    "which also counts requests that were shrunk but still executed with a positive share count.",
   );
   console.log("");
   console.log(
-    "Caveat: D isn't the most conservative variant here - it has more trades and a higher return than",
+    "Caveat: full-system (D) isn't the most conservative variant - it has more trades and a higher return",
   );
   console.log(
-    "B/C because the sell-fraction throttle changes exit dynamics (partial exits instead of one full",
+    "than B/C because the sell-fraction throttle changes exit dynamics (partial exits instead of one full",
   );
   console.log(
     "exit let this window's winners keep running). That's an observed result in this specific window,",
@@ -1237,7 +1396,21 @@ async function main() {
   console.log("not yet a validated edge - see CLAUDE.md.");
   console.log("");
 
-  const result = fullSystemResult!;
+  const closeToCloseD = resultsByModel
+    .get("close_to_close")!
+    .find((r) => r.variant.useDailyKillAndSellThrottle)!.result;
+  const nextOpenD = resultsByModel
+    .get("next_open")!
+    .find((r) => r.variant.useDailyKillAndSellThrottle)!.result;
+
+  console.log("=== Execution drag (variant D, full system) ===");
+  console.log(
+    `Close-to-close return: ${closeToCloseD.totalPnlPercent.toFixed(2)}%  |  Next-open return: ${nextOpenD.totalPnlPercent.toFixed(2)}%  |  Drag: ${(closeToCloseD.totalPnlPercent - nextOpenD.totalPnlPercent).toFixed(2)} pts`,
+  );
+  console.log(
+    `Close-to-close max drawdown: ${closeToCloseD.maxDrawdownPercent.toFixed(2)}%  |  Next-open max drawdown: ${nextOpenD.maxDrawdownPercent.toFixed(2)}%`,
+  );
+  console.log("");
 
   const buyAndHoldPercent = computeEqualWeightBuyAndHold(
     barsByTicker,
@@ -1263,26 +1436,7 @@ async function main() {
   const independentAveragePercent =
     independentAverages.reduce((sum, v) => sum + v, 0) / independentAverages.length;
 
-  console.log("=== Full-system result (variant D - matches live) ===");
-  console.log(`Total return: ${result.totalPnlPercent.toFixed(2)}%`);
-  console.log(`Max drawdown: ${result.maxDrawdownPercent.toFixed(2)}%`);
-  console.log(`Average exposure: ${result.avgExposurePercent.toFixed(1)}%`);
-  console.log(
-    `Circuit breaker: ${
-      result.circuitBreakerTrippedAt
-        ? `tripped on ${result.circuitBreakerTrippedAt}, stayed tripped for ${result.daysTrippedCount}/${result.totalSimDays} days (${((result.daysTrippedCount / result.totalSimDays) * 100).toFixed(1)}%) - sticky, no auto-recovery modeled, matching live`
-        : "never tripped"
-    }`,
-  );
-  console.log(`BUYs blocked by tripped circuit breaker: ${result.circuitBreakerBlockedBuyCount}`);
-  console.log(
-    `BUYs reduced by bucket cap: ${result.bucketCapReductionCount} (partial or full reduction; of these, ${result.bucketCapFullyBlockedCount} were cut all the way to 0 shares)`,
-  );
-  console.log(`Orders reduced at execution time (same-day cash/position competition): ${result.executionTimeReductionCount}`);
-  console.log(`Orders rejected at execution time (daily -5% kill switch or no cash left): ${result.executionTimeRejectionCount}`);
-  console.log("");
-
-  console.log("=== Benchmarks ===");
+  console.log("=== Benchmarks (always close-to-close-anchored) ===");
   console.log(`Equal-weighted buy & hold (all ${TICKERS.length} tickers, $${(STARTING_CAPITAL / TICKERS.length).toFixed(0)} each): ${buyAndHoldPercent.toFixed(2)}%`);
   if (spyBuyAndHoldPercent !== null) {
     console.log(`SPY buy & hold: ${spyBuyAndHoldPercent.toFixed(2)}%`);
@@ -1290,44 +1444,45 @@ async function main() {
   console.log(
     `Independent per-ticker average (backtest-sweep.ts-style, $${STARTING_CAPITAL} EACH, no portfolio caps): ${independentAveragePercent.toFixed(2)}%`,
   );
-  console.log(
-    "  Note: this compares average %% return, not dollar totals. Some of the gap vs. the portfolio result",
-  );
-  console.log(
-    "  above is whole-share rounding being worse at 1/13th the capital, not purely caps/competition.",
-  );
   console.log("");
 
-  console.log("=== Per-ticker breakdown (full system) ===");
-  console.log(
-    "ticker".padEnd(8) +
-      pad("trades", 8) +
-      pad("final shares", 14) +
-      pad("realized PnL", 14) +
-      pad("independent %", 16),
-  );
-  TICKERS.forEach((ticker, i) => {
-    const summary = result.perTicker.get(ticker)!;
+  for (const executionModel of executionModels) {
+    const result = resultsByModel
+      .get(executionModel)!
+      .find((r) => r.variant.useDailyKillAndSellThrottle)!.result;
+
+    console.log(`=== Full-system per-ticker breakdown - ${executionModel.toUpperCase()} ===`);
     console.log(
-      ticker.padEnd(8) +
-        pad(String(summary.trades), 8) +
-        pad(String(summary.finalShares), 14) +
-        pad(summary.realizedPnl.toFixed(2), 14) +
-        pad(independentAverages[i]!.toFixed(2), 16),
+      "ticker".padEnd(8) +
+        pad("trades", 8) +
+        pad("final shares", 14) +
+        pad("realized PnL", 14) +
+        pad("independent %", 16),
     );
-  });
-  console.log("");
+    TICKERS.forEach((ticker, i) => {
+      const summary = result.perTicker.get(ticker)!;
+      console.log(
+        ticker.padEnd(8) +
+          pad(String(summary.trades), 8) +
+          pad(String(summary.finalShares), 14) +
+          pad(summary.realizedPnl.toFixed(2), 14) +
+          pad(independentAverages[i]!.toFixed(2), 16),
+      );
+    });
+    console.log("");
 
-  await writeReportsForFullSystem(
-    result,
-    barsByTicker,
-    indexByTickerByDate,
-    commonDates,
-    simStartIndex,
-    buyAndHoldPercent,
-    spyBuyAndHoldPercent,
-    buyAndHoldCurve,
-  );
+    await writeReportsForFullSystem(
+      result,
+      barsByTicker,
+      indexByTickerByDate,
+      commonDates,
+      simStartIndex,
+      buyAndHoldPercent,
+      spyBuyAndHoldPercent,
+      buyAndHoldCurve,
+      executionModel,
+    );
+  }
 }
 
 main().catch((error: unknown) => {
