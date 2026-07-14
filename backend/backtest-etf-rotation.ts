@@ -1,5 +1,6 @@
 import { promises as fs } from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 
 import {
@@ -603,7 +604,17 @@ async function main() {
   await writeReport(analysis, "next_open", configLabel, validationStatus);
 }
 
-main().catch((error: unknown) => {
-  console.error(error);
-  process.exit(1);
-});
+// Only auto-run main() when this file is the actual entry point, not just
+// imported for runEtfRotationWindowAnalysis - without this guard, every
+// script that imports from here (multiwindow, holdcount-sweep, out-of-sample)
+// silently also re-ran this file's own main() on import: an extra Current-
+// window fetch/simulation/report-write on every single run of those other
+// scripts, and confusing interleaved console output. Same fix applied to
+// backtest-portfolio.ts, which has the identical pattern.
+const isMainModule = process.argv[1] === fileURLToPath(import.meta.url);
+if (isMainModule) {
+  main().catch((error: unknown) => {
+    console.error(error);
+    process.exit(1);
+  });
+}
