@@ -4,6 +4,7 @@ import {
   applyStickyTrip,
   evaluatePortfolioDrawdown,
   findPeakSinceTracking,
+  shouldSendDailyReminder,
 } from "./portfolioCircuitBreaker.js";
 
 describe("applyStickyTrip", () => {
@@ -128,5 +129,30 @@ describe("findPeakSinceTracking", () => {
     const result = findPeakSinceTracking(history, 10000, now, cachedPeak);
 
     expect(result.peakEquity).toBe(11000);
+  });
+});
+
+describe("shouldSendDailyReminder", () => {
+  it("sends when tripped and no reminder has ever been sent", () => {
+    expect(shouldSendDailyReminder(true, null, "2026-07-14")).toBe(true);
+  });
+
+  it("sends when tripped and the last reminder was a different calendar day", () => {
+    expect(shouldSendDailyReminder(true, "2026-07-13", "2026-07-14")).toBe(
+      true,
+    );
+  });
+
+  it("does not send again on the same calendar day", () => {
+    expect(shouldSendDailyReminder(true, "2026-07-14", "2026-07-14")).toBe(
+      false,
+    );
+  });
+
+  it("never sends when not tripped, regardless of last-sent date", () => {
+    expect(shouldSendDailyReminder(false, null, "2026-07-14")).toBe(false);
+    expect(shouldSendDailyReminder(false, "2026-07-13", "2026-07-14")).toBe(
+      false,
+    );
   });
 });
