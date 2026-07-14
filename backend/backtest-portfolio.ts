@@ -26,6 +26,7 @@ import {
 } from "./portfolioCircuitBreaker.js";
 import { evaluateTrade, type AccountState, type RiskProfile } from "./riskManager.js";
 import { createStrategyConfigHash } from "./decisionJournal.js";
+import { buildBenchmarkMetrics, buildScorecardMetrics, formatScorecardMarkdown } from "./scorecard.js";
 
 dotenv.config();
 
@@ -1294,6 +1295,32 @@ and the independent-per-ticker baseline have no signal-to-execution lag concept.
 - Equal-weighted buy & hold (all ${TICKERS.length} tickers): ${buyAndHoldPercent.toFixed(2)}%
 - SPY buy & hold: ${spyBuyAndHoldPercent !== null ? `${spyBuyAndHoldPercent.toFixed(2)}%` : "n/a (SPY not in ticker list)"}
 
+${formatScorecardMarkdown(
+    `Full system (${executionModel})`,
+    buildScorecardMetrics({
+      totalReturnPercent: result.totalPnlPercent,
+      maxDrawdownPercent: result.maxDrawdownPercent,
+      avgExposurePercent: result.avgExposurePercent,
+      totalTrades: result.totalTrades,
+      simDays: result.totalSimDays,
+    }),
+    [
+      buildBenchmarkMetrics(
+        "Equal-weight buy & hold",
+        buyAndHoldPercent,
+        result.totalSimDays,
+      ),
+      ...(spyBuyAndHoldPercent !== null
+        ? [
+            buildBenchmarkMetrics(
+              "SPY buy & hold",
+              spyBuyAndHoldPercent,
+              result.totalSimDays,
+            ),
+          ]
+        : []),
+    ],
+  )}
 ## Caveats
 - The full-system variant (D) is not the most conservative variant in the ablation table - it has more
   trades and a higher return than bucket-cap-only (B) or +circuit-breaker (C), because the sell-fraction
