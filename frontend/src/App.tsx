@@ -13,6 +13,8 @@ import { StrategyComparisonPanel } from "./components/StrategyComparisonPanel";
 import { StrategyConfigPanel } from "./components/StrategyConfigPanel";
 import { StrategyQualityPanel } from "./components/StrategyQualityPanel";
 import { SystemHealthBanner } from "./components/SystemHealthBanner";
+import { CircuitBreakerBanner } from "./components/CircuitBreakerBanner";
+import { CircuitBreakerReviewPanel } from "./components/CircuitBreakerReviewPanel";
 import { TickerChartPanel } from "./components/TickerChartPanel";
 import type {
   AutopilotRunResponse,
@@ -38,6 +40,7 @@ import { useDashboardData } from "./hooks/useDashboardData";
 import { useAutopilotStream } from "./hooks/useAutopilotStream";
 import { useChatTerminal } from "./hooks/useChatTerminal";
 import { useManualOrder } from "./hooks/useManualOrder";
+import { useCircuitBreakerReview } from "./hooks/useCircuitBreakerReview";
 import { API_BASE_URL } from "./api/client";
 
 const EMPTY_AUTOPILOT_STATUS: AutopilotStatus = {
@@ -152,6 +155,12 @@ export default function App() {
       console.warn("Autopilot status refresh failed:", error);
     }
   }, []);
+
+  const circuitBreakerReview = useCircuitBreakerReview(
+    fetchWithAdminSession,
+    refreshDashboard,
+    refreshAutopilotStatus,
+  );
 
   useAutopilotStream({
     addAutopilotLog,
@@ -343,6 +352,19 @@ export default function App() {
       </header>
 
       <SystemHealthBanner health={dashboardHealth} />
+
+      <CircuitBreakerBanner
+        circuitBreaker={autopilotStatus.circuitBreaker}
+        thresholdPercent={autopilotStatus.circuitBreakerMaxDrawdownFromPeakPercent * 100}
+        onReviewClick={circuitBreakerReview.openReview}
+      />
+
+      {circuitBreakerReview.isReviewOpen && (
+        <CircuitBreakerReviewPanel
+          reviewState={circuitBreakerReview}
+          onClose={circuitBreakerReview.closeReview}
+        />
+      )}
 
       <main className="flex-1 grid grid-cols-1 xl:grid-cols-12 p-6 gap-6">
         <section className="xl:col-span-3 flex flex-col gap-6">
