@@ -12,17 +12,38 @@
 // pure/adapter split already used by applyStickyTrip (portfolioCircuitBreaker.ts).
 
 const DAYS_PER_YEAR = 365;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 /**
- * Annualizes a total return over simDays into a CAGR percent.
- * (1 + totalReturnPercent/100) ^ (365/simDays) - 1, as a percent.
+ * Calendar days between two "YYYY-MM-DD" date strings, inclusive of both
+ * endpoints. CAGR must be annualized over calendar time, not trading-bar
+ * count - `commonDates` in backtest-portfolio.ts comes from Alpaca daily
+ * bars, which only exist for trading sessions (no weekends/holidays), so a
+ * trading-day count understates the true elapsed time by roughly 365/252
+ * (~1.45x). Using it directly as the CAGR exponent's denominator
+ * overstates the annualized return's magnitude - confirmed on a real run
+ * (see CLAUDE.md's scorecard bullet for the exact numbers).
+ */
+export function calendarDaysInclusive(startDate: string, endDate: string): number {
+  const start = Date.parse(`${startDate}T00:00:00Z`);
+  const end = Date.parse(`${endDate}T00:00:00Z`);
+
+  return Math.floor((end - start) / MS_PER_DAY) + 1;
+}
+
+/**
+ * Annualizes a total return over annualizationDays (calendar days, not
+ * trading days - see calendarDaysInclusive) into a CAGR percent.
+ * (1 + totalReturnPercent/100) ^ (365/annualizationDays) - 1, as a percent.
  */
 export function computeCagrPercent(
   totalReturnPercent: number,
-  simDays: number,
+  annualizationDays: number,
 ): number {
-  if (simDays <= 0) {
-    throw new Error(`computeCagrPercent: simDays must be > 0, got ${simDays}`);
+  if (annualizationDays <= 0) {
+    throw new Error(
+      `computeCagrPercent: annualizationDays must be > 0, got ${annualizationDays}`,
+    );
   }
 
   const growthFactor = 1 + totalReturnPercent / 100;
@@ -34,7 +55,7 @@ export function computeCagrPercent(
     return -100;
   }
 
-  const annualizedGrowth = Math.pow(growthFactor, DAYS_PER_YEAR / simDays);
+  const annualizedGrowth = Math.pow(growthFactor, DAYS_PER_YEAR / annualizationDays);
 
   return (annualizedGrowth - 1) * 100;
 }
@@ -61,13 +82,17 @@ export interface ScorecardMetrics {
   calmarRatio: number | null;
   avgExposurePercent: number;
   totalTrades: number;
-  simDays: number;
+  /** Count of trading-session bars simulated - a decision-cycle count, not a time span. */
+  simTradingDays: number;
+  /** Calendar days between the window's start and end date - what CAGR is actually annualized over. */
+  annualizationDays: number;
 }
 
 export interface BenchmarkMetrics {
   label: string;
   totalReturnPercent: number;
   cagrPercent: number;
+  annualizationDays: number;
 }
 
 export function buildScorecardMetrics(input: {
@@ -75,11 +100,12 @@ export function buildScorecardMetrics(input: {
   maxDrawdownPercent: number;
   avgExposurePercent: number;
   totalTrades: number;
-  simDays: number;
+  simTradingDays: number;
+  annualizationDays: number;
 }): ScorecardMetrics {
   const cagrPercent = computeCagrPercent(
     input.totalReturnPercent,
-    input.simDays,
+    input.annualizationDays,
   );
 
   return {
@@ -89,19 +115,21 @@ export function buildScorecardMetrics(input: {
     calmarRatio: computeCalmarRatio(cagrPercent, input.maxDrawdownPercent),
     avgExposurePercent: input.avgExposurePercent,
     totalTrades: input.totalTrades,
-    simDays: input.simDays,
+    simTradingDays: input.simTradingDays,
+    annualizationDays: input.annualizationDays,
   };
 }
 
 export function buildBenchmarkMetrics(
   label: string,
   totalReturnPercent: number,
-  simDays: number,
+  annualizationDays: number,
 ): BenchmarkMetrics {
   return {
     label,
     totalReturnPercent,
-    cagrPercent: computeCagrPercent(totalReturnPercent, simDays),
+    cagrPercent: computeCagrPercent(totalReturnPercent, annualizationDays),
+    annualizationDays,
   };
 }
 
@@ -113,10 +141,12 @@ function calmarText(calmarRatio: number | null): string {
   return calmarRatio === null ? "n/a" : calmarRatio.toFixed(2);
 }
 
-// Below this, annualizing a short-window return produces a CAGR that's
-// mathematically correct but not a meaningful expectation (e.g. a 41-day
-// +4% return annualizes to +40%+) - observed for real on a short single-
-// window run during development of this module, not a hypothetical.
+// Below this, annualizing a short calendar window's return produces a CAGR
+// that's mathematically correct but not a meaningful expectation (e.g. a
+// 41-trading-day run's +4% return annualizes to +40%+) - observed for real
+// on a short single-window run during development of this module, not a
+// hypothetical. Checked against calendar days, not trading-bar count - a
+// "short window" is short in elapsed time, not decision-cycle count.
 const SHORT_WINDOW_DAYS_THRESHOLD = 180;
 
 export function formatScorecardMarkdown(
@@ -133,13 +163,13 @@ export function formatScorecardMarkdown(
   ];
 
   const shortWindowCaveat =
-    strategy.simDays < SHORT_WINDOW_DAYS_THRESHOLD
-      ? `\n**Window is only ${strategy.simDays} days** - CAGR annualizes the observed return, so the shorter the window, the more extreme (and less meaningful as a forecast) the annualized number becomes. Treat CAGR here as directionally informative only, not a return estimate. Prefer a multi-window run (\`backtest-portfolio-multiwindow.ts\`) with longer windows for anything that informs a real decision.\n`
+    strategy.annualizationDays < SHORT_WINDOW_DAYS_THRESHOLD
+      ? `\n**Window is only ${strategy.annualizationDays} calendar days** - CAGR annualizes the observed return, so the shorter the window, the more extreme (and less meaningful as a forecast) the annualized number becomes. Treat CAGR here as directionally informative only, not a return estimate. Prefer a multi-window run (\`backtest-portfolio-multiwindow.ts\`) with longer windows for anything that informs a real decision.\n`
       : "";
 
   return `## Scorecard
 
-Over ${strategy.simDays} simulated days. Benchmarks have no drawdown-managed exit or exposure/trade concept, so those columns are n/a for them - they're included for CAGR comparison only.
+Over ${strategy.simTradingDays} trading days (${strategy.annualizationDays} calendar days). CAGR is annualized over calendar days, not trading-day count - see \`calendarDaysInclusive\` in \`scorecard.ts\`. Benchmarks have no drawdown-managed exit or exposure/trade concept, so those columns are n/a for them - they're included for CAGR comparison only.
 
 | Label | Total return | CAGR | Max drawdown | Calmar | Avg exposure | Trades |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -155,7 +185,8 @@ export const SCORECARD_CSV_HEADER: string[] = [
   "calmar_ratio",
   "avg_exposure_pct",
   "total_trades",
-  "sim_days",
+  "sim_trading_days",
+  "annualization_calendar_days",
 ];
 
 export function formatScorecardCsvRow(
@@ -170,14 +201,16 @@ export function formatScorecardCsvRow(
     metrics.calmarRatio === null ? "n/a" : metrics.calmarRatio.toFixed(2),
     metrics.avgExposurePercent.toFixed(1),
     String(metrics.totalTrades),
-    String(metrics.simDays),
+    String(metrics.simTradingDays),
+    String(metrics.annualizationDays),
   ];
 }
 
-// Matches SCORECARD_CSV_HEADER's 8 columns exactly (label, total_return_pct,
-// cagr_pct, max_drawdown_pct, calmar_ratio, avg_exposure_pct, total_trades,
-// sim_days) - a benchmark has no drawdown-managed exit or exposure/trade/
-// sim_days concept of its own, so those 5 columns are "n/a".
+// Matches SCORECARD_CSV_HEADER's 9 columns exactly - a benchmark has no
+// drawdown-managed exit, exposure, trade count, or trading-bar count of its
+// own, so those 5 columns (max_drawdown_pct, calmar_ratio, avg_exposure_pct,
+// total_trades, sim_trading_days) are "n/a"; annualization_calendar_days is
+// real (the same window as the strategy row), not "n/a".
 export function formatBenchmarkCsvRow(benchmark: BenchmarkMetrics): string[] {
   return [
     benchmark.label,
@@ -188,5 +221,6 @@ export function formatBenchmarkCsvRow(benchmark: BenchmarkMetrics): string[] {
     "n/a",
     "n/a",
     "n/a",
+    String(benchmark.annualizationDays),
   ];
 }

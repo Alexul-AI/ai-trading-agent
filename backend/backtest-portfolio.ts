@@ -26,7 +26,12 @@ import {
 } from "./portfolioCircuitBreaker.js";
 import { evaluateTrade, type AccountState, type RiskProfile } from "./riskManager.js";
 import { createStrategyConfigHash } from "./decisionJournal.js";
-import { buildBenchmarkMetrics, buildScorecardMetrics, formatScorecardMarkdown } from "./scorecard.js";
+import {
+  buildBenchmarkMetrics,
+  buildScorecardMetrics,
+  calendarDaysInclusive,
+  formatScorecardMarkdown,
+} from "./scorecard.js";
 
 dotenv.config();
 
@@ -1255,6 +1260,13 @@ async function writeReportsForFullSystem(
   await fs.mkdir(reportDir, { recursive: true });
 
   const configHash = createStrategyConfigHash(DEFAULT_STRATEGY_CONFIG);
+  // CAGR must annualize over calendar time, not the trading-bar count in
+  // commonDates (Alpaca daily bars only exist for trading sessions) - see
+  // scorecard.ts's calendarDaysInclusive doc comment for why this matters.
+  const annualizationDays = calendarDaysInclusive(
+    commonDates[simStartIndex]!,
+    commonDates[commonDates.length - 1]!,
+  );
 
   const reportMd = `# Portfolio backtest report
 
@@ -1302,20 +1314,21 @@ ${formatScorecardMarkdown(
       maxDrawdownPercent: result.maxDrawdownPercent,
       avgExposurePercent: result.avgExposurePercent,
       totalTrades: result.totalTrades,
-      simDays: result.totalSimDays,
+      simTradingDays: result.totalSimDays,
+      annualizationDays,
     }),
     [
       buildBenchmarkMetrics(
         "Equal-weight buy & hold",
         buyAndHoldPercent,
-        result.totalSimDays,
+        annualizationDays,
       ),
       ...(spyBuyAndHoldPercent !== null
         ? [
             buildBenchmarkMetrics(
               "SPY buy & hold",
               spyBuyAndHoldPercent,
-              result.totalSimDays,
+              annualizationDays,
             ),
           ]
         : []),

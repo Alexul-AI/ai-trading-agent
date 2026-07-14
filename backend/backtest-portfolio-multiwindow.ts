@@ -10,6 +10,7 @@ import {
 import {
   buildBenchmarkMetrics,
   buildScorecardMetrics,
+  calendarDaysInclusive,
   formatScorecardCsvRow,
   formatBenchmarkCsvRow,
   SCORECARD_CSV_HEADER,
@@ -175,25 +176,35 @@ async function main() {
       .get("next_open")!
       .find((r) => r.variant.useDailyKillAndSellThrottle)!.result;
 
+    // CAGR must annualize over calendar time (startDate to endDate), not
+    // analysis.simDays (a trading-bar count from Alpaca daily bars, which
+    // don't exist for weekends/holidays) - see scorecard.ts's
+    // calendarDaysInclusive doc comment.
+    const annualizationDays = calendarDaysInclusive(
+      analysis.startDate,
+      analysis.endDate,
+    );
+
     const metrics = buildScorecardMetrics({
       totalReturnPercent: nextOpenD.totalPnlPercent,
       maxDrawdownPercent: nextOpenD.maxDrawdownPercent,
       avgExposurePercent: nextOpenD.avgExposurePercent,
       totalTrades: nextOpenD.totalTrades,
-      simDays: analysis.simDays,
+      simTradingDays: analysis.simDays,
+      annualizationDays,
     });
     const spyBenchmark =
       analysis.spyBuyAndHoldPercent !== null
         ? buildBenchmarkMetrics(
             "SPY buy & hold",
             analysis.spyBuyAndHoldPercent,
-            analysis.simDays,
+            annualizationDays,
           )
         : null;
     const equalWeightBenchmark = buildBenchmarkMetrics(
       "Equal-weight buy & hold",
       analysis.buyAndHoldPercent,
-      analysis.simDays,
+      annualizationDays,
     );
 
     console.log(
