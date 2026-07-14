@@ -15,6 +15,7 @@
     "test:backtest-etf-rotation": "tsx backtest-etf-rotation.ts",
     "test:backtest-etf-rotation-multiwindow": "tsx backtest-etf-rotation-multiwindow.ts",
     "test:backtest-etf-rotation-holdcount-sweep": "tsx backtest-etf-rotation-holdcount-sweep.ts",
+    "test:backtest-etf-rotation-forward-validation": "tsx backtest-etf-rotation-forward-validation.ts",
     "test": "vitest run"
   },
   "dependencies": {
