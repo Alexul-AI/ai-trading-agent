@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 
 import {
   runEtfRotationWindowAnalysis,
+  type EtfRotationSimResult,
   type EtfRotationWindowAnalysisResult,
 } from "./backtest-etf-rotation.js";
 import {
@@ -18,12 +19,20 @@ const APCA_API_KEY_ID = process.env.APCA_API_KEY_ID ?? "";
 const APCA_API_SECRET_KEY = process.env.APCA_API_SECRET_KEY ?? "";
 const FEED = process.env.ALPACA_DATA_FEED || "iex";
 
-// The date candidate-hold3 was formally named as an explicit candidate
-// (PR #28/#29) and historical out-of-sample validation was declared
-// exhausted (PR #30) - a fixed historical fact anchoring what counts as
-// genuinely new/forward data, not a tunable knob. Deliberately NOT an env
-// var for that reason.
+// The target date candidate-hold3 was formally named as an explicit
+// candidate (PR #28/#29) and historical out-of-sample validation was
+// declared exhausted (PR #30) - a fixed historical fact, not a tunable knob,
+// so this is deliberately not an env var. The fetch window below is sized
+// to land the *simulated* start close to this date, not exactly on it (see
+// FORWARD_FETCH_WARMUP_BUFFER_DAYS) - the achieved start is always reported
+// alongside this target, never silently substituted for it.
 const FORWARD_VALIDATION_ANCHOR_DATE = "2026-07-14";
+
+// Comfortably above the ~304-calendar-day equivalent of WARMUP_BARS=210
+// trading days (backtest-etf-rotation.ts), so warmup reliably clears without
+// throwing, while keeping the achieved simulated start close to the anchor -
+// this is a purpose-sized window, not the project's standard 900-day one.
+const FORWARD_FETCH_WARMUP_BUFFER_DAYS = 330;
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
@@ -33,17 +42,17 @@ const LOG_CSV_PATH = path.join(REPORT_DIR, "etf-rotation-forward-validation-log.
 
 const LOG_CSV_HEADER = [
   "run_timestamp",
-  "anchor_date",
+  "anchor_date_target",
   "actual_window_start",
   "actual_window_end",
-  "forward_trading_days",
-  "forward_rebalance_count",
-  "baseline2_forward_return_pct",
-  "baseline2_forward_maxdd_pct",
-  "candidate3_forward_return_pct",
-  "candidate3_forward_maxdd_pct",
-  "spy_forward_return_pct",
-  "equalweight_forward_return_pct",
+  "sim_trading_days",
+  "rebalance_count",
+  "baseline2_return_pct",
+  "baseline2_maxdd_pct",
+  "candidate3_return_pct",
+  "candidate3_maxdd_pct",
+  "spy_return_pct",
+  "equalweight_return_pct",
 ].join(",");
 
 interface AlpacaBar {
@@ -76,8 +85,8 @@ function daysAgoFromTarget(targetIso: string): number {
 
 // Same per-script-copy convention as every other backtest script in this
 // repo (see backtest-etf-rotation.ts's identical function/comment) - this
-// copy only ever needs a small window (anchor to today), not the full
-// 900-day fetch the main analysis below uses.
+// copy only ever needs a small window (the achieved start to today), not the
+// main analysis's own fetch.
 async function fetchAlpacaBars(ticker: string, days: number, endDaysAgo: number): Promise<AlpacaBar[]> {
   const endDate = new Date();
   endDate.setDate(endDate.getDate() - endDaysAgo);
@@ -117,14 +126,14 @@ async function fetchAlpacaBars(ticker: string, days: number, endDaysAgo: number)
   return allBars.sort((a, b) => new Date(a.t).getTime() - new Date(b.t).getTime());
 }
 
-function priceReturnPercentSinceAnchor(bars: AlpacaBar[], anchorDate: string): number | null {
-  const fromBar = bars.find((b) => dateKeyOf(b) >= anchorDate);
+function priceReturnPercentSince(bars: AlpacaBar[], sinceDate: string): number | null {
+  const fromBar = bars.find((b) => dateKeyOf(b) >= sinceDate);
   const toBar = bars[bars.length - 1];
   if (!fromBar || !toBar || fromBar.c <= 0) return null;
   return ((toBar.c - fromBar.c) / fromBar.c) * 100;
 }
 
-interface ForwardTrade {
+interface WeightedTrade {
   date: string;
   ticker: string;
   action: "BUY" | "SELL";
@@ -133,70 +142,26 @@ interface ForwardTrade {
   weightPercentOfEquity: number | null;
 }
 
-interface ForwardSlice {
-  forwardReturnPercent: number;
-  forwardMaxDrawdownPercent: number;
-  forwardTradingDays: number;
-  forwardRebalanceCount: number;
-  forwardTrades: ForwardTrade[];
-}
-
-// Derives forward-only, anchor-rebased metrics from an already-computed
-// whole-window analysis, rather than trying to pin runEtfRotationWindowAnalysis's
-// own simulated start date exactly to the anchor (its warmup-clearing logic
-// always starts as early as the fetched data allows, so forcing an exact
-// start date would mean fragile fetch-window buffer sizing). Peak/drawdown
-// tracking is reset at the anchor point - this is NOT comparable to the
-// whole-window max drawdown numbers published elsewhere for this strategy.
-function computeForwardSlice(
-  analysis: EtfRotationWindowAnalysisResult,
-  anchorDate: string,
-): ForwardSlice | null {
-  const result = analysis.resultsByModel.get("next_open")!;
-  const anchorIndex = result.equityCurve.findIndex((p) => p.date >= anchorDate);
-  if (anchorIndex === -1) return null;
-
-  const slice = result.equityCurve.slice(anchorIndex);
-  const equityAtAnchor = slice[0]!.equity;
-  const equityAtEnd = slice[slice.length - 1]!.equity;
-  const forwardReturnPercent =
-    equityAtAnchor > 0 ? ((equityAtEnd - equityAtAnchor) / equityAtAnchor) * 100 : 0;
-
-  const equityByDate = new Map(slice.map((p) => [p.date, p.equity]));
-  let peak = equityAtAnchor;
-  let maxDrawdown = 0;
-  for (const point of slice) {
-    if (point.equity > peak) peak = point.equity;
-    const dd = peak > 0 ? ((point.equity - peak) / peak) * 100 : 0;
-    if (dd < maxDrawdown) maxDrawdown = dd;
-  }
-
-  const forwardTrades: ForwardTrade[] = result.trades
-    .filter((t) => t.date >= anchorDate)
-    .map((t) => {
-      const equityThatDay = equityByDate.get(t.date);
-      const dollarAmount = t.shares * t.price;
-      const weightPercentOfEquity =
-        equityThatDay && equityThatDay > 0 ? (dollarAmount / equityThatDay) * 100 : null;
-      return { ...t, weightPercentOfEquity };
-    });
-
-  const forwardRebalanceCount = new Set(forwardTrades.map((t) => t.date)).size;
-
-  return {
-    forwardReturnPercent,
-    forwardMaxDrawdownPercent: maxDrawdown,
-    forwardTradingDays: slice.length,
-    forwardRebalanceCount,
-    forwardTrades,
-  };
+// Attaches an approximate realized weight% to every trade by joining its
+// dollar amount against that date's equity-curve point - the "decisions/
+// prices/weights per rebalance" record, with no changes to the shared sim
+// engine that produced trades/equityCurve in the first place.
+function attachWeights(result: EtfRotationSimResult): WeightedTrade[] {
+  const equityByDate = new Map(result.equityCurve.map((p) => [p.date, p.equity]));
+  return result.trades.map((t) => {
+    const equityThatDay = equityByDate.get(t.date);
+    const dollarAmount = t.shares * t.price;
+    const weightPercentOfEquity =
+      equityThatDay && equityThatDay > 0 ? (dollarAmount / equityThatDay) * 100 : null;
+    return { ...t, weightPercentOfEquity };
+  });
 }
 
 function pad(value: string, width: number): string {
   return value.padStart(width);
 }
 
-function formatTrades(trades: ForwardTrade[]): string {
+function formatTrades(trades: WeightedTrade[]): string {
   if (trades.length === 0) return "_(none yet)_";
   return trades
     .map(
@@ -209,44 +174,56 @@ function formatTrades(trades: ForwardTrade[]): string {
 }
 
 async function writeForwardReport(
-  anchorDate: string,
   baselineAnalysis: EtfRotationWindowAnalysisResult,
   candidateAnalysis: EtfRotationWindowAnalysisResult,
-  baselineForward: ForwardSlice,
-  candidateForward: ForwardSlice,
-  spyForwardReturnPercent: number | null,
-  equalWeightForwardReturnPercent: number | null,
+  baselineTrades: WeightedTrade[],
+  candidateTrades: WeightedTrade[],
+  spyReturnPercent: number | null,
+  equalWeightReturnPercent: number | null,
   readText: string,
+  startGapCalendarDays: number,
 ) {
+  const baselineResult = baselineAnalysis.resultsByModel.get("next_open")!;
+  const candidateResult = candidateAnalysis.resultsByModel.get("next_open")!;
+  const gapText =
+    startGapCalendarDays > 0
+      ? `${startGapCalendarDays} calendar day(s) BEFORE the target anchor`
+      : startGapCalendarDays < 0
+        ? `${-startGapCalendarDays} calendar day(s) AFTER the target anchor`
+        : `exactly on the target anchor`;
+
   const md = `# ETF rotation forward validation report
 
 Generated: ${new Date().toISOString()}
-Anchor date (candidate-hold3 named, historical out-of-sample declared exhausted): ${anchorDate}
+Target anchor (candidate-hold3 named, historical out-of-sample declared exhausted): ${FORWARD_VALIDATION_ANCHOR_DATE}
 
-## Actual window ranges
-- baseline-2: ${baselineAnalysis.startDate} to ${baselineAnalysis.endDate}
-- candidate-hold3: ${candidateAnalysis.startDate} to ${candidateAnalysis.endDate}
+## Simulated window (fresh cash start)
+- baseline-2: ${baselineAnalysis.startDate} to ${baselineAnalysis.endDate} (${baselineResult.totalSimDays} trading days)
+- candidate-hold3: ${candidateAnalysis.startDate} to ${candidateAnalysis.endDate} (${candidateResult.totalSimDays} trading days)
+- Achieved start is ${gapText} (warmup-buffer sizing can't hit it exactly - see FORWARD_FETCH_WARMUP_BUFFER_DAYS in the script).
 
-## Forward slice (since anchor) - NEXT_OPEN
+Both simulations start with pure cash and execute their first rebalance immediately on day one (isMonthlyRebalanceDate's "first simulated day" rule) - this is not a slice of an older, already-running portfolio. Both configs share the same achieved start date, so any gap from the target anchor is a small, symmetric imprecision affecting both equally, not the cross-config state contamination the previous version of this script had (see PR #31 review).
+
+## Result (NEXT_OPEN)
 | series | return% | maxDD% | trading days | rebalances |
 |---|---|---|---|---|
-| baseline-2 | ${baselineForward.forwardReturnPercent.toFixed(2)} | ${baselineForward.forwardMaxDrawdownPercent.toFixed(2)} | ${baselineForward.forwardTradingDays} | ${baselineForward.forwardRebalanceCount} |
-| candidate-hold3 | ${candidateForward.forwardReturnPercent.toFixed(2)} | ${candidateForward.forwardMaxDrawdownPercent.toFixed(2)} | ${candidateForward.forwardTradingDays} | ${candidateForward.forwardRebalanceCount} |
+| baseline-2 | ${baselineResult.totalPnlPercent.toFixed(2)} | ${baselineResult.maxDrawdownPercent.toFixed(2)} | ${baselineResult.totalSimDays} | ${baselineResult.rebalanceCount} |
+| candidate-hold3 | ${candidateResult.totalPnlPercent.toFixed(2)} | ${candidateResult.maxDrawdownPercent.toFixed(2)} | ${candidateResult.totalSimDays} | ${candidateResult.rebalanceCount} |
 
-## Benchmarks (forward-only, context - not a rebased simulation)
-- SPY: ${spyForwardReturnPercent !== null ? `${spyForwardReturnPercent.toFixed(2)}%` : "n/a"}
-- Equal-weight 5-ETF (approx. - simple average of individual price returns since anchor, not a whole-share rebalanced sim): ${equalWeightForwardReturnPercent !== null ? `${equalWeightForwardReturnPercent.toFixed(2)}%` : "n/a"}
+## Benchmarks (same period, context)
+- SPY buy & hold: ${spyReturnPercent !== null ? `${spyReturnPercent.toFixed(2)}%` : "n/a"}
+- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): ${equalWeightReturnPercent !== null ? `${equalWeightReturnPercent.toFixed(2)}%` : "n/a"}
 
-## Decisions since anchor - baseline-2
-${formatTrades(baselineForward.forwardTrades)}
+## Decisions - baseline-2
+${formatTrades(baselineTrades)}
 
-## Decisions since anchor - candidate-hold3
-${formatTrades(candidateForward.forwardTrades)}
+## Decisions - candidate-hold3
+${formatTrades(candidateTrades)}
 
 ## Pre-declared read criteria (written before any forward data existed)
-- 0 rebalances since anchor: nothing to read yet.
-- 1-2 rebalances since anchor (~1-2 months): report the numbers, informational only - too early for a promotion decision.
-- 3+ rebalances since anchor (~3 months, matching the original estimate): candidate-hold3 is read as "holding up so far" only if BOTH (a) its forward max drawdown is not worse than baseline-2's, and (b) its forward return is not worse than baseline-2's by more than 5 percentage points. Either condition failing is a flagged concern worth more data/discussion, not an automatic rejection.
+- 0 rebalances: nothing to read yet.
+- 1-2 rebalances (~1-2 months): report the numbers, informational only - too early for a promotion decision.
+- 3+ rebalances (~3 months, matching the original estimate): candidate-hold3 is read as "holding up so far" only if BOTH (a) its max drawdown is not worse than baseline-2's, and (b) its return is not worse than baseline-2's by more than 5 percentage points. Either condition failing is a flagged concern worth more data/discussion, not an automatic rejection.
 - Regardless of the read at any sample size: this is supplementary color on top of the already-completed historical multi-window validation (PR #27/#28), not a replacement for it. It does not by itself trigger promoting candidate-hold3 to DEFAULT_ETF_ROTATION_CONFIG - that stays a separate, explicit, user-approved step.
 
 ## Current read
@@ -254,8 +231,8 @@ ${readText}
 
 ## Caveats
 - Raw Alpaca bars (adjustment=raw) - no dividends/distributions, same caveat as every other ETF rotation report in this repo.
-- The equal-weight forward benchmark above is an approximation (simple average of five individual price returns since anchor), not a whole-share rebalanced simulation like the main analysis' whole-window benchmark.
-- Forward max drawdown is measured only within the post-anchor slice (peak reset at the anchor date) - it is not comparable to the whole-window max drawdown numbers published elsewhere for this strategy.
+- The equal-weight benchmark above is an approximation (simple average of five individual price returns), not a whole-share rebalanced simulation like this strategy's own whole-window benchmark elsewhere in this repo.
+- The simulated window is intentionally short and grows only by re-running this script later (each run re-fetches from a fresh anchor-sized window, so day counts are not directly comparable run-to-run the way the accumulating CSV log's rebalance_count column is).
 - Small sample by construction - this only grows richer over repeated future runs of this script. See the pre-declared criteria above for how to read it at different sample sizes.
 - This script performs no trades and touches no live/paper execution path - it only reads Alpaca's historical/current bars, the same as every other backtest script in this repo.
 `;
@@ -280,107 +257,119 @@ async function appendForwardLogRow(row: (string | number)[]) {
 }
 
 async function main() {
-  console.log(`ETF rotation forward validation - anchor date: ${FORWARD_VALIDATION_ANCHOR_DATE}`);
+  console.log(`ETF rotation forward validation - target anchor: ${FORWARD_VALIDATION_ANCHOR_DATE}`);
   console.log(
-    "Compares baseline-2 vs candidate-hold3 (both run unconditionally) on the slice of data " +
-      "dated on/after the anchor - data that did not exist when candidate-hold3 was named " +
-      "(PR #28/#29) or when historical out-of-sample validation was declared exhausted (PR #30).",
+    "Compares baseline-2 vs candidate-hold3 (both run unconditionally), each simulated fresh " +
+      "with pure cash starting close to the anchor - not a slice of an older, already-running " +
+      "portfolio. Data since the anchor did not exist when candidate-hold3 was named (PR #28/#29) " +
+      "or when historical out-of-sample validation was declared exhausted (PR #30).",
   );
   console.log("");
 
+  const fetchDays = daysAgoFromTarget(FORWARD_VALIDATION_ANCHOR_DATE) + FORWARD_FETCH_WARMUP_BUFFER_DAYS;
+
   const baselineAnalysis = await runEtfRotationWindowAnalysis({
     label: "Forward (baseline-2)",
-    days: 900,
+    days: fetchDays,
     endDaysAgo: 0,
     config: ETF_ROTATION_MVP_BASELINE_CONFIG,
   });
   const candidateAnalysis = await runEtfRotationWindowAnalysis({
     label: "Forward (candidate-hold3)",
-    days: 900,
+    days: fetchDays,
     endDaysAgo: 0,
     config: ETF_ROTATION_HOLD3_CANDIDATE_CONFIG,
   });
 
-  console.log(`Baseline-2 actual range: ${baselineAnalysis.startDate} to ${baselineAnalysis.endDate}`);
-  console.log(`Candidate-hold3 actual range: ${candidateAnalysis.startDate} to ${candidateAnalysis.endDate}`);
+  console.log(`Baseline-2 actual simulated range: ${baselineAnalysis.startDate} to ${baselineAnalysis.endDate}`);
+  console.log(`Candidate-hold3 actual simulated range: ${candidateAnalysis.startDate} to ${candidateAnalysis.endDate}`);
+  if (baselineAnalysis.startDate !== candidateAnalysis.startDate) {
+    console.log(
+      `WARNING: baseline-2 and candidate-hold3 achieved different start dates (expected to match since both share the same universe/fetch params) - likely an Alpaca data hiccup between the two sequential fetches.`,
+    );
+  }
+  // Quantified, not vague: how many calendar days before (positive) or after
+  // (negative) the target anchor the achieved fresh-cash start actually
+  // landed - warmup-buffer sizing can't hit the anchor exactly (see
+  // FORWARD_FETCH_WARMUP_BUFFER_DAYS), so this gap must be visible, not
+  // hand-waved as "close to."
+  const anchorMs = new Date(`${FORWARD_VALIDATION_ANCHOR_DATE}T00:00:00Z`).getTime();
+  const startMs = new Date(`${baselineAnalysis.startDate}T00:00:00Z`).getTime();
+  const startGapCalendarDays = Math.round((anchorMs - startMs) / MS_PER_DAY);
+  console.log(
+    startGapCalendarDays > 0
+      ? `Achieved start is ${startGapCalendarDays} calendar day(s) BEFORE the target anchor (warmup-buffer sizing, not pixel-perfect) - both configs start from the same clean-cash date, so this is a small, symmetric imprecision, not the cross-config state contamination the previous version had.`
+      : startGapCalendarDays < 0
+        ? `Achieved start is ${-startGapCalendarDays} calendar day(s) AFTER the target anchor.`
+        : `Achieved start lands exactly on the target anchor.`,
+  );
   console.log("");
 
-  const baselineForward = computeForwardSlice(baselineAnalysis, FORWARD_VALIDATION_ANCHOR_DATE);
-  const candidateForward = computeForwardSlice(candidateAnalysis, FORWARD_VALIDATION_ANCHOR_DATE);
+  const baselineResult = baselineAnalysis.resultsByModel.get("next_open")!;
+  const candidateResult = candidateAnalysis.resultsByModel.get("next_open")!;
+  const baselineTrades = attachWeights(baselineResult);
+  const candidateTrades = attachWeights(candidateResult);
 
-  if (!baselineForward || !candidateForward) {
-    console.log(
-      `No trading days at/after the anchor date (${FORWARD_VALIDATION_ANCHOR_DATE}) yet - re-run this script after some time has passed.`,
-    );
-    return;
-  }
-
-  // Small separate fetch, just for the SPY/equal-weight forward-only
-  // benchmarks - see the module comment on computeForwardSlice for why this
+  // Small separate fetch, just for the SPY/equal-weight benchmarks over the
+  // same actual period - see attachWeights/module comments for why this
   // isn't derived from the main analysis above.
   const universe = ETF_ROTATION_MVP_BASELINE_CONFIG.universe;
-  const smallFetchDays = daysAgoFromTarget(FORWARD_VALIDATION_ANCHOR_DATE) + 5;
+  const smallFetchDays = daysAgoFromTarget(baselineAnalysis.startDate) + 5;
   const barsByTicker = new Map<string, AlpacaBar[]>();
   for (const ticker of universe) {
     barsByTicker.set(ticker, await fetchAlpacaBars(ticker, smallFetchDays, 0));
   }
-  const spyForwardReturnPercent = priceReturnPercentSinceAnchor(
-    barsByTicker.get("SPY") ?? [],
-    FORWARD_VALIDATION_ANCHOR_DATE,
-  );
-  const perTickerForwardReturns = universe
-    .map((t) => priceReturnPercentSinceAnchor(barsByTicker.get(t) ?? [], FORWARD_VALIDATION_ANCHOR_DATE))
+  const spyReturnPercent = priceReturnPercentSince(barsByTicker.get("SPY") ?? [], baselineAnalysis.startDate);
+  const perTickerReturns = universe
+    .map((t) => priceReturnPercentSince(barsByTicker.get(t) ?? [], baselineAnalysis.startDate))
     .filter((r): r is number => r !== null);
-  const equalWeightForwardReturnPercent =
-    perTickerForwardReturns.length > 0
-      ? perTickerForwardReturns.reduce((a, b) => a + b, 0) / perTickerForwardReturns.length
-      : null;
+  const equalWeightReturnPercent =
+    perTickerReturns.length > 0 ? perTickerReturns.reduce((a, b) => a + b, 0) / perTickerReturns.length : null;
 
-  console.log("=== Forward slice (since anchor), NEXT_OPEN ===");
+  console.log("=== Result, NEXT_OPEN (fresh-cash simulation since the anchor) ===");
   console.log(
     "series".padEnd(24) + pad("return%", 10) + pad("maxDD%", 10) + pad("trading days", 14) + pad("rebalances", 12),
   );
   console.log(
     "baseline-2".padEnd(24) +
-      pad(baselineForward.forwardReturnPercent.toFixed(2), 10) +
-      pad(baselineForward.forwardMaxDrawdownPercent.toFixed(2), 10) +
-      pad(String(baselineForward.forwardTradingDays), 14) +
-      pad(String(baselineForward.forwardRebalanceCount), 12),
+      pad(baselineResult.totalPnlPercent.toFixed(2), 10) +
+      pad(baselineResult.maxDrawdownPercent.toFixed(2), 10) +
+      pad(String(baselineResult.totalSimDays), 14) +
+      pad(String(baselineResult.rebalanceCount), 12),
   );
   console.log(
     "candidate-hold3".padEnd(24) +
-      pad(candidateForward.forwardReturnPercent.toFixed(2), 10) +
-      pad(candidateForward.forwardMaxDrawdownPercent.toFixed(2), 10) +
-      pad(String(candidateForward.forwardTradingDays), 14) +
-      pad(String(candidateForward.forwardRebalanceCount), 12),
+      pad(candidateResult.totalPnlPercent.toFixed(2), 10) +
+      pad(candidateResult.maxDrawdownPercent.toFixed(2), 10) +
+      pad(String(candidateResult.totalSimDays), 14) +
+      pad(String(candidateResult.rebalanceCount), 12),
   );
   console.log("");
+  console.log(`SPY buy & hold (same period, context): ${spyReturnPercent !== null ? `${spyReturnPercent.toFixed(2)}%` : "n/a"}`);
   console.log(
-    `SPY forward-only (context, not rebased sim): ${spyForwardReturnPercent !== null ? `${spyForwardReturnPercent.toFixed(2)}%` : "n/a"}`,
-  );
-  console.log(
-    `Equal-weight 5-ETF forward-only (context, approx.): ${equalWeightForwardReturnPercent !== null ? `${equalWeightForwardReturnPercent.toFixed(2)}%` : "n/a"}`,
+    `Equal-weight 5-ETF (same period, context, approx.): ${equalWeightReturnPercent !== null ? `${equalWeightReturnPercent.toFixed(2)}%` : "n/a"}`,
   );
   console.log("");
 
   // Rebalance dates depend only on the calendar (isMonthlyRebalanceDate),
-  // not on holdCount, so this count is expected to match between the two
-  // configs for the same window - using baseline-2's as the single count.
-  const rebalanceCount = baselineForward.forwardRebalanceCount;
+  // not on holdCount, and both configs share the same simulated window, so
+  // this count is expected to match between them - using baseline-2's as
+  // the single count.
+  const rebalanceCount = baselineResult.rebalanceCount;
   console.log("=== Read (pre-declared criteria - see docs/product/ROADMAP.md Phase 2) ===");
   let readText: string;
   if (rebalanceCount === 0) {
-    readText = "0 rebalances since anchor - nothing to read yet.";
+    readText = "0 rebalances since the anchor - nothing to read yet.";
   } else if (rebalanceCount < 3) {
-    readText = `${rebalanceCount} rebalance(s) since anchor - too early for a promotion decision, informational only.`;
+    readText = `${rebalanceCount} rebalance(s) since the anchor - too early for a promotion decision, informational only.`;
   } else {
-    const ddOk = candidateForward.forwardMaxDrawdownPercent >= baselineForward.forwardMaxDrawdownPercent;
-    const returnGap = candidateForward.forwardReturnPercent - baselineForward.forwardReturnPercent;
+    const ddOk = candidateResult.maxDrawdownPercent >= baselineResult.maxDrawdownPercent;
+    const returnGap = candidateResult.totalPnlPercent - baselineResult.totalPnlPercent;
     const returnOk = returnGap >= -5;
     readText =
       ddOk && returnOk
-        ? `${rebalanceCount} rebalances since anchor - candidate-hold3 holding up so far (maxDD not worse, return within 5pt tolerance of baseline-2).`
-        : `${rebalanceCount} rebalances since anchor - concern flagged (${ddOk ? "" : "maxDD worse than baseline-2. "}${returnOk ? "" : "return more than 5pt worse than baseline-2."}) - worth more data/discussion, not an automatic rejection.`;
+        ? `${rebalanceCount} rebalances since the anchor - candidate-hold3 holding up so far (maxDD not worse, return within 5pt tolerance of baseline-2).`
+        : `${rebalanceCount} rebalances since the anchor - concern flagged (${ddOk ? "" : "maxDD worse than baseline-2. "}${returnOk ? "" : "return more than 5pt worse than baseline-2."}) - worth more data/discussion, not an automatic rejection.`;
   }
   console.log(readText);
   console.log(
@@ -390,14 +379,14 @@ async function main() {
   console.log("");
 
   await writeForwardReport(
-    FORWARD_VALIDATION_ANCHOR_DATE,
     baselineAnalysis,
     candidateAnalysis,
-    baselineForward,
-    candidateForward,
-    spyForwardReturnPercent,
-    equalWeightForwardReturnPercent,
+    baselineTrades,
+    candidateTrades,
+    spyReturnPercent,
+    equalWeightReturnPercent,
     readText,
+    startGapCalendarDays,
   );
 
   await appendForwardLogRow([
@@ -405,14 +394,14 @@ async function main() {
     FORWARD_VALIDATION_ANCHOR_DATE,
     baselineAnalysis.startDate,
     baselineAnalysis.endDate,
-    baselineForward.forwardTradingDays,
+    baselineResult.totalSimDays,
     rebalanceCount,
-    baselineForward.forwardReturnPercent.toFixed(2),
-    baselineForward.forwardMaxDrawdownPercent.toFixed(2),
-    candidateForward.forwardReturnPercent.toFixed(2),
-    candidateForward.forwardMaxDrawdownPercent.toFixed(2),
-    spyForwardReturnPercent !== null ? spyForwardReturnPercent.toFixed(2) : "n/a",
-    equalWeightForwardReturnPercent !== null ? equalWeightForwardReturnPercent.toFixed(2) : "n/a",
+    baselineResult.totalPnlPercent.toFixed(2),
+    baselineResult.maxDrawdownPercent.toFixed(2),
+    candidateResult.totalPnlPercent.toFixed(2),
+    candidateResult.maxDrawdownPercent.toFixed(2),
+    spyReturnPercent !== null ? spyReturnPercent.toFixed(2) : "n/a",
+    equalWeightReturnPercent !== null ? equalWeightReturnPercent.toFixed(2) : "n/a",
   ]);
 }
 
