@@ -15,8 +15,10 @@ import { createAutopilotWorker } from "./autopilotWorker.js";
 import {
   getPortfolioCircuitBreakerState,
   resetPortfolioCircuitBreaker,
+  getMaxDrawdownFromPeakPercent,
   type EquityHistoryPoint,
 } from "./portfolioCircuitBreaker.js";
+import { appendCircuitBreakerAuditEvent } from "./circuitBreakerAuditLog.js";
 import {
   classifyOrderError,
   createClientOrderIdTracker,
@@ -1009,19 +1011,60 @@ app.post("/api/autopilot/run-once", requireAdminToken, async (_req, res) => {
   res.json(result);
 });
 
+const circuitBreakerResetSchema = z.object({
+  reason: z.string().trim().min(1, "A reason is required to reset the circuit breaker."),
+});
+
 app.post(
   "/api/autopilot/circuit-breaker/reset",
   requireAdminToken,
-  async (_req, res) => {
+  async (req, res) => {
+    const parsedBody = circuitBreakerResetSchema.safeParse(req.body);
+
+    if (!parsedBody.success) {
+      res.status(400).json({
+        error: parsedBody.error.flatten().fieldErrors.reason?.[0] ??
+          "A reason is required to reset the circuit breaker.",
+      });
+      return;
+    }
+
+    const { reason } = parsedBody.data;
+
     try {
       const portfolio = await getPortfolioSnapshot();
+      const previousState = await getPortfolioCircuitBreakerState();
       const state = await resetPortfolioCircuitBreaker(portfolio.equity);
+
+      const drawdownPercent = previousState
+        ? ((portfolio.equity - previousState.peakEquity) /
+            previousState.peakEquity) *
+          100
+        : 0;
+
+      await appendCircuitBreakerAuditEvent({
+        type: "CIRCUIT_BREAKER_RESET",
+        timestamp: new Date().toISOString(),
+        equity: portfolio.equity,
+        peakEquity: previousState?.peakEquity ?? state.peakEquity,
+        drawdownPercent,
+        thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
+        reason,
+      });
+
+      const confirmationMessage = `Circuit breaker manually reset.\nPrevious peak: ${(
+        previousState?.peakEquity ?? state.peakEquity
+      ).toFixed(2)}\nNew peak (rebased to current equity): ${state.peakEquity.toFixed(
+        2,
+      )}\nReason: ${reason}`;
 
       broadcastSSE({
         type: "notification",
         level: "info",
-        message: `Portfolio circuit breaker reset. New peak equity: ${state.peakEquity.toFixed(2)}.`,
+        message: confirmationMessage,
       });
+
+      await sendTelegramAlert(confirmationMessage);
 
       res.json({ status: "reset", state });
     } catch (error) {
@@ -1030,6 +1073,106 @@ app.post(
     }
   },
 );
+
+// Read-only, no admin gate (same convention as /api/dashboard and
+// /api/autopilot/journal) - this only surfaces data that already exists
+// elsewhere (breaker state, portfolio, journal), nothing new is computed
+// that would need to be kept private.
+app.get("/api/autopilot/circuit-breaker/review", async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  try {
+    // A long halt can outlast a single fetch's window - the next-open
+    // backtest finding (CLAUDE.md) saw one span 315 days, which at this
+    // worker's hourly cadence is ~7,500+ runs. journalTruncated only signals
+    // the journal FILE being bigger than the tail-read's byte window; it
+    // says nothing about whether this specific fetch reaches back to
+    // trippedAt, so it can't be trusted alone to vouch for
+    // blockedBuyCountSinceHalt below. Widened past the default 5MB/50-run
+    // read (this is an on-demand admin fetch, not the ~15s-polled
+    // dashboard, so a larger, slower read here is an acceptable trade).
+    const [circuitBreakerState, portfolio, journalRuns, truncationInfo] =
+      await Promise.all([
+        getPortfolioCircuitBreakerState(),
+        getPortfolioSnapshot(),
+        readAutopilotRuns(10000, undefined, 20 * 1024 * 1024),
+        getJournalTruncationInfo(),
+      ]);
+
+    const tripped = circuitBreakerState?.tripped ?? false;
+    const trippedAt = circuitBreakerState?.trippedAt ?? null;
+    const peakEquity = circuitBreakerState?.peakEquity ?? 0;
+    const drawdownFromPeakPercent =
+      peakEquity > 0
+        ? ((portfolio.equity - peakEquity) / peakEquity) * 100
+        : 0;
+    const daysHalted = trippedAt
+      ? Math.max(
+          1,
+          Math.round(
+            (Date.now() - Date.parse(trippedAt)) / (24 * 60 * 60 * 1000),
+          ),
+        )
+      : null;
+
+    const blockedDecisions = trippedAt
+      ? journalRuns
+          .flatMap((run) => run.decisions)
+          .filter(
+            (decision) =>
+              decision.blockReasonCode === "PORTFOLIO_CIRCUIT_BREAKER" &&
+              decision.timestamp >= trippedAt,
+          )
+      : [];
+
+    // readAutopilotRuns returns most-recent-first, so the last element is
+    // the oldest run actually fetched. If that's still after trippedAt, the
+    // fetch window didn't reach back to the trip - blockedBuyCountSinceHalt
+    // is then a lower bound over the loaded window only, not a true total.
+    const oldestFetchedRunTimestamp =
+      journalRuns.length > 0
+        ? journalRuns[journalRuns.length - 1]!.timestamp
+        : null;
+    const blockedSignalDataCoversFullHalt =
+      !trippedAt ||
+      (oldestFetchedRunTimestamp !== null &&
+        oldestFetchedRunTimestamp <= trippedAt);
+
+    res.json({
+      tripped,
+      trippedAt,
+      haltReason: tripped
+        ? "Portfolio equity drew down more than the configured threshold from its peak."
+        : null,
+      peakEquity,
+      peakEquityAt: circuitBreakerState?.peakEquityAt ?? null,
+      currentEquity: portfolio.equity,
+      drawdownFromPeakPercent,
+      thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
+      daysHalted,
+      blockedBuyCountSinceHalt: blockedDecisions.length,
+      // True total only when this is true - otherwise blockedBuyCountSinceHalt
+      // and recentBlockedSignals are a lower bound over the fetched journal
+      // window, not the whole halt. See comment above the journal fetch.
+      blockedSignalDataCoversFullHalt,
+      recentBlockedSignals: blockedDecisions.slice(0, 10).map((decision) => ({
+        ticker: decision.ticker,
+        timestamp: decision.timestamp,
+        price: decision.price,
+        reason: decision.blockReasonDetail ?? decision.reason,
+      })),
+      journalTruncated: truncationInfo.truncated,
+      positions: portfolio.positions,
+      cash: portfolio.balance,
+    });
+  } catch (error) {
+    console.error(
+      "[API] /api/autopilot/circuit-breaker/review failed:",
+      error,
+    );
+    res.status(500).json({ error: "Failed to load circuit breaker review" });
+  }
+});
 
 app.post("/api/trade", requireAdminToken, async (req, res) => {
   if (!areManualTradesAllowed()) {

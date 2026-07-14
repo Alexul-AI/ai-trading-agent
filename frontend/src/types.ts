@@ -113,6 +113,16 @@ export interface AutopilotDecision {
   skippedReason?: string;
 }
 
+export interface CircuitBreakerState {
+  trackingStartDate: string;
+  peakEquity: number;
+  peakEquityAt: string;
+  tripped: boolean;
+  trippedAt: string | null;
+  dataStale: boolean;
+  lastReminderSentDate: string | null;
+}
+
 export interface AutopilotStatus {
   enabled: boolean;
   executeTrades: boolean;
@@ -132,6 +142,8 @@ export interface AutopilotStatus {
   lastRunAt: string | null;
   lastError: string | null;
   lastDecisions: AutopilotDecision[];
+  circuitBreaker: CircuitBreakerState | null;
+  circuitBreakerMaxDrawdownFromPeakPercent: number;
 }
 
 export interface JournalRun {

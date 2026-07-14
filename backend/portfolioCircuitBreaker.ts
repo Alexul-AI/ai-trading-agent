@@ -33,6 +33,10 @@ export interface CircuitBreakerState {
   // open just because a data fetch had a bad moment. SELL/STOP_LOSS are
   // never affected by this, same as `tripped`.
   dataStale: boolean;
+  // Calendar date ("YYYY-MM-DD") the last daily halted-reminder was sent,
+  // or null if none has been sent since the current trip (or ever). Reset
+  // alongside trippedAt so a fresh trip gets its own fresh reminder cadence.
+  lastReminderSentDate: string | null;
 }
 
 export interface DrawdownEvaluation {
@@ -63,6 +67,18 @@ export function applyStickyTrip(
   wasTripped: boolean,
 ): boolean {
   return evaluationTripped || wasTripped;
+}
+
+// Pure - same reasoning as applyStickyTrip: keep the "should we act" decision
+// testable without I/O. Reminders are calendar-day-scoped (not cycle-scoped,
+// since the autopilot cycle runs roughly hourly) - true at most once per
+// distinct todayDateKey while tripped, never while not tripped.
+export function shouldSendDailyReminder(
+  tripped: boolean,
+  lastReminderSentDate: string | null,
+  todayDateKey: string,
+): boolean {
+  return tripped && lastReminderSentDate !== todayDateKey;
 }
 
 export function evaluatePortfolioDrawdown(
@@ -193,6 +209,7 @@ export async function updatePortfolioCircuitBreaker(
     tripped: applyStickyTrip(evaluation.tripped, wasTripped),
     trippedAt: justTripped ? now : (existing?.trippedAt ?? null),
     dataStale,
+    lastReminderSentDate: existing?.lastReminderSentDate ?? null,
   };
 
   await writeState(state);
@@ -210,6 +227,7 @@ export async function resetPortfolioCircuitBreaker(
     tripped: false,
     trippedAt: null,
     dataStale: false,
+    lastReminderSentDate: null,
   };
   await writeState(state);
   return state;
@@ -217,4 +235,14 @@ export async function resetPortfolioCircuitBreaker(
 
 export async function getPortfolioCircuitBreakerState(): Promise<CircuitBreakerState | null> {
   return readState();
+}
+
+// Called at most once per calendar day while tripped, right after
+// shouldSendDailyReminder confirms a reminder should go out - see
+// autopilotWorker.ts's single per-cycle circuit-breaker update call site.
+export async function recordReminderSent(todayDateKey: string): Promise<void> {
+  const existing = await readState();
+  if (!existing) return;
+
+  await writeState({ ...existing, lastReminderSentDate: todayDateKey });
 }

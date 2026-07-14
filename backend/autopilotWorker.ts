@@ -18,9 +18,12 @@ import { getNewsSentiment, getInsiderActivity } from "./agent.js";
 import {
   updatePortfolioCircuitBreaker,
   getMaxDrawdownFromPeakPercent,
+  shouldSendDailyReminder,
+  recordReminderSent,
   type CircuitBreakerState,
   type FetchEquityHistory,
 } from "./portfolioCircuitBreaker.js";
+import { appendCircuitBreakerAuditEvent } from "./circuitBreakerAuditLog.js";
 import {
   computeBucketRegimeByDate,
   isBuySuppressedByRegime,
@@ -1277,14 +1280,17 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       );
       lastCircuitBreakerState = circuitBreakerUpdate.state;
 
+      const circuitBreakerDrawdownPercent =
+        ((portfolio.equity - circuitBreakerUpdate.state.peakEquity) /
+          circuitBreakerUpdate.state.peakEquity) *
+        100;
+
       if (circuitBreakerUpdate.justTripped) {
         const alertMessage = `PORTFOLIO CIRCUIT BREAKER TRIPPED: equity ${portfolio.equity.toFixed(
           2,
-        )} is down ${(
-          ((portfolio.equity - circuitBreakerUpdate.state.peakEquity) /
-            circuitBreakerUpdate.state.peakEquity) *
-          100
-        ).toFixed(1)}% from peak ${circuitBreakerUpdate.state.peakEquity.toFixed(
+        )} is down ${circuitBreakerDrawdownPercent.toFixed(
+          1,
+        )}% from peak ${circuitBreakerUpdate.state.peakEquity.toFixed(
           2,
         )}. New BUYs are blocked until manually reset.`;
 
@@ -1297,6 +1303,15 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         if (options.sendTelegramAlert) {
           await options.sendTelegramAlert(alertMessage);
         }
+
+        await appendCircuitBreakerAuditEvent({
+          type: "CIRCUIT_BREAKER_TRIPPED",
+          timestamp: circuitBreakerUpdate.state.trippedAt ?? new Date().toISOString(),
+          equity: portfolio.equity,
+          peakEquity: circuitBreakerUpdate.state.peakEquity,
+          drawdownPercent: circuitBreakerDrawdownPercent,
+          thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
+        });
       }
 
       // Computed once per cycle, before the concurrent per-ticker loop
@@ -1411,6 +1426,62 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       runSignalBlockedCount = signalCandidates.length - signalReady.length;
       runDryRunCount = dryRunSignals.length;
       runExecutedCount = executedSignals.length;
+
+      // Once-per-calendar-day nudge while the breaker stays tripped - the
+      // trip alert above only fires once, ever, on the transition; this is
+      // what stops a long halt (see CLAUDE.md's next-open finding: 315 of
+      // 406 simulated days) from going unnoticed in between.
+      const todayDateKey = lastRunAt.slice(0, 10);
+      if (
+        shouldSendDailyReminder(
+          circuitBreakerUpdate.state.tripped,
+          circuitBreakerUpdate.state.lastReminderSentDate,
+          todayDateKey,
+        )
+      ) {
+        const daysHalted = circuitBreakerUpdate.state.trippedAt
+          ? Math.max(
+              1,
+              Math.round(
+                (Date.parse(lastRunAt) -
+                  Date.parse(circuitBreakerUpdate.state.trippedAt)) /
+                  (24 * 60 * 60 * 1000),
+              ),
+            )
+          : null;
+        const blockedBuyCountToday = decisions.filter(
+          (decision) => decision.blockReasonCode === "PORTFOLIO_CIRCUIT_BREAKER",
+        ).length;
+
+        const reminderMessage = `Trading still halted by circuit breaker.\nHalted since: ${
+          circuitBreakerUpdate.state.trippedAt ?? "unknown"
+        }\nHalt days: ${daysHalted ?? "unknown"}\nCurrent equity: ${portfolio.equity.toFixed(
+          2,
+        )}\nCurrent drawdown: ${circuitBreakerDrawdownPercent.toFixed(
+          1,
+        )}%\nBUY blocked today: ${blockedBuyCountToday}\nSELL still allowed.`;
+
+        options.broadcastSSE({
+          type: "notification",
+          level: "error",
+          message: reminderMessage,
+        });
+
+        if (options.sendTelegramAlert) {
+          await options.sendTelegramAlert(reminderMessage);
+        }
+
+        await appendCircuitBreakerAuditEvent({
+          type: "CIRCUIT_BREAKER_REMINDER_SENT",
+          timestamp: lastRunAt,
+          equity: portfolio.equity,
+          peakEquity: circuitBreakerUpdate.state.peakEquity,
+          drawdownPercent: circuitBreakerDrawdownPercent,
+          thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
+        });
+
+        await recordReminderSent(todayDateKey);
+      }
 
       try {
         const journalRun = await appendAutopilotRun({

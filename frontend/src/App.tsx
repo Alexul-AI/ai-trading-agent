@@ -56,6 +56,8 @@ const EMPTY_AUTOPILOT_STATUS: AutopilotStatus = {
   lastRunAt: null,
   lastError: null,
   lastDecisions: [],
+  circuitBreaker: null,
+  circuitBreakerMaxDrawdownFromPeakPercent: -0.15,
 };
 
 export default function App() {
