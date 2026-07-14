@@ -26,6 +26,12 @@ import {
 } from "./portfolioCircuitBreaker.js";
 import { evaluateTrade, type AccountState, type RiskProfile } from "./riskManager.js";
 import { createStrategyConfigHash } from "./decisionJournal.js";
+import {
+  buildBenchmarkMetrics,
+  buildScorecardMetrics,
+  calendarDaysInclusive,
+  formatScorecardMarkdown,
+} from "./scorecard.js";
 
 dotenv.config();
 
@@ -1254,6 +1260,13 @@ async function writeReportsForFullSystem(
   await fs.mkdir(reportDir, { recursive: true });
 
   const configHash = createStrategyConfigHash(DEFAULT_STRATEGY_CONFIG);
+  // CAGR must annualize over calendar time, not the trading-bar count in
+  // commonDates (Alpaca daily bars only exist for trading sessions) - see
+  // scorecard.ts's calendarDaysInclusive doc comment for why this matters.
+  const annualizationDays = calendarDaysInclusive(
+    commonDates[simStartIndex]!,
+    commonDates[commonDates.length - 1]!,
+  );
 
   const reportMd = `# Portfolio backtest report
 
@@ -1294,6 +1307,33 @@ and the independent-per-ticker baseline have no signal-to-execution lag concept.
 - Equal-weighted buy & hold (all ${TICKERS.length} tickers): ${buyAndHoldPercent.toFixed(2)}%
 - SPY buy & hold: ${spyBuyAndHoldPercent !== null ? `${spyBuyAndHoldPercent.toFixed(2)}%` : "n/a (SPY not in ticker list)"}
 
+${formatScorecardMarkdown(
+    `Full system (${executionModel})`,
+    buildScorecardMetrics({
+      totalReturnPercent: result.totalPnlPercent,
+      maxDrawdownPercent: result.maxDrawdownPercent,
+      avgExposurePercent: result.avgExposurePercent,
+      totalTrades: result.totalTrades,
+      simTradingDays: result.totalSimDays,
+      annualizationDays,
+    }),
+    [
+      buildBenchmarkMetrics(
+        "Equal-weight buy & hold",
+        buyAndHoldPercent,
+        annualizationDays,
+      ),
+      ...(spyBuyAndHoldPercent !== null
+        ? [
+            buildBenchmarkMetrics(
+              "SPY buy & hold",
+              spyBuyAndHoldPercent,
+              annualizationDays,
+            ),
+          ]
+        : []),
+    ],
+  )}
 ## Caveats
 - The full-system variant (D) is not the most conservative variant in the ablation table - it has more
   trades and a higher return than bucket-cap-only (B) or +circuit-breaker (C), because the sell-fraction

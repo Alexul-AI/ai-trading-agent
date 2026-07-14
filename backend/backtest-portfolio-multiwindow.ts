@@ -7,6 +7,14 @@ import {
   TICKERS,
   type WindowAnalysisResult,
 } from "./backtest-portfolio.js";
+import {
+  buildBenchmarkMetrics,
+  buildScorecardMetrics,
+  calendarDaysInclusive,
+  formatScorecardCsvRow,
+  formatBenchmarkCsvRow,
+  SCORECARD_CSV_HEADER,
+} from "./scorecard.js";
 
 dotenv.config();
 
@@ -147,6 +155,90 @@ async function main() {
   }
   console.log("");
 
+  // --- Table 1.5: scorecard by window (docs/product/ROADMAP.md Phase 1) ---
+  // NEXT_OPEN, variant D only - the roadmap's "next-open as primary result",
+  // not both models (Table 1 above already covers the close-vs-next-open
+  // comparison itself).
+  console.log("=== Scorecard by window (NEXT_OPEN, variant D, full system) ===");
+  console.log(
+    "window".padEnd(28) +
+      pad("CAGR%", 10) +
+      pad("maxDD%", 10) +
+      pad("Calmar", 9) +
+      pad("exposure%", 11) +
+      pad("trades", 8) +
+      pad("SPY CAGR%", 12) +
+      pad("EW CAGR%", 11),
+  );
+  const scorecardRows: (string | number)[][] = [SCORECARD_CSV_HEADER];
+  for (const analysis of analyses) {
+    const nextOpenD = analysis.resultsByModel
+      .get("next_open")!
+      .find((r) => r.variant.useDailyKillAndSellThrottle)!.result;
+
+    // CAGR must annualize over calendar time (startDate to endDate), not
+    // analysis.simDays (a trading-bar count from Alpaca daily bars, which
+    // don't exist for weekends/holidays) - see scorecard.ts's
+    // calendarDaysInclusive doc comment.
+    const annualizationDays = calendarDaysInclusive(
+      analysis.startDate,
+      analysis.endDate,
+    );
+
+    const metrics = buildScorecardMetrics({
+      totalReturnPercent: nextOpenD.totalPnlPercent,
+      maxDrawdownPercent: nextOpenD.maxDrawdownPercent,
+      avgExposurePercent: nextOpenD.avgExposurePercent,
+      totalTrades: nextOpenD.totalTrades,
+      simTradingDays: analysis.simDays,
+      annualizationDays,
+    });
+    const spyBenchmark =
+      analysis.spyBuyAndHoldPercent !== null
+        ? buildBenchmarkMetrics(
+            "SPY buy & hold",
+            analysis.spyBuyAndHoldPercent,
+            annualizationDays,
+          )
+        : null;
+    const equalWeightBenchmark = buildBenchmarkMetrics(
+      "Equal-weight buy & hold",
+      analysis.buyAndHoldPercent,
+      annualizationDays,
+    );
+
+    console.log(
+      analysis.label.padEnd(28) +
+        pad(metrics.cagrPercent.toFixed(2), 10) +
+        pad(metrics.maxDrawdownPercent.toFixed(2), 10) +
+        pad(
+          metrics.calmarRatio === null ? "n/a" : metrics.calmarRatio.toFixed(2),
+          9,
+        ) +
+        pad(metrics.avgExposurePercent.toFixed(1), 11) +
+        pad(String(metrics.totalTrades), 8) +
+        pad(spyBenchmark ? spyBenchmark.cagrPercent.toFixed(2) : "n/a", 12) +
+        pad(equalWeightBenchmark.cagrPercent.toFixed(2), 11),
+    );
+
+    scorecardRows.push(formatScorecardCsvRow(analysis.label, metrics));
+    if (spyBenchmark) {
+      scorecardRows.push(
+        formatBenchmarkCsvRow({
+          ...spyBenchmark,
+          label: `${analysis.label} - SPY`,
+        }),
+      );
+    }
+    scorecardRows.push(
+      formatBenchmarkCsvRow({
+        ...equalWeightBenchmark,
+        label: `${analysis.label} - Equal-weight`,
+      }),
+    );
+  }
+  console.log("");
+
   // --- Table 2: circuit-breaker policy comparison by window ---
   console.log(
     "=== Circuit-breaker policy comparison by window (NEXT_OPEN, variant D) ===",
@@ -233,9 +325,15 @@ async function main() {
   console.log("reset, not auto-reset).");
 
   await fs.mkdir(REPORT_DIR, { recursive: true });
-  const summary = [toCsv(dragRows), "", toCsv(policyRows), "", toCsv(verdictRows)].join(
-    "\n",
-  );
+  const summary = [
+    toCsv(dragRows),
+    "",
+    toCsv(scorecardRows),
+    "",
+    toCsv(policyRows),
+    "",
+    toCsv(verdictRows),
+  ].join("\n");
   await fs.writeFile(
     path.join(REPORT_DIR, "multi-window-summary.csv"),
     summary,
