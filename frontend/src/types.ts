@@ -123,6 +123,37 @@ export interface CircuitBreakerState {
   lastReminderSentDate: string | null;
 }
 
+export interface BlockedSignalSummary {
+  ticker: string;
+  timestamp: string;
+  price: number;
+  reason: string;
+}
+
+export interface CircuitBreakerReview {
+  tripped: boolean;
+  trippedAt: string | null;
+  haltReason: string | null;
+  peakEquity: number;
+  peakEquityAt: string | null;
+  currentEquity: number;
+  drawdownFromPeakPercent: number;
+  thresholdPercent: number;
+  daysHalted: number | null;
+  blockedBuyCountSinceHalt: number;
+  blockedSignalDataCoversFullHalt: boolean;
+  recentBlockedSignals: BlockedSignalSummary[];
+  journalTruncated: boolean;
+  positions: Record<string, Position>;
+  cash: number;
+}
+
+export interface CircuitBreakerResetResponse {
+  status?: string;
+  state?: CircuitBreakerState;
+  error?: string;
+}
+
 export interface AutopilotStatus {
   enabled: boolean;
   executeTrades: boolean;
