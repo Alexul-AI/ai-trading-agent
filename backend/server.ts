@@ -1082,11 +1082,20 @@ app.get("/api/autopilot/circuit-breaker/review", async (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
 
   try {
+    // A long halt can outlast a single fetch's window - the next-open
+    // backtest finding (CLAUDE.md) saw one span 315 days, which at this
+    // worker's hourly cadence is ~7,500+ runs. journalTruncated only signals
+    // the journal FILE being bigger than the tail-read's byte window; it
+    // says nothing about whether this specific fetch reaches back to
+    // trippedAt, so it can't be trusted alone to vouch for
+    // blockedBuyCountSinceHalt below. Widened past the default 5MB/50-run
+    // read (this is an on-demand admin fetch, not the ~15s-polled
+    // dashboard, so a larger, slower read here is an acceptable trade).
     const [circuitBreakerState, portfolio, journalRuns, truncationInfo] =
       await Promise.all([
         getPortfolioCircuitBreakerState(),
         getPortfolioSnapshot(),
-        readAutopilotRuns(2000),
+        readAutopilotRuns(10000, undefined, 20 * 1024 * 1024),
         getJournalTruncationInfo(),
       ]);
 
@@ -1116,6 +1125,19 @@ app.get("/api/autopilot/circuit-breaker/review", async (_req, res) => {
           )
       : [];
 
+    // readAutopilotRuns returns most-recent-first, so the last element is
+    // the oldest run actually fetched. If that's still after trippedAt, the
+    // fetch window didn't reach back to the trip - blockedBuyCountSinceHalt
+    // is then a lower bound over the loaded window only, not a true total.
+    const oldestFetchedRunTimestamp =
+      journalRuns.length > 0
+        ? journalRuns[journalRuns.length - 1]!.timestamp
+        : null;
+    const blockedSignalDataCoversFullHalt =
+      !trippedAt ||
+      (oldestFetchedRunTimestamp !== null &&
+        oldestFetchedRunTimestamp <= trippedAt);
+
     res.json({
       tripped,
       trippedAt,
@@ -1129,6 +1151,10 @@ app.get("/api/autopilot/circuit-breaker/review", async (_req, res) => {
       thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
       daysHalted,
       blockedBuyCountSinceHalt: blockedDecisions.length,
+      // True total only when this is true - otherwise blockedBuyCountSinceHalt
+      // and recentBlockedSignals are a lower bound over the fetched journal
+      // window, not the whole halt. See comment above the journal fetch.
+      blockedSignalDataCoversFullHalt,
       recentBlockedSignals: blockedDecisions.slice(0, 10).map((decision) => ({
         ticker: decision.ticker,
         timestamp: decision.timestamp,
