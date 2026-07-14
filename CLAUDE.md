@@ -1,6 +1,6 @@
 # Project context for Claude
 
-This file is loaded automatically at the start of every session in this repo. Read [README.md](README.md) for architecture and [GOLIVE_CRITERIA.md](GOLIVE_CRITERIA.md) for the live-trading readiness checklist before making strategy/risk changes.
+This file is loaded automatically at the start of every session in this repo. Read [README.md](README.md) for architecture and [GOLIVE_CRITERIA.md](GOLIVE_CRITERIA.md) for the live-trading readiness checklist before making strategy/risk changes. Read [docs/product/ROADMAP.md](docs/product/ROADMAP.md) (added 2026-07-14) for the product-level plan: phased path from research to paper to micro-live, strategy priority order (ETF Rotation first, Trend Participation optional/conditional, Hybrid Allocator deferred), the tax/reporting and paper-infrastructure gates, and an explicit stop/park criteria section — before proposing new strategy work or discussing go-live timing.
 
 ## Who the user is
 
