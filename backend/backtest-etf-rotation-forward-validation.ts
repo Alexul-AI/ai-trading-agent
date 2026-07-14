@@ -22,16 +22,23 @@ const FEED = process.env.ALPACA_DATA_FEED || "iex";
 // The target date candidate-hold3 was formally named as an explicit
 // candidate (PR #28/#29) and historical out-of-sample validation was
 // declared exhausted (PR #30) - a fixed historical fact, not a tunable knob,
-// so this is deliberately not an env var. The fetch window below is sized
-// to land the *simulated* start close to this date, not exactly on it (see
-// FORWARD_FETCH_WARMUP_BUFFER_DAYS) - the achieved start is always reported
-// alongside this target, never silently substituted for it.
+// so this is deliberately not an env var. Passed as runEtfRotationWindowAnalysis's
+// simStartDateOverride, which pins the simulation's first trading day to the
+// first common date >= this value - pre-anchor history is fetched (below)
+// purely to give indicators (momentum/SMA) their warmup runway, but it is
+// never simulated, traded, or reflected in trades/equityCurve/return/
+// drawdown. Without the override, the simulation would start as soon as
+// warmup clears - which drifted 26 calendar days *before* this anchor in an
+// earlier version of this script (caught in review before merge), including
+// pre-anchor performance in what was supposed to be a forward-only read.
 const FORWARD_VALIDATION_ANCHOR_DATE = "2026-07-14";
 
 // Comfortably above the ~304-calendar-day equivalent of WARMUP_BARS=210
-// trading days (backtest-etf-rotation.ts), so warmup reliably clears without
-// throwing, while keeping the achieved simulated start close to the anchor -
-// this is a purpose-sized window, not the project's standard 900-day one.
+// trading days (backtest-etf-rotation.ts), so warmup reliably clears before
+// reaching the anchor. Overshooting this is harmless now (simStartDateOverride
+// pins the actual sim start regardless of how much slack the buffer leaves) -
+// unlike before the override existed, there is no longer a precision
+// tradeoff in sizing this generously.
 const FORWARD_FETCH_WARMUP_BUFFER_DAYS = 330;
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -186,29 +193,34 @@ async function writeForwardReport(
   const baselineResult = baselineAnalysis.resultsByModel.get("next_open")!;
   const candidateResult = candidateAnalysis.resultsByModel.get("next_open")!;
   const gapText =
-    startGapCalendarDays > 0
-      ? `${startGapCalendarDays} calendar day(s) BEFORE the target anchor`
-      : startGapCalendarDays < 0
-        ? `${-startGapCalendarDays} calendar day(s) AFTER the target anchor`
-        : `exactly on the target anchor`;
+    startGapCalendarDays < 0
+      ? `**WARNING: ${-startGapCalendarDays} day(s) BEFORE the target anchor - simStartDateOverride should have prevented this, treat this run as suspect.**`
+      : startGapCalendarDays === 0
+        ? `exactly on the target anchor (no pre-anchor data included)`
+        : `${startGapCalendarDays} calendar day(s) after the target anchor (the anchor fell on a non-trading day; still no pre-anchor data included)`;
 
   const md = `# ETF rotation forward validation report
 
 Generated: ${new Date().toISOString()}
 Target anchor (candidate-hold3 named, historical out-of-sample declared exhausted): ${FORWARD_VALIDATION_ANCHOR_DATE}
 
-## Simulated window (fresh cash start)
+## Simulated window (fresh cash start, pinned to the anchor)
 - baseline-2: ${baselineAnalysis.startDate} to ${baselineAnalysis.endDate} (${baselineResult.totalSimDays} trading days)
 - candidate-hold3: ${candidateAnalysis.startDate} to ${candidateAnalysis.endDate} (${candidateResult.totalSimDays} trading days)
-- Achieved start is ${gapText} (warmup-buffer sizing can't hit it exactly - see FORWARD_FETCH_WARMUP_BUFFER_DAYS in the script).
+- Achieved start is ${gapText}.
 
-Both simulations start with pure cash and execute their first rebalance immediately on day one (isMonthlyRebalanceDate's "first simulated day" rule) - this is not a slice of an older, already-running portfolio. Both configs share the same achieved start date, so any gap from the target anchor is a small, symmetric imprecision affecting both equally, not the cross-config state contamination the previous version of this script had (see PR #31 review).
+Both simulations start with pure cash and execute their first rebalance immediately on day one (isMonthlyRebalanceDate's "first simulated day" rule). The simulated window is pinned to never start earlier than the anchor (via runEtfRotationWindowAnalysis's simStartDateOverride) - pre-anchor price history is used only to warm up momentum/SMA indicators, never simulated or traded. This fixes a real bug caught in review before merge: an earlier version of this script let the simulation start wherever warmup happened to clear, which drifted 26 calendar days before the anchor and included pre-anchor performance in what was meant to be a forward-only read (see PR #31 review).
 
 ## Result (NEXT_OPEN)
 | series | return% | maxDD% | trading days | rebalances |
 |---|---|---|---|---|
 | baseline-2 | ${baselineResult.totalPnlPercent.toFixed(2)} | ${baselineResult.maxDrawdownPercent.toFixed(2)} | ${baselineResult.totalSimDays} | ${baselineResult.rebalanceCount} |
 | candidate-hold3 | ${candidateResult.totalPnlPercent.toFixed(2)} | ${candidateResult.maxDrawdownPercent.toFixed(2)} | ${candidateResult.totalSimDays} | ${candidateResult.rebalanceCount} |
+${
+  baselineResult.finalRebalanceUnexecuted || candidateResult.finalRebalanceUnexecuted
+    ? "\nA rebalance decided on the last simulated day had no following day to execute on yet (NEXT_OPEN window-edge effect) - it will appear in the Decisions section below once this script is re-run after that day has passed, not dropped silently.\n"
+    : ""
+}
 
 ## Benchmarks (same period, context)
 - SPY buy & hold: ${spyReturnPercent !== null ? `${spyReturnPercent.toFixed(2)}%` : "n/a"}
@@ -260,8 +272,9 @@ async function main() {
   console.log(`ETF rotation forward validation - target anchor: ${FORWARD_VALIDATION_ANCHOR_DATE}`);
   console.log(
     "Compares baseline-2 vs candidate-hold3 (both run unconditionally), each simulated fresh " +
-      "with pure cash starting close to the anchor - not a slice of an older, already-running " +
-      "portfolio. Data since the anchor did not exist when candidate-hold3 was named (PR #28/#29) " +
+      "with pure cash and pinned to never start before the anchor (simStartDateOverride) - not a " +
+      "slice of an older, already-running portfolio, and no pre-anchor days leaking into the " +
+      "result. Data since the anchor did not exist when candidate-hold3 was named (PR #28/#29) " +
       "or when historical out-of-sample validation was declared exhausted (PR #30).",
   );
   console.log("");
@@ -273,12 +286,14 @@ async function main() {
     days: fetchDays,
     endDaysAgo: 0,
     config: ETF_ROTATION_MVP_BASELINE_CONFIG,
+    simStartDateOverride: FORWARD_VALIDATION_ANCHOR_DATE,
   });
   const candidateAnalysis = await runEtfRotationWindowAnalysis({
     label: "Forward (candidate-hold3)",
     days: fetchDays,
     endDaysAgo: 0,
     config: ETF_ROTATION_HOLD3_CANDIDATE_CONFIG,
+    simStartDateOverride: FORWARD_VALIDATION_ANCHOR_DATE,
   });
 
   console.log(`Baseline-2 actual simulated range: ${baselineAnalysis.startDate} to ${baselineAnalysis.endDate}`);
@@ -288,21 +303,26 @@ async function main() {
       `WARNING: baseline-2 and candidate-hold3 achieved different start dates (expected to match since both share the same universe/fetch params) - likely an Alpaca data hiccup between the two sequential fetches.`,
     );
   }
-  // Quantified, not vague: how many calendar days before (positive) or after
-  // (negative) the target anchor the achieved fresh-cash start actually
-  // landed - warmup-buffer sizing can't hit the anchor exactly (see
-  // FORWARD_FETCH_WARMUP_BUFFER_DAYS), so this gap must be visible, not
-  // hand-waved as "close to."
+  // simStartDateOverride guarantees simStartIndex >= the first common date
+  // >= the anchor, so this gap should only ever be 0 (anchor was a trading
+  // day) or positive (anchor fell on a weekend/holiday, so the sim starts on
+  // the next trading day after it) - never negative. A negative value here
+  // would mean the override didn't take effect and no pre-anchor data
+  // leaked into the simulated window - printed regardless, not hidden.
   const anchorMs = new Date(`${FORWARD_VALIDATION_ANCHOR_DATE}T00:00:00Z`).getTime();
   const startMs = new Date(`${baselineAnalysis.startDate}T00:00:00Z`).getTime();
-  const startGapCalendarDays = Math.round((anchorMs - startMs) / MS_PER_DAY);
-  console.log(
-    startGapCalendarDays > 0
-      ? `Achieved start is ${startGapCalendarDays} calendar day(s) BEFORE the target anchor (warmup-buffer sizing, not pixel-perfect) - both configs start from the same clean-cash date, so this is a small, symmetric imprecision, not the cross-config state contamination the previous version had.`
-      : startGapCalendarDays < 0
-        ? `Achieved start is ${-startGapCalendarDays} calendar day(s) AFTER the target anchor.`
-        : `Achieved start lands exactly on the target anchor.`,
-  );
+  const startGapCalendarDays = Math.round((startMs - anchorMs) / MS_PER_DAY);
+  if (startGapCalendarDays < 0) {
+    console.log(
+      `WARNING: achieved start (${baselineAnalysis.startDate}) is BEFORE the target anchor (${FORWARD_VALIDATION_ANCHOR_DATE}) by ${-startGapCalendarDays} day(s) - simStartDateOverride should have prevented this, treat this run's numbers as suspect and investigate.`,
+    );
+  } else if (startGapCalendarDays === 0) {
+    console.log(`Achieved start lands exactly on the target anchor - no pre-anchor data included.`);
+  } else {
+    console.log(
+      `Achieved start is ${startGapCalendarDays} calendar day(s) after the target anchor (the anchor fell on a non-trading day) - still no pre-anchor data included.`,
+    );
+  }
   console.log("");
 
   const baselineResult = baselineAnalysis.resultsByModel.get("next_open")!;
@@ -344,6 +364,11 @@ async function main() {
       pad(String(candidateResult.totalSimDays), 14) +
       pad(String(candidateResult.rebalanceCount), 12),
   );
+  if (baselineResult.finalRebalanceUnexecuted || candidateResult.finalRebalanceUnexecuted) {
+    console.log(
+      "A rebalance decided on the last simulated day had no following day to execute on yet (NEXT_OPEN window-edge effect) - it'll show up in Decisions once re-run after that day passes, not dropped silently.",
+    );
+  }
   console.log("");
   console.log(`SPY buy & hold (same period, context): ${spyReturnPercent !== null ? `${spyReturnPercent.toFixed(2)}%` : "n/a"}`);
   console.log(
