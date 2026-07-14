@@ -24,14 +24,70 @@ export interface EtfRotationConfig {
 // universe description. Momentum lookback (126 trading days, ~6 months) and
 // trend filter (SMA200, matching the Trend Participation section's own
 // convention) are single-value MVP choices, not a multi-lookback blend -
-// documented simplifications, not limitations discovered late. Hold count
-// of 2 is the low end of the roadmap's "2-4," chosen for fewest trades.
-export const DEFAULT_ETF_ROTATION_CONFIG: EtfRotationConfig = {
+// documented simplifications, not limitations discovered late.
+//
+// Original MVP config (PR #26) - holdCount=2, the low end of the roadmap's
+// "2-4," chosen for fewest trades. Still the production default until
+// holdCount=3 is independently validated (see the candidate config below -
+// PR #28's hold-count sweep found it promising, but on the same 5 windows
+// used to diagnose the problem it fixes, which isn't independent
+// confirmation).
+export const ETF_ROTATION_MVP_BASELINE_CONFIG: EtfRotationConfig = {
   universe: ["SPY", "QQQ", "EFA", "TLT", "GLD"],
   momentumLookbackDays: 126,
   trendFilterSmaPeriod: 200,
   holdCount: 2,
 };
+
+// PR #28's hold-count sweep: holdCount=3 improved return and/or drawdown in
+// 4 of 5 windows and fixed the 2022 bear-heavy concentration problem the
+// sweep was built to investigate. NOT a production default - promote to
+// ETF_ROTATION_MVP_BASELINE_CONFIG's role only after out-of-sample
+// validation (docs/product/ROADMAP.md Phase 2), not automatically off one
+// same-window sweep.
+export const ETF_ROTATION_HOLD3_CANDIDATE_CONFIG: EtfRotationConfig = {
+  ...ETF_ROTATION_MVP_BASELINE_CONFIG,
+  holdCount: 3,
+};
+
+// Kept for any existing import of the old name - always points at the
+// currently-validated production default (the baseline, not the candidate).
+export const DEFAULT_ETF_ROTATION_CONFIG: EtfRotationConfig =
+  ETF_ROTATION_MVP_BASELINE_CONFIG;
+
+export type EtfRotationConfigVariantKey = "baseline-2" | "candidate-hold3";
+
+export interface EtfRotationConfigVariant {
+  config: EtfRotationConfig;
+  label: string;
+  validationStatus: string;
+}
+
+export const ETF_ROTATION_CONFIG_VARIANTS: Record<
+  EtfRotationConfigVariantKey,
+  EtfRotationConfigVariant
+> = {
+  "baseline-2": {
+    config: ETF_ROTATION_MVP_BASELINE_CONFIG,
+    label: "baseline-2 (holdCount=2, original MVP)",
+    validationStatus: "Production default (Phase 2 MVP, PR #26).",
+  },
+  "candidate-hold3": {
+    config: ETF_ROTATION_HOLD3_CANDIDATE_CONFIG,
+    label: "candidate-hold3 (holdCount=3)",
+    validationStatus:
+      "Candidate per PR #28's hold-count sweep - NOT independently validated (the same 5 windows were used to diagnose the concentration problem and to pick this fix), not a production default.",
+  },
+};
+
+// Fails safe to the validated baseline on anything unrecognized or unset -
+// never silently runs the unvalidated candidate by accident just because an
+// env var was misspelled.
+export function resolveEtfRotationConfigVariant(
+  raw: string | undefined,
+): EtfRotationConfigVariantKey {
+  return raw === "candidate-hold3" ? "candidate-hold3" : "baseline-2";
+}
 
 /**
  * Trailing return over lookbackDays, as a percent. Null (not 0) when there

@@ -5,6 +5,9 @@ import {
   decideRotationTargets,
   isMonthlyRebalanceDate,
   passesTrendFilter,
+  resolveEtfRotationConfigVariant,
+  ETF_ROTATION_MVP_BASELINE_CONFIG,
+  ETF_ROTATION_HOLD3_CANDIDATE_CONFIG,
   type EtfRotationConfig,
 } from "./etfRotationStrategy.js";
 
@@ -163,5 +166,39 @@ describe("decideRotationTargets", () => {
     const targets = decideRotationTargets(history, config);
 
     expect(targets).toEqual([]);
+  });
+});
+
+describe("resolveEtfRotationConfigVariant", () => {
+  it("resolves the exact candidate string to candidate-hold3", () => {
+    expect(resolveEtfRotationConfigVariant("candidate-hold3")).toBe(
+      "candidate-hold3",
+    );
+  });
+
+  it("fails safe to baseline-2 when unset, empty, or unrecognized - never silently runs the unvalidated candidate", () => {
+    expect(resolveEtfRotationConfigVariant(undefined)).toBe("baseline-2");
+    expect(resolveEtfRotationConfigVariant("")).toBe("baseline-2");
+    expect(resolveEtfRotationConfigVariant("candidate-hold4")).toBe(
+      "baseline-2",
+    );
+    expect(resolveEtfRotationConfigVariant("Candidate-Hold3")).toBe(
+      "baseline-2",
+    );
+  });
+});
+
+describe("ETF_ROTATION_HOLD3_CANDIDATE_CONFIG", () => {
+  it("only changes holdCount, inheriting everything else from the baseline unchanged", () => {
+    expect(ETF_ROTATION_HOLD3_CANDIDATE_CONFIG.holdCount).toBe(3);
+    expect(ETF_ROTATION_HOLD3_CANDIDATE_CONFIG.universe).toEqual(
+      ETF_ROTATION_MVP_BASELINE_CONFIG.universe,
+    );
+    expect(ETF_ROTATION_HOLD3_CANDIDATE_CONFIG.momentumLookbackDays).toBe(
+      ETF_ROTATION_MVP_BASELINE_CONFIG.momentumLookbackDays,
+    );
+    expect(ETF_ROTATION_HOLD3_CANDIDATE_CONFIG.trendFilterSmaPeriod).toBe(
+      ETF_ROTATION_MVP_BASELINE_CONFIG.trendFilterSmaPeriod,
+    );
   });
 });
