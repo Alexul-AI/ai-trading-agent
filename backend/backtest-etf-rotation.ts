@@ -413,6 +413,18 @@ export async function runEtfRotationWindowAnalysis(options: {
   days: number;
   endDaysAgo: number;
   config?: EtfRotationConfig;
+  /**
+   * If provided, the simulation's first trading day is pulled forward to the
+   * first common date >= this value (still never earlier than wherever
+   * warmup naturally clears). Pre-override history is used only to compute
+   * indicators (momentum/SMA) during warmup - it is never simulated, traded,
+   * or reflected in trades/equityCurve/return/drawdown. Added for
+   * backtest-etf-rotation-forward-validation.ts, so a fixed anchor date can
+   * be pinned exactly rather than drifting earlier by however much slack the
+   * fetch window's warmup buffer happens to leave. Optional and additive -
+   * every existing caller is unaffected when omitted.
+   */
+  simStartDateOverride?: string;
 }): Promise<EtfRotationWindowAnalysisResult> {
   const config = options.config ?? DEFAULT_ETF_ROTATION_CONFIG;
   const barsByTicker = new Map<string, AlpacaBar[]>();
@@ -426,12 +438,23 @@ export async function runEtfRotationWindowAnalysis(options: {
     barsByTicker,
     config.universe,
   );
-  const simStartIndex = findSimStartIndex(commonDates, indexByTickerByDate, config.universe);
+  const warmupClearedIndex = findSimStartIndex(commonDates, indexByTickerByDate, config.universe);
 
-  if (simStartIndex >= commonDates.length) {
+  if (warmupClearedIndex >= commonDates.length) {
     throw new Error(
       `[${options.label}] Not enough shared history to clear the warmup window for all tickers - try a larger days value.`,
     );
+  }
+
+  let simStartIndex = warmupClearedIndex;
+  if (options.simStartDateOverride) {
+    const overrideIndex = commonDates.findIndex((d) => d >= options.simStartDateOverride!);
+    if (overrideIndex === -1) {
+      throw new Error(
+        `[${options.label}] simStartDateOverride (${options.simStartDateOverride}) is after the last available trading day (${commonDates[commonDates.length - 1]}).`,
+      );
+    }
+    simStartIndex = Math.max(warmupClearedIndex, overrideIndex);
   }
 
   const startDate = commonDates[simStartIndex]!;
