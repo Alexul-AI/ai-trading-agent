@@ -3,7 +3,7 @@ import path from "path";
 import dotenv from "dotenv";
 
 import { runEtfRotationWindowAnalysis } from "./backtest-etf-rotation.js";
-import { DEFAULT_ETF_ROTATION_CONFIG } from "./etfRotationStrategy.js";
+import { ETF_ROTATION_MVP_BASELINE_CONFIG } from "./etfRotationStrategy.js";
 import {
   buildBenchmarkMetrics,
   buildScorecardMetrics,
@@ -99,7 +99,7 @@ async function main() {
         label: `${window.label} (holdCount=${holdCount})`,
         days: window.days,
         endDaysAgo: window.endDaysAgo,
-        config: { ...DEFAULT_ETF_ROTATION_CONFIG, holdCount },
+        config: { ...ETF_ROTATION_MVP_BASELINE_CONFIG, holdCount },
       });
       const nextOpenD = analysis.resultsByModel.get("next_open")!;
       const annualizationDays = calendarDaysInclusive(analysis.startDate, analysis.endDate);

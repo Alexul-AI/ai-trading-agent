@@ -5,7 +5,9 @@ import dotenv from "dotenv";
 import {
   decideRotationTargets,
   DEFAULT_ETF_ROTATION_CONFIG,
+  ETF_ROTATION_CONFIG_VARIANTS,
   isMonthlyRebalanceDate,
+  resolveEtfRotationConfigVariant,
   type EtfRotationConfig,
   type RotationTarget,
 } from "./etfRotationStrategy.js";
@@ -401,6 +403,8 @@ export interface EtfRotationWindowAnalysisResult {
   resultsByModel: Map<ExecutionModel, EtfRotationSimResult>;
   buyAndHoldPercent: number;
   spyBuyAndHoldPercent: number | null;
+  /** The actual config this window was simulated with - report writers must read this, not a module-level default, or a report can silently misdescribe what was actually simulated. */
+  config: EtfRotationConfig;
 }
 
 export async function runEtfRotationWindowAnalysis(options: {
@@ -467,6 +471,7 @@ export async function runEtfRotationWindowAnalysis(options: {
     resultsByModel,
     buyAndHoldPercent,
     spyBuyAndHoldPercent,
+    config,
   };
 }
 
@@ -477,9 +482,12 @@ function pad(value: string, width: number): string {
 async function writeReport(
   analysis: EtfRotationWindowAnalysisResult,
   executionModel: ExecutionModel,
+  configLabel: string,
+  validationStatus: string,
 ) {
   const result = analysis.resultsByModel.get(executionModel)!;
   const annualizationDays = calendarDaysInclusive(analysis.startDate, analysis.endDate);
+  const config = analysis.config;
 
   const scorecardMd = formatScorecardMarkdown(
     `ETF rotation (${executionModel})`,
@@ -504,14 +512,16 @@ async function writeReport(
 Generated: ${new Date().toISOString()}
 
 ## Run configuration
+- Config variant: ${configLabel}
+- Validation status: ${validationStatus}
 - Window: ${result.totalSimDays} simulated trading days (${analysis.startDate} to ${analysis.endDate}, ${annualizationDays} calendar days)
-- Universe: ${DEFAULT_ETF_ROTATION_CONFIG.universe.join(", ")}
+- Universe: ${config.universe.join(", ")}
 - Starting capital: $${STARTING_CAPITAL}
 - Execution model: ${executionModel === "close_to_close" ? "CLOSE_TO_CLOSE (signal and execution both at day's close - a same-bar assumption)" : "NEXT_OPEN (signal at close[d], executed at open[d+1])"}
 - Rebalance cadence: monthly (first trading day of each new calendar month)
-- Momentum lookback: ${DEFAULT_ETF_ROTATION_CONFIG.momentumLookbackDays} trading days
-- Trend filter: price > SMA(${DEFAULT_ETF_ROTATION_CONFIG.trendFilterSmaPeriod})
-- Hold count: top ${DEFAULT_ETF_ROTATION_CONFIG.holdCount} by momentum, equal-weighted at 100/holdCount% per slot
+- Momentum lookback: ${config.momentumLookbackDays} trading days
+- Trend filter: price > SMA(${config.trendFilterSmaPeriod})
+- Hold count: top ${config.holdCount} by momentum, equal-weighted at 100/holdCount% per slot
 - Slippage: ${(SLIPPAGE_PERCENT * 100).toFixed(2)}%
 
 ## Result
@@ -531,7 +541,7 @@ ${scorecardMd}
 - Each rebalance fully liquidates current holdings and rebuys the new target set, rather than trading only the delta - simpler to reason about, but inflates trade count somewhat versus a smarter delta-only rebalancer for any ticker that happens to stay in both the old and new target set. Read "Total trades" with that in mind.
 - This backtest does not model bucket cap / circuit breaker / daily kill switch, because the first goal is to measure the clean rotation strategy on diversified ETFs. This does not mean these platform-level protections are disabled or considered unnecessary for future paper/live execution - even an ETF portfolio can hit a prolonged bear market, and the portfolio-level circuit breaker should stay a platform-level safety net regardless of which strategy is running on top of it. Max drawdown is measured here, not actively defended against mid-simulation.
 - Uses raw Alpaca daily bars (adjustment=raw). ETF dividends/distributions (SPY/EFA/TLT all pay meaningful yields; GLD does not) are not included, so both the strategy's and the benchmarks' returns are price-return, not total-return. The relative comparison between strategy and benchmark is still apples-to-apples (both miss dividends the same way), but the absolute return numbers above are not real total-return figures, and "beats SPY" should be read as "beats SPY's raw price return," not necessarily its total return. A future research PR should switch to adjusted/total-return data before treating ETF rotation as a real income candidate.
-- Single momentum lookback (${DEFAULT_ETF_ROTATION_CONFIG.momentumLookbackDays} trading days) and a single trend filter (SMA${DEFAULT_ETF_ROTATION_CONFIG.trendFilterSmaPeriod}) - not a multi-timeframe blend. A documented MVP simplification, not a limitation discovered late.
+- Single momentum lookback (${config.momentumLookbackDays} trading days) and a single trend filter (SMA${config.trendFilterSmaPeriod}) - not a multi-timeframe blend. A documented MVP simplification, not a limitation discovered late.
 - One window, one run - not yet multi-window validated (docs/product/ROADMAP.md Phase 1's own standard). A multi-window companion is the natural next step before treating any result here as a real finding, same phased approach as backtest-portfolio.ts (single-window first, multi-window later).
 `;
 
@@ -542,15 +552,21 @@ ${scorecardMd}
 }
 
 async function main() {
+  const variantKey = resolveEtfRotationConfigVariant(process.env.ETF_ROTATION_CONFIG);
+  const { config, label: configLabel, validationStatus } = ETF_ROTATION_CONFIG_VARIANTS[variantKey];
+
   console.log(
-    `ETF rotation backtest: ${DEFAULT_ETF_ROTATION_CONFIG.universe.length} tickers (${DEFAULT_ETF_ROTATION_CONFIG.universe.join(", ")}) | Days: ${DAYS} | Starting capital: $${STARTING_CAPITAL}`,
+    `ETF rotation backtest: ${config.universe.length} tickers (${config.universe.join(", ")}) | Days: ${DAYS} | Starting capital: $${STARTING_CAPITAL}`,
   );
+  console.log(`Config variant: ${configLabel}`);
+  console.log(`Validation status: ${validationStatus}`);
   console.log("");
 
   const analysis = await runEtfRotationWindowAnalysis({
     label: "current",
     days: DAYS,
     endDaysAgo: END_DAYS_AGO,
+    config,
   });
 
   console.log(
@@ -583,8 +599,8 @@ async function main() {
   );
   console.log("");
 
-  await writeReport(analysis, "close_to_close");
-  await writeReport(analysis, "next_open");
+  await writeReport(analysis, "close_to_close", configLabel, validationStatus);
+  await writeReport(analysis, "next_open", configLabel, validationStatus);
 }
 
 main().catch((error: unknown) => {

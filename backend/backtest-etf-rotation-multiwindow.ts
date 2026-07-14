@@ -6,7 +6,10 @@ import {
   runEtfRotationWindowAnalysis,
   type EtfRotationWindowAnalysisResult,
 } from "./backtest-etf-rotation.js";
-import { DEFAULT_ETF_ROTATION_CONFIG } from "./etfRotationStrategy.js";
+import {
+  ETF_ROTATION_CONFIG_VARIANTS,
+  resolveEtfRotationConfigVariant,
+} from "./etfRotationStrategy.js";
 import {
   buildBenchmarkMetrics,
   buildScorecardMetrics,
@@ -72,9 +75,14 @@ function toCsv(rows: (string | number)[][]): string {
 }
 
 async function main() {
+  const variantKey = resolveEtfRotationConfigVariant(process.env.ETF_ROTATION_CONFIG);
+  const { config, label: configLabel, validationStatus } = ETF_ROTATION_CONFIG_VARIANTS[variantKey];
+
   console.log(
-    `ETF rotation multi-window validation: ${DEFAULT_ETF_ROTATION_CONFIG.universe.length} tickers, ${WINDOWS.length} windows`,
+    `ETF rotation multi-window validation: ${config.universe.length} tickers, ${WINDOWS.length} windows`,
   );
+  console.log(`Config variant: ${configLabel}`);
+  console.log(`Validation status: ${validationStatus}`);
   console.log(
     "Each window runs the close-to-close/next-open ablation - see backtest-etf-rotation.ts for what that does.",
   );
@@ -88,7 +96,7 @@ async function main() {
     console.log(
       `=== Running window: ${window.label} (requested days=${window.days}, endDaysAgo=${window.endDaysAgo}) ===`,
     );
-    const analysis = await runEtfRotationWindowAnalysis(window);
+    const analysis = await runEtfRotationWindowAnalysis({ ...window, config });
     console.log(
       `  Actual range: ${analysis.startDate} to ${analysis.endDate} (${analysis.simDays} simulated days)`,
     );
@@ -245,7 +253,17 @@ async function main() {
   );
 
   await fs.mkdir(REPORT_DIR, { recursive: true });
-  const summary = [toCsv(dragRows), "", toCsv(scorecardRows)].join("\n");
+  // A leading header block so this CSV is still self-describing if it's
+  // opened later, out of context, without the console output next to it -
+  // a table of numbers with no config label attached is exactly the kind
+  // of thing that gets misread as "the" result later.
+  const configHeader = toCsv([
+    ["config_variant", configLabel],
+    ["validation_status", validationStatus],
+  ]);
+  const summary = [configHeader, "", toCsv(dragRows), "", toCsv(scorecardRows)].join(
+    "\n",
+  );
   await fs.writeFile(
     path.join(REPORT_DIR, "etf-rotation-multiwindow-summary.csv"),
     summary,
