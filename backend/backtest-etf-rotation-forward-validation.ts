@@ -307,8 +307,9 @@ async function main() {
   // >= the anchor, so this gap should only ever be 0 (anchor was a trading
   // day) or positive (anchor fell on a weekend/holiday, so the sim starts on
   // the next trading day after it) - never negative. A negative value here
-  // would mean the override didn't take effect and no pre-anchor data
-  // leaked into the simulated window - printed regardless, not hidden.
+  // would mean the override failed to take effect and pre-anchor data DID
+  // leak into the simulated window (a real bug, not an accepted imprecision)
+  // - printed regardless, not hidden.
   const anchorMs = new Date(`${FORWARD_VALIDATION_ANCHOR_DATE}T00:00:00Z`).getTime();
   const startMs = new Date(`${baselineAnalysis.startDate}T00:00:00Z`).getTime();
   const startGapCalendarDays = Math.round((startMs - anchorMs) / MS_PER_DAY);
