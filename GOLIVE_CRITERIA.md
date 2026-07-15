@@ -28,6 +28,8 @@ The scheduled autopilot loop started running continuously on 2026-07-09 and is s
 - [ ] Portfolio circuit breaker (built 2026-07-11) has been observed tripping at least once and correctly blocking new BUYs while still allowing SELLs
 - [ ] If `AUTOPILOT_ALLOW_FRACTIONAL_SHARES` is enabled (built 2026-07-11, off by default): at least one fractional/notional BUY has gone through paper trading, and its cycle-based STOP_LOSS/TAKE_PROFIT exit (no broker-side bracket for these positions) has been observed firing correctly - this is a genuinely different exit mechanism than the whole-share bracket path and needs its own live verification, not just unit-test coverage
 
+These are trading-behavior gates. A separate, platform/ops-level checklist - deploy topology, restart/persistence behavior, order-idempotency durability, emergency stop - lives in `docs/ops/PAPER_INFRASTRUCTURE_GATE.md` and must also clear before `AUTOPILOT_EXECUTE_TRADES=true`, not just before live capital. As of 2026-07-15: circuit-breaker and order-idempotency restart persistence are code-fixed and regression-tested (simulated locally on real files, not yet observed against a real Render redeploy or a real order); the Render single-instance question is still open and can only be confirmed by looking at the Render dashboard, not from this repo.
+
 ### 4. Experimental filters excluded from the readiness decision
 - [ ] `AUTOPILOT_SENTIMENT_FILTER` and `AUTOPILOT_INSIDER_FILTER` are either left off, or their block events are tracked and evaluated separately from the core strategy's results
 - These signals cannot be backtested (the underlying APIs only return current data, not point-in-time history), so their effect on readiness must never be assumed positive by default.
