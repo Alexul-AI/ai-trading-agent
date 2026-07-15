@@ -40,11 +40,18 @@ export interface JournalDecision {
   ticker: string;
   timestamp: string;
   price: number;
-  rsi: number;
-  macdHistogram: number;
-  previousMacdHistogram: number;
-  bollingerLower: number;
-  bollingerUpper: number;
+  /**
+   * Optional as of the ETF Rotation integration - these are single-ticker
+   * confluence-scoring indicators (strategyEngine.ts) with no equivalent in
+   * a momentum/trend-filter rebalance decision (see etfRotationStrategy.ts's
+   * RotationTarget). Omitted entirely for rotation decisions rather than
+   * populated with misleading placeholder values.
+   */
+  rsi?: number;
+  macdHistogram?: number;
+  previousMacdHistogram?: number;
+  bollingerLower?: number;
+  bollingerUpper?: number;
   action: "BUY" | "SELL" | "HOLD";
   confidence: number;
   suggestedShares: number;

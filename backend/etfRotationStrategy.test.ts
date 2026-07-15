@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   computeMomentumReturnPercent,
+  computeRebalanceOrders,
   decideRotationTargets,
   isMonthlyRebalanceDate,
   passesTrendFilter,
@@ -9,6 +10,7 @@ import {
   ETF_ROTATION_MVP_BASELINE_CONFIG,
   ETF_ROTATION_HOLD3_CANDIDATE_CONFIG,
   type EtfRotationConfig,
+  type RotationTarget,
 } from "./etfRotationStrategy.js";
 
 describe("computeMomentumReturnPercent", () => {
@@ -199,6 +201,88 @@ describe("ETF_ROTATION_HOLD3_CANDIDATE_CONFIG", () => {
     );
     expect(ETF_ROTATION_HOLD3_CANDIDATE_CONFIG.trendFilterSmaPeriod).toBe(
       ETF_ROTATION_MVP_BASELINE_CONFIG.trendFilterSmaPeriod,
+    );
+  });
+});
+
+describe("computeRebalanceOrders", () => {
+  const universe = ["SPY", "QQQ", "EFA", "TLT", "GLD"];
+
+  it("sells everything currently held in the universe, before buying targets", () => {
+    const targets: RotationTarget[] = [{ ticker: "QQQ", weightPercent: 50 }];
+    const currentShares = new Map([
+      ["SPY", 10],
+      ["TLT", 5],
+    ]);
+    const prices = new Map([
+      ["SPY", 500],
+      ["TLT", 90],
+      ["QQQ", 400],
+    ]);
+
+    const orders = computeRebalanceOrders(
+      targets,
+      10000,
+      currentShares,
+      prices,
+      universe,
+    );
+
+    // Sells come first, in universe order.
+    expect(orders[0]).toEqual({ ticker: "SPY", action: "SELL", shares: 10 });
+    expect(orders[1]).toEqual({ ticker: "TLT", action: "SELL", shares: 5 });
+    // Then the buy, sized from equity * weightPercent / price, floored.
+    expect(orders[2]).toEqual({
+      ticker: "QQQ",
+      action: "BUY",
+      shares: 12, // floor(10000 * 0.5 / 400) = 12
+      targetWeightPercent: 50,
+    });
+  });
+
+  it("does not sell a ticker with zero current shares", () => {
+    const orders = computeRebalanceOrders(
+      [],
+      10000,
+      new Map([["SPY", 0]]),
+      new Map(),
+      universe,
+    );
+
+    expect(orders).toEqual([]);
+  });
+
+  it("skips a buy target with no known price rather than dividing by zero", () => {
+    const targets: RotationTarget[] = [{ ticker: "GLD", weightPercent: 100 }];
+
+    const orders = computeRebalanceOrders(
+      targets,
+      10000,
+      new Map(),
+      new Map(), // no price for GLD
+      universe,
+    );
+
+    expect(orders).toEqual([]);
+  });
+
+  it("skips a buy target that would floor to 0 shares", () => {
+    const targets: RotationTarget[] = [{ ticker: "GLD", weightPercent: 1 }];
+
+    const orders = computeRebalanceOrders(
+      targets,
+      100, // 1% of 100 = $1, GLD costs way more than that
+      new Map(),
+      new Map([["GLD", 250]]),
+      universe,
+    );
+
+    expect(orders).toEqual([]);
+  });
+
+  it("returns an empty array when there is nothing to sell and no targets", () => {
+    expect(computeRebalanceOrders([], 10000, new Map(), new Map(), universe)).toEqual(
+      [],
     );
   });
 });

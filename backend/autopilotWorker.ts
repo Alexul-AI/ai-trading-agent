@@ -14,6 +14,19 @@ import {
   appendAutopilotRun,
   createStrategyConfigHash,
 } from "./decisionJournal.js";
+import {
+  computeRebalanceOrders,
+  decideRotationTargets,
+  ETF_ROTATION_CONFIG_VARIANTS,
+  isMonthlyRebalanceDate,
+  resolveEtfRotationConfigVariant,
+  type EtfRotationConfig,
+  type RebalanceOrder,
+} from "./etfRotationStrategy.js";
+import {
+  getLastRebalanceDateKey,
+  recordRebalanceDateKey,
+} from "./etfRotationWorkerState.js";
 import { getNewsSentiment, getInsiderActivity } from "./agent.js";
 import {
   updatePortfolioCircuitBreaker,
@@ -126,11 +139,17 @@ export interface AutopilotDecisionLog {
   ticker: string;
   timestamp: string;
   price: number;
-  rsi: number;
-  macdHistogram: number;
-  previousMacdHistogram: number;
-  bollingerLower: number;
-  bollingerUpper: number;
+  /**
+   * Optional - single-ticker confluence-scoring indicators (strategyEngine.ts)
+   * with no equivalent for an ETF Rotation rebalance decision (see
+   * etfRotationStrategy.ts). Omitted for rotation decisions rather than
+   * populated with misleading placeholder values.
+   */
+  rsi?: number;
+  macdHistogram?: number;
+  previousMacdHistogram?: number;
+  bollingerLower?: number;
+  bollingerUpper?: number;
   action: StrategyDecision["action"];
   confidence: number;
   suggestedShares: number;
@@ -138,7 +157,8 @@ export interface AutopilotDecisionLog {
   /** Fractional-fallback dollar amount, set only when using notional sizing. */
   suggestedNotional?: number;
   originalSuggestedNotional?: number;
-  reasonType: StrategyDecision["reasonType"];
+  /** A plain string, not restricted to StrategyDecision's own reasonType union - the ETF Rotation path uses its own vocabulary (REBALANCE_BUY/REBALANCE_SELL/etc), matching decisionJournal.ts's JournalDecision.reasonType (also an unrestricted string). */
+  reasonType: string;
   reason: string;
   safetyNote?: string;
   finalStatus?: DecisionFinalStatus;
@@ -371,6 +391,42 @@ const STRATEGY_VERSION =
 
 const STRATEGY_CONFIG_HASH = createStrategyConfigHash(DEFAULT_STRATEGY_CONFIG);
 
+// Mutually exclusive with the baseline strategy above - never both in the
+// same process. See docs/product/ROADMAP.md Phase 3 and the ETF Rotation
+// live-integration plan: the baseline's 13-ticker universe and rotation's
+// 5-ETF universe overlap (SPY/EFA/TLT/GLD), and neither order idempotency
+// (server.ts's client_order_id, keyed only "TICKER:ACTION") nor position
+// tracking (ticker-keyed only, no strategy attribution) could safely
+// disambiguate two strategies trading the same ticker concurrently.
+export type AutopilotStrategyKind = "baseline" | "etf_rotation";
+
+const AUTOPILOT_STRATEGY: AutopilotStrategyKind =
+  process.env.AUTOPILOT_STRATEGY === "etf_rotation"
+    ? "etf_rotation"
+    : "baseline";
+
+const ETF_ROTATION_CONFIG_VARIANT_KEY = resolveEtfRotationConfigVariant(
+  process.env.ETF_ROTATION_CONFIG,
+);
+const ETF_ROTATION_ACTIVE_CONFIG: EtfRotationConfig =
+  ETF_ROTATION_CONFIG_VARIANTS[ETF_ROTATION_CONFIG_VARIANT_KEY].config;
+
+const ETF_ROTATION_STRATEGY_VERSION = `etf-rotation-${ETF_ROTATION_CONFIG_VARIANT_KEY}`;
+const ETF_ROTATION_STRATEGY_CONFIG_HASH = createStrategyConfigHash(
+  ETF_ROTATION_ACTIVE_CONFIG,
+);
+
+// Momentum(126 trading days) + SMA(200 trading days) need ~210 trading days
+// of runway before a decision is numerically valid (same WARMUP_BARS
+// convention as backtest-etf-rotation.ts) - far more than the baseline
+// path's 180-calendar-day default. 400 calendar days clears that with
+// weekend/holiday margin to spare.
+const AUTOPILOT_ETF_ROTATION_BARS_DAYS = Number.parseInt(
+  process.env.AUTOPILOT_ETF_ROTATION_BARS_DAYS || "400",
+  10,
+);
+const ETF_ROTATION_WARMUP_TRADING_DAYS = 210;
+
 function toIsoDate(date: Date): string {
   return date.toISOString().split("T")[0] ?? date.toISOString();
 }
@@ -569,14 +625,17 @@ export function isSignalReadyDecision(decision: AutopilotDecisionLog): boolean {
   );
 }
 
-async function fetchAlpacaBarsUncached(ticker: string): Promise<AlpacaBar[]> {
+async function fetchAlpacaBarsUncached(
+  ticker: string,
+  days: number = AUTOPILOT_BARS_DAYS,
+): Promise<AlpacaBar[]> {
   if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY) {
     throw new Error("Missing Alpaca API keys for market data.");
   }
 
   const endDate = new Date();
   const startDate = new Date();
-  startDate.setDate(endDate.getDate() - AUTOPILOT_BARS_DAYS);
+  startDate.setDate(endDate.getDate() - days);
 
   const allBars: AlpacaBar[] = [];
   let pageToken: string | undefined;
@@ -633,16 +692,24 @@ const barsCacheByTicker = new Map<
   { bars: AlpacaBar[]; fetchedAt: number }
 >();
 
-async function fetchAlpacaBars(ticker: string): Promise<AlpacaBar[]> {
-  const cached = barsCacheByTicker.get(ticker);
+// Cache key includes days since the ETF Rotation path fetches the same
+// tickers with a much longer warmup window than the baseline path - without
+// this, whichever call happened to run first this cycle would silently
+// serve its own days value's bars to the other.
+async function fetchAlpacaBars(
+  ticker: string,
+  days: number = AUTOPILOT_BARS_DAYS,
+): Promise<AlpacaBar[]> {
+  const cacheKey = `${ticker}:${days}`;
+  const cached = barsCacheByTicker.get(cacheKey);
 
   if (cached && Date.now() - cached.fetchedAt < BARS_CACHE_TTL_MS) {
     return cached.bars;
   }
 
-  const bars = await fetchAlpacaBarsUncached(ticker);
+  const bars = await fetchAlpacaBarsUncached(ticker, days);
 
-  barsCacheByTicker.set(ticker, { bars, fetchedAt: Date.now() });
+  barsCacheByTicker.set(cacheKey, { bars, fetchedAt: Date.now() });
 
   return bars;
 }
@@ -1211,6 +1278,227 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     );
   }
 
+  // ETF Rotation decision path (Stage 1: decision-only, see
+  // docs/product/ROADMAP.md Phase 3 and the ETF Rotation live-integration
+  // plan) - mutually exclusive with analyzeTicker's per-ticker baseline
+  // loop, never both in the same runOnce() call. Every decision this
+  // produces is journaled with executionStatus "dry_run" (BUY/SELL) or
+  // "not_attempted" (HOLD) unconditionally - this function never calls
+  // options.executeSafeTrade, by construction, regardless of
+  // AUTOPILOT_EXECUTE_TRADES/AUTOPILOT_ALLOW_BUY/AUTOPILOT_ALLOW_SELL.
+  async function runEtfRotationCycle(
+    portfolio: PortfolioSnapshot,
+  ): Promise<AutopilotDecisionLog[]> {
+    const config = ETF_ROTATION_ACTIVE_CONFIG;
+    const timestamp = new Date().toISOString();
+
+    const barsByTicker = new Map<string, AlpacaBar[]>();
+
+    await Promise.all(
+      config.universe.map(async (ticker) => {
+        barsByTicker.set(
+          ticker,
+          await fetchAlpacaBars(ticker, AUTOPILOT_ETF_ROTATION_BARS_DAYS),
+        );
+      }),
+    );
+
+    let latestDateKey: string | null = null;
+    const priceHistoryByTicker = new Map<string, number[]>();
+    const currentPriceByTicker = new Map<string, number>();
+
+    for (const ticker of config.universe) {
+      const bars = barsByTicker.get(ticker) ?? [];
+      const prices = bars.map((bar) => bar.c);
+      priceHistoryByTicker.set(ticker, prices);
+
+      const latestBar = bars[bars.length - 1];
+      if (latestBar) {
+        currentPriceByTicker.set(ticker, Number(latestBar.c.toFixed(2)));
+        const dateKey = latestBar.t.split("T")[0] ?? latestBar.t;
+        if (!latestDateKey || dateKey > latestDateKey) {
+          latestDateKey = dateKey;
+        }
+      }
+    }
+
+    if (!latestDateKey) {
+      throw new Error(
+        "ETF Rotation: no bars available for any universe ticker.",
+      );
+    }
+
+    const lastRebalanceDateKey = await getLastRebalanceDateKey();
+    const isRebalanceDay = isMonthlyRebalanceDate(
+      latestDateKey,
+      lastRebalanceDateKey,
+    );
+
+    if (!isRebalanceDay) {
+      return config.universe.map((ticker) => ({
+        ticker,
+        timestamp,
+        price: currentPriceByTicker.get(ticker) ?? 0,
+        action: "HOLD",
+        confidence: 0,
+        suggestedShares: 0,
+        reasonType: "NOT_REBALANCE_DAY",
+        reason: `Not a monthly rebalance day (latest bar ${latestDateKey}, last rebalance ${
+          lastRebalanceDateKey ?? "never"
+        }).`,
+        finalStatus: "hold",
+        signalStatus: "hold",
+        executionStatus: "not_attempted",
+        isSignalReady: false,
+        executed: false,
+      }));
+    }
+
+    // Fails closed (skips the rebalance rather than computing targets off
+    // partial history) if any universe ticker doesn't yet have enough bars
+    // for a numerically valid momentum/SMA read - same "don't trust a short
+    // window" principle as the RSI/MACD warmup fix elsewhere in this repo.
+    const insufficientHistoryTickers = config.universe.filter(
+      (ticker) =>
+        (priceHistoryByTicker.get(ticker)?.length ?? 0) <
+        ETF_ROTATION_WARMUP_TRADING_DAYS,
+    );
+
+    if (insufficientHistoryTickers.length > 0) {
+      return config.universe.map((ticker) => ({
+        ticker,
+        timestamp,
+        price: currentPriceByTicker.get(ticker) ?? 0,
+        action: "HOLD",
+        confidence: 0,
+        suggestedShares: 0,
+        reasonType: "NOT_REBALANCE_DAY",
+        reason: `Skipping rebalance: insufficient warmup history (need ${ETF_ROTATION_WARMUP_TRADING_DAYS} trading days) for ${insufficientHistoryTickers.join(
+          ", ",
+        )}.`,
+        finalStatus: "hold",
+        signalStatus: "hold",
+        executionStatus: "not_attempted",
+        isSignalReady: false,
+        executed: false,
+        skippedReason: "Insufficient warmup history.",
+      }));
+    }
+
+    const targets = decideRotationTargets(priceHistoryByTicker, config);
+
+    const currentSharesByTicker = new Map<string, number>();
+    for (const ticker of config.universe) {
+      const position = portfolio.positions[ticker];
+      if (position?.shares) {
+        currentSharesByTicker.set(ticker, position.shares);
+      }
+    }
+
+    const orders: RebalanceOrder[] = computeRebalanceOrders(
+      targets,
+      portfolio.equity,
+      currentSharesByTicker,
+      currentPriceByTicker,
+      config.universe,
+    );
+
+    // Recorded even though nothing executes yet (Stage 1) - the monthly
+    // gate's job is "did we already compute this month's targets," which is
+    // true as soon as targets are computed, independent of execution. Stage
+    // 2 will not need to change this.
+    await recordRebalanceDateKey(latestDateKey);
+
+    const targetByTicker = new Map(targets.map((target) => [target.ticker, target]));
+    const sellByTicker = new Map(
+      orders
+        .filter((order) => order.action === "SELL")
+        .map((order) => [order.ticker, order]),
+    );
+    const buyByTicker = new Map(
+      orders
+        .filter((order) => order.action === "BUY")
+        .map((order) => [order.ticker, order]),
+    );
+
+    return config.universe.map((ticker): AutopilotDecisionLog => {
+      const price = currentPriceByTicker.get(ticker) ?? 0;
+      const buyOrder = buyByTicker.get(ticker);
+      const sellOrder = sellByTicker.get(ticker);
+      const target = targetByTicker.get(ticker);
+
+      if (buyOrder) {
+        const reason = sellOrder
+          ? `Momentum/trend rebalance: continuing top pick at target weight ${target?.weightPercent.toFixed(
+              1,
+            )}% - liquidated ${sellOrder.shares} existing shares and rebuilt to ${
+              buyOrder.shares
+            } shares.`
+          : `Momentum/trend rebalance: new top pick at target weight ${target?.weightPercent.toFixed(
+              1,
+            )}% - buying ${buyOrder.shares} shares.`;
+
+        return {
+          ticker,
+          timestamp,
+          price,
+          action: "BUY",
+          confidence: 1,
+          suggestedShares: buyOrder.shares,
+          reasonType: "REBALANCE_BUY",
+          reason,
+          finalStatus: "signal_ready",
+          signalStatus: "ready",
+          executionStatus: "dry_run",
+          isSignalReady: true,
+          executionBlockReasonCategory: "dry_run",
+          executionBlockReasonCode: "ETF_ROTATION_STAGE_1_NO_EXECUTION",
+          executionBlockReasonDetail:
+            "ETF Rotation execution is not yet wired to order submission (Stage 1: decision-only).",
+          executed: false,
+        };
+      }
+
+      if (sellOrder) {
+        return {
+          ticker,
+          timestamp,
+          price,
+          action: "SELL",
+          confidence: 1,
+          suggestedShares: sellOrder.shares,
+          reasonType: "REBALANCE_SELL",
+          reason: `Momentum/trend rebalance: no longer a top pick or failed the trend filter - liquidating ${sellOrder.shares} shares.`,
+          finalStatus: "signal_ready",
+          signalStatus: "ready",
+          executionStatus: "dry_run",
+          isSignalReady: true,
+          executionBlockReasonCategory: "dry_run",
+          executionBlockReasonCode: "ETF_ROTATION_STAGE_1_NO_EXECUTION",
+          executionBlockReasonDetail:
+            "ETF Rotation execution is not yet wired to order submission (Stage 1: decision-only).",
+          executed: false,
+        };
+      }
+
+      return {
+        ticker,
+        timestamp,
+        price,
+        action: "HOLD",
+        confidence: 0,
+        suggestedShares: 0,
+        reasonType: "REBALANCE_HOLD",
+        reason: "Not currently held and not selected in this rebalance.",
+        finalStatus: "hold",
+        signalStatus: "hold",
+        executionStatus: "not_attempted",
+        isSignalReady: false,
+        executed: false,
+      };
+    });
+  }
+
   async function runOnce(trigger: "manual" | "scheduled" = "manual") {
     if (running) {
       return {
@@ -1262,9 +1550,13 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
 
     try {
       const portfolio = await options.getPortfolioSnapshot();
+      const universeForCycle =
+        AUTOPILOT_STRATEGY === "etf_rotation"
+          ? ETF_ROTATION_ACTIVE_CONFIG.universe
+          : AUTOPILOT_TICKERS;
       const tickers = Array.from(
         new Set([
-          ...AUTOPILOT_TICKERS,
+          ...universeForCycle,
           ...Object.keys(portfolio.positions).map((ticker) =>
             ticker.toUpperCase(),
           ),
@@ -1318,10 +1610,11 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       // below - every bucket-representative ticker (SPY, EFA, TLT, GLD,
       // AMD, NVDA, TSLA) is already part of AUTOPILOT_TICKERS, so this
       // reuses fetchAlpacaBars's existing cache rather than issuing new
-      // requests.
+      // requests. Baseline-strategy-only - the ETF Rotation path below has
+      // its own trend filter and doesn't use this.
       const regimeByBucketByDate = new Map<string, Map<string, RegimeState>>();
 
-      if (AUTOPILOT_REGIME_FILTER_ENABLED) {
+      if (AUTOPILOT_STRATEGY === "baseline" && AUTOPILOT_REGIME_FILTER_ENABLED) {
         const regimeBarsByTicker = new Map<string, AlpacaBar[]>();
         const bucketTickers = new Set(
           REGIME_BUCKETS.flatMap((bucket) => bucket.tickers),
@@ -1347,65 +1640,76 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         }
       }
 
-      // Each ticker's analysis only reads/writes its own per-ticker cache
-      // and cooldown entries (bars, sentiment, insider caches; lastBuyAt),
-      // and all of them read the same read-only portfolio snapshot and
-      // circuit breaker state - safe to run concurrently. Errors are caught
-      // per-ticker below so one failing ticker can never affect another or
-      // reject the batch.
-      decisions = await Promise.all(
-        tickers.map(async (ticker): Promise<AutopilotDecisionLog> => {
-          try {
-            const decision = await analyzeTicker(
-              ticker,
-              portfolio,
-              circuitBreakerUpdate.state,
-              regimeByBucketByDate,
-            );
+      if (AUTOPILOT_STRATEGY === "etf_rotation") {
+        decisions = await runEtfRotationCycle(portfolio);
 
-            options.broadcastSSE({
-              type: "autopilot_signal",
-              data: decision,
-            });
+        for (const decision of decisions) {
+          options.broadcastSSE({
+            type: "autopilot_signal",
+            data: decision,
+          });
+        }
+      } else {
+        // Each ticker's analysis only reads/writes its own per-ticker cache
+        // and cooldown entries (bars, sentiment, insider caches; lastBuyAt),
+        // and all of them read the same read-only portfolio snapshot and
+        // circuit breaker state - safe to run concurrently. Errors are caught
+        // per-ticker below so one failing ticker can never affect another or
+        // reject the batch.
+        decisions = await Promise.all(
+          tickers.map(async (ticker): Promise<AutopilotDecisionLog> => {
+            try {
+              const decision = await analyzeTicker(
+                ticker,
+                portfolio,
+                circuitBreakerUpdate.state,
+                regimeByBucketByDate,
+              );
 
-            return decision;
-          } catch (error) {
-            const message = getErrorMessage(error);
+              options.broadcastSSE({
+                type: "autopilot_signal",
+                data: decision,
+              });
 
-            const failedDecision: AutopilotDecisionLog = {
-              ticker,
-              timestamp: new Date().toISOString(),
-              price: 0,
-              rsi: 0,
-              macdHistogram: 0,
-              previousMacdHistogram: 0,
-              bollingerLower: 0,
-              bollingerUpper: 0,
-              action: "HOLD",
-              confidence: 0,
-              suggestedShares: 0,
-              reasonType: "NO_SIGNAL",
-              reason: `Autopilot analysis failed for ${ticker}: ${message}`,
-              finalStatus: "error",
-              signalStatus: "blocked",
-              executionStatus: "not_attempted",
-              isSignalReady: false,
-              blockReasonCategory: "error",
-              blockReasonCode: "ANALYSIS_ERROR",
-              blockReasonDetail: message,
-              executed: false,
-              skippedReason: message,
-            };
+              return decision;
+            } catch (error) {
+              const message = getErrorMessage(error);
 
-            options.broadcastSSE({
-              type: "autopilot_signal_error",
-              data: failedDecision,
-            });
+              const failedDecision: AutopilotDecisionLog = {
+                ticker,
+                timestamp: new Date().toISOString(),
+                price: 0,
+                rsi: 0,
+                macdHistogram: 0,
+                previousMacdHistogram: 0,
+                bollingerLower: 0,
+                bollingerUpper: 0,
+                action: "HOLD",
+                confidence: 0,
+                suggestedShares: 0,
+                reasonType: "NO_SIGNAL",
+                reason: `Autopilot analysis failed for ${ticker}: ${message}`,
+                finalStatus: "error",
+                signalStatus: "blocked",
+                executionStatus: "not_attempted",
+                isSignalReady: false,
+                blockReasonCategory: "error",
+                blockReasonCode: "ANALYSIS_ERROR",
+                blockReasonDetail: message,
+                executed: false,
+                skippedReason: message,
+              };
 
-            return failedDecision;
-          }
-        }),
-      );
+              options.broadcastSSE({
+                type: "autopilot_signal_error",
+                data: failedDecision,
+              });
+
+              return failedDecision;
+            }
+          }),
+        );
+      }
 
       lastDecisions = decisions;
       lastRunAt = new Date().toISOString();
@@ -1495,12 +1799,17 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           signalBlockedCount: runSignalBlockedCount,
           dryRunCount: runDryRunCount,
           executedCount: runExecutedCount,
-          strategyVersion: STRATEGY_VERSION,
-          strategyConfigHash: STRATEGY_CONFIG_HASH,
-          strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<
-            string,
-            unknown
-          >,
+          strategyVersion:
+            AUTOPILOT_STRATEGY === "etf_rotation"
+              ? ETF_ROTATION_STRATEGY_VERSION
+              : STRATEGY_VERSION,
+          strategyConfigHash:
+            AUTOPILOT_STRATEGY === "etf_rotation"
+              ? ETF_ROTATION_STRATEGY_CONFIG_HASH
+              : STRATEGY_CONFIG_HASH,
+          strategyConfig: (AUTOPILOT_STRATEGY === "etf_rotation"
+            ? ETF_ROTATION_ACTIVE_CONFIG
+            : DEFAULT_STRATEGY_CONFIG) as unknown as Record<string, unknown>,
           decisions,
         });
 
@@ -1604,15 +1913,23 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       allowBuy: AUTOPILOT_ALLOW_BUY,
       allowSell: AUTOPILOT_ALLOW_SELL,
       tradeMode: options.tradeMode,
-      strategyVersion: STRATEGY_VERSION,
-      strategyConfigHash: STRATEGY_CONFIG_HASH,
-      strategyConfig: DEFAULT_STRATEGY_CONFIG as unknown as Record<
-        string,
-        unknown
-      >,
+      strategyVersion:
+        AUTOPILOT_STRATEGY === "etf_rotation"
+          ? ETF_ROTATION_STRATEGY_VERSION
+          : STRATEGY_VERSION,
+      strategyConfigHash:
+        AUTOPILOT_STRATEGY === "etf_rotation"
+          ? ETF_ROTATION_STRATEGY_CONFIG_HASH
+          : STRATEGY_CONFIG_HASH,
+      strategyConfig: (AUTOPILOT_STRATEGY === "etf_rotation"
+        ? ETF_ROTATION_ACTIVE_CONFIG
+        : DEFAULT_STRATEGY_CONFIG) as unknown as Record<string, unknown>,
       running,
       intervalMs: AUTOPILOT_INTERVAL_MS,
-      tickers: AUTOPILOT_TICKERS,
+      tickers:
+        AUTOPILOT_STRATEGY === "etf_rotation"
+          ? ETF_ROTATION_ACTIVE_CONFIG.universe
+          : AUTOPILOT_TICKERS,
       minConfidence: AUTOPILOT_MIN_CONFIDENCE,
       maxSellFraction: clampFraction(AUTOPILOT_MAX_SELL_FRACTION),
       blockSellBelowAverageEntry: AUTOPILOT_BLOCK_SELL_BELOW_AVG,

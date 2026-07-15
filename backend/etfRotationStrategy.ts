@@ -201,3 +201,59 @@ export function decideRotationTargets(
     weightPercent: weightPercentPerSlot,
   }));
 }
+
+export interface RebalanceOrder {
+  ticker: string;
+  action: "BUY" | "SELL";
+  shares: number;
+  /** The target's weightPercent for a BUY (undefined for a SELL, which always fully liquidates). */
+  targetWeightPercent?: number;
+}
+
+/**
+ * Translates a target allocation (from decideRotationTargets) into concrete
+ * BUY/SELL share orders, given the current portfolio - pure, no I/O, so the
+ * live worker and any future test can call it the same way.
+ *
+ * Full liquidate-then-rebuy, matching backtest-etf-rotation.ts's own
+ * documented simplification (simpler to reason about than delta-only
+ * trading, at the cost of some extra round-trip trades for a ticker that
+ * happens to stay in both the old and new target set) - live and backtest
+ * should behave the same way for the same inputs, not silently diverge.
+ * Returns SELLs before BUYs in the array (the order the caller should
+ * execute them in) so a SELL's freed cash is available for a later BUY.
+ */
+export function computeRebalanceOrders(
+  targets: RotationTarget[],
+  currentEquity: number,
+  currentSharesByTicker: Map<string, number>,
+  currentPriceByTicker: Map<string, number>,
+  universe: string[],
+): RebalanceOrder[] {
+  const orders: RebalanceOrder[] = [];
+
+  for (const ticker of universe) {
+    const shares = currentSharesByTicker.get(ticker) ?? 0;
+    if (shares > 0) {
+      orders.push({ ticker, action: "SELL", shares });
+    }
+  }
+
+  for (const target of targets) {
+    const price = currentPriceByTicker.get(target.ticker) ?? 0;
+    if (price <= 0) continue;
+
+    const targetDollars = (target.weightPercent / 100) * currentEquity;
+    const shares = Math.floor(targetDollars / price);
+    if (shares <= 0) continue;
+
+    orders.push({
+      ticker: target.ticker,
+      action: "BUY",
+      shares,
+      targetWeightPercent: target.weightPercent,
+    });
+  }
+
+  return orders;
+}
