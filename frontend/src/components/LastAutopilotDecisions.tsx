@@ -47,8 +47,10 @@ export function LastAutopilotDecisions({
                     </span>
                   </div>
                   <div className="text-[10px] text-slate-500 mt-1">
-                    RSI {decision.rsi} · MACD {decision.macdHistogram} · price{" "}
-                    {formatMoney(decision.price)}
+                    {decision.rsi !== undefined
+                      ? `RSI ${decision.rsi} · MACD ${decision.macdHistogram} · `
+                      : ""}
+                    price {formatMoney(decision.price)}
                   </div>
                 </div>
 

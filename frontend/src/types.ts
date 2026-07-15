@@ -6,7 +6,14 @@ export type ReasonType =
   | "STOP_LOSS"
   | "TAKE_PROFIT"
   | "NO_SIGNAL"
-  | "RISK_LIMIT";
+  | "RISK_LIMIT"
+  // ETF Rotation's own vocabulary (backend/etfRotationStrategy.ts) - a
+  // monthly-rebalance decision has no equivalent to the single-ticker
+  // confluence-scoring reasons above.
+  | "REBALANCE_BUY"
+  | "REBALANCE_SELL"
+  | "REBALANCE_HOLD"
+  | "NOT_REBALANCE_DAY";
 
 export interface Position {
   shares: number;
@@ -85,11 +92,13 @@ export interface AutopilotDecision {
   ticker: string;
   timestamp: string;
   price: number;
-  rsi: number;
-  macdHistogram: number;
-  previousMacdHistogram: number;
-  bollingerLower: number;
-  bollingerUpper: number;
+  // Optional - ETF Rotation rebalance decisions have no single-ticker
+  // indicator equivalent (see ReasonType's REBALANCE_* values above).
+  rsi?: number;
+  macdHistogram?: number;
+  previousMacdHistogram?: number;
+  bollingerLower?: number;
+  bollingerUpper?: number;
   action: SignalAction;
   confidence: number;
   suggestedShares: number;
