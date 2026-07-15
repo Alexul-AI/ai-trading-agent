@@ -1,10 +1,18 @@
+import { promises as fs } from "fs";
+import os from "os";
+import path from "path";
+
 import { describe, expect, it } from "vitest";
 
 import {
   applyStickyTrip,
   evaluatePortfolioDrawdown,
   findPeakSinceTracking,
+  getPortfolioCircuitBreakerState,
+  resetPortfolioCircuitBreaker,
   shouldSendDailyReminder,
+  updatePortfolioCircuitBreaker,
+  type CircuitBreakerState,
 } from "./portfolioCircuitBreaker.js";
 
 describe("applyStickyTrip", () => {
@@ -154,5 +162,99 @@ describe("shouldSendDailyReminder", () => {
     expect(shouldSendDailyReminder(false, "2026-07-13", "2026-07-14")).toBe(
       false,
     );
+  });
+});
+
+describe("circuit breaker restart persistence", () => {
+  async function withTempStateFile(
+    run: (filePath: string) => Promise<void>,
+  ): Promise<void> {
+    const dir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "circuit-breaker-test-"),
+    );
+    const filePath = path.join(dir, "circuit-breaker-state.json");
+    try {
+      await run(filePath);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  async function writeTrippedFixture(
+    filePath: string,
+    overrides: Partial<CircuitBreakerState> = {},
+  ): Promise<CircuitBreakerState> {
+    const fixture: CircuitBreakerState = {
+      trackingStartDate: "2026-06-01T00:00:00.000Z",
+      peakEquity: 100000,
+      peakEquityAt: "2026-07-01T00:00:00.000Z",
+      tripped: true,
+      trippedAt: "2026-07-10T00:00:00.000Z",
+      dataStale: false,
+      lastReminderSentDate: "2026-07-14",
+      ...overrides,
+    };
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, JSON.stringify(fixture), "utf-8");
+    return fixture;
+  }
+
+  it("the restart scenario: a tripped state left by a previous process is read back exactly, nothing lost", async () => {
+    await withTempStateFile(async (filePath) => {
+      const fixture = await writeTrippedFixture(filePath);
+
+      // A fresh process ("after restart") reads the state a prior process left.
+      const state = await getPortfolioCircuitBreakerState(filePath);
+
+      expect(state).toEqual(fixture);
+    });
+  });
+
+  it("a restart does not un-trip the breaker even when a fresh evaluation would say equity has recovered", async () => {
+    await withTempStateFile(async (filePath) => {
+      await writeTrippedFixture(filePath);
+
+      // Equity is now back above the peak - evaluatePortfolioDrawdown alone
+      // would report tripped=false - but the sticky rule must still win
+      // after a restart, not just within one process's lifetime.
+      const recoveredEquity = 150000;
+      const fetchEquityHistoryStub = async () => [];
+
+      const result = await updatePortfolioCircuitBreaker(
+        recoveredEquity,
+        fetchEquityHistoryStub,
+        filePath,
+      );
+
+      expect(result.state.tripped).toBe(true);
+      expect(result.justTripped).toBe(false);
+      // trippedAt must be preserved from before the restart, not overwritten
+      // with "now" just because this process re-evaluated it.
+      expect(result.state.trippedAt).toBe("2026-07-10T00:00:00.000Z");
+    });
+  });
+
+  it("reset clears the tripped state left by a previous process, including the reminder cadence", async () => {
+    await withTempStateFile(async (filePath) => {
+      await writeTrippedFixture(filePath);
+
+      const resetState = await resetPortfolioCircuitBreaker(120000, filePath);
+
+      expect(resetState.tripped).toBe(false);
+      expect(resetState.trippedAt).toBeNull();
+      expect(resetState.lastReminderSentDate).toBeNull();
+
+      // Confirm the reset actually landed on disk, not just in the
+      // in-memory return value.
+      const onDisk = await getPortfolioCircuitBreakerState(filePath);
+      expect(onDisk).toEqual(resetState);
+    });
+  });
+
+  it("starts clean (null) when no state file exists yet, same as a brand-new deployment", async () => {
+    await withTempStateFile(async (filePath) => {
+      const state = await getPortfolioCircuitBreakerState(filePath);
+      expect(state).toBeNull();
+    });
   });
 });
