@@ -21,7 +21,7 @@ import {
 import { appendCircuitBreakerAuditEvent } from "./circuitBreakerAuditLog.js";
 import {
   classifyOrderError,
-  createClientOrderIdTracker,
+  createPersistedClientOrderIdTracker,
   type AlpacaErrorLike,
 } from "./orderIdempotency.js";
 import { createAdminAuth } from "./src/auth/adminAuth.js";
@@ -221,8 +221,12 @@ let transactionHistory: Array<{
 
 // Kept alive for this process's lifetime (see orderIdempotency.ts) - a
 // client_order_id for a given ticker+action is held until we get a
-// definitive outcome, not regenerated per call.
-const clientOrderIdTracker = createClientOrderIdTracker();
+// definitive outcome, not regenerated per call. Persisted to
+// data/order-idempotency-state.json so a pending ambiguous-error entry
+// survives a restart instead of letting a retry mint a fresh id that
+// Alpaca's own dedup can't catch (docs/ops/PAPER_INFRASTRUCTURE_GATE.md
+// item 4).
+const clientOrderIdTracker = await createPersistedClientOrderIdTracker();
 
 const sseClients = new Set<Response>();
 
@@ -531,7 +535,7 @@ async function executeSafeTrade(
     const finalShares = riskResult.adjustedShares;
     const finalNotional = riskResult.adjustedNotional;
 
-    const clientOrderId = clientOrderIdTracker.getOrCreate(ticker, action);
+    const clientOrderId = await clientOrderIdTracker.getOrCreate(ticker, action);
 
     const orderPayload: UnknownRecord = {
       symbol: ticker,
@@ -588,7 +592,7 @@ async function executeSafeTrade(
 
     try {
       createdOrder = asRecord(await alpaca.createOrder(orderPayload));
-      clientOrderIdTracker.clear(ticker, action);
+      await clientOrderIdTracker.clear(ticker, action);
     } catch (orderError) {
       const classification = classifyOrderError(
         orderError as AlpacaErrorLike,
@@ -601,12 +605,12 @@ async function executeSafeTrade(
         createdOrder = asRecord(
           await alpaca.getOrderByClientId(clientOrderId),
         );
-        clientOrderIdTracker.clear(ticker, action);
+        await clientOrderIdTracker.clear(ticker, action);
       } else if (classification === "definitive_rejection") {
         // A real problem with the order itself - retrying the identical
         // request won't fix it, safe to free up this ticker+action for a
         // fresh attempt.
-        clientOrderIdTracker.clear(ticker, action);
+        await clientOrderIdTracker.clear(ticker, action);
         throw orderError;
       } else {
         // Ambiguous network error (timeout, DNS, connection reset) - we

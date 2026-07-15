@@ -17,7 +17,7 @@ gaps. It does not change any code, threshold, or execution behavior.
 | 1 | One worker instance | ❓ Not verifiable from the repo — needs a Render dashboard check |
 | 2 | Persistent disk behavior | ⚠️ Partially confirmed (see below) |
 | 3 | Restart with circuit breaker tripped | ⚠️ Unit-tested only, never observed against a real restart |
-| 4 | Restart with pending/ambiguous order | ❌ Real gap found — see below |
+| 4 | Restart with pending/ambiguous order | ✅ Fixed 2026-07-15 — see below |
 | 5 | Audit/journal survives deploy | ✅ Empirically confirmed |
 | 6 | Alerts work after restart | ⚠️ Should work (state-backed), never observed live |
 | 7 | No duplicate worker cycles | ⚠️ Logic exists and is tested, contingent on item 1 |

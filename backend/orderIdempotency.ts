@@ -1,4 +1,6 @@
 import { randomUUID } from "crypto";
+import { promises as fs } from "fs";
+import path from "path";
 
 export type OrderErrorClassification =
   | "duplicate_client_order_id"
@@ -52,6 +54,8 @@ export function classifyOrderError(
 export interface ClientOrderIdTracker {
   getOrCreate(ticker: string, action: string): string;
   clear(ticker: string, action: string): void;
+  /** Current pending entries, keyed "TICKER:ACTION" -> client_order_id - for persistence, not decision logic. */
+  snapshot(): Record<string, string>;
 }
 
 // Factory, not a module-level singleton, so tests don't share state across
@@ -62,8 +66,14 @@ export interface ClientOrderIdTracker {
 // same-cycle-signal retry safe: a later attempt for the same logical trade
 // reuses the earlier attempt's ID rather than minting a new one, so if the
 // original actually landed at the broker, Alpaca's own dedup catches it.
-export function createClientOrderIdTracker(): ClientOrderIdTracker {
-  const pendingByKey = new Map<string, string>();
+//
+// `initialState` hydrates the in-memory map from a previous run (see
+// createPersistedClientOrderIdTracker below) - defaults to empty so every
+// existing call site/test is unaffected.
+export function createClientOrderIdTracker(
+  initialState: Record<string, string> = {},
+): ClientOrderIdTracker {
+  const pendingByKey = new Map<string, string>(Object.entries(initialState));
 
   function key(ticker: string, action: string): string {
     return `${ticker.toUpperCase()}:${action.toUpperCase()}`;
@@ -82,6 +92,77 @@ export function createClientOrderIdTracker(): ClientOrderIdTracker {
     },
     clear(ticker: string, action: string): void {
       pendingByKey.delete(key(ticker, action));
+    },
+    snapshot(): Record<string, string> {
+      return Object.fromEntries(pendingByKey);
+    },
+  };
+}
+
+const DATA_DIR = path.resolve(process.cwd(), "data");
+const STATE_FILE = path.join(DATA_DIR, "order-idempotency-state.json");
+
+// Same fail-soft convention as portfolioCircuitBreaker.ts's readState - a
+// missing or corrupt file just means "nothing pending," not an error.
+async function readPersistedState(
+  filePath: string = STATE_FILE,
+): Promise<Record<string, string>> {
+  try {
+    const raw = await fs.readFile(filePath, "utf-8");
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, string>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writePersistedState(
+  state: Record<string, string>,
+  filePath: string = STATE_FILE,
+): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, JSON.stringify(state, null, 2), "utf-8");
+}
+
+export interface AsyncClientOrderIdTracker {
+  getOrCreate(ticker: string, action: string): Promise<string>;
+  clear(ticker: string, action: string): Promise<void>;
+  snapshot(): Record<string, string>;
+}
+
+// Wraps the pure in-memory tracker with disk persistence, so a pending
+// ambiguous-error client_order_id survives a process restart (the gap
+// flagged in docs/ops/PAPER_INFRASTRUCTURE_GATE.md item 4 - a restart
+// during that window used to wipe the in-memory record, letting a retry
+// mint a fresh client_order_id that Alpaca's own dedup can't catch).
+//
+// getOrCreate/clear are async and *await* the disk write before returning -
+// not fire-and-forget - because the durability guarantee only holds if the
+// write has actually landed before the caller proceeds to submit the order.
+//
+// `filePath` defaults to the real state file; server.ts never overrides it.
+// The override exists solely so tests can point this at a real temp file
+// instead of mocking fs or mutating global process.cwd().
+export async function createPersistedClientOrderIdTracker(
+  filePath: string = STATE_FILE,
+): Promise<AsyncClientOrderIdTracker> {
+  const initialState = await readPersistedState(filePath);
+  const tracker = createClientOrderIdTracker(initialState);
+
+  return {
+    async getOrCreate(ticker: string, action: string): Promise<string> {
+      const id = tracker.getOrCreate(ticker, action);
+      await writePersistedState(tracker.snapshot(), filePath);
+      return id;
+    },
+    async clear(ticker: string, action: string): Promise<void> {
+      tracker.clear(ticker, action);
+      await writePersistedState(tracker.snapshot(), filePath);
+    },
+    snapshot(): Record<string, string> {
+      return tracker.snapshot();
     },
   };
 }
