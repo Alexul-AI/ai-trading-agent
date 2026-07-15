@@ -112,6 +112,26 @@ describe("etfRotationOrderAuditLog", () => {
 
     expect(events).toHaveLength(1);
   });
+
+  it("round-trips a REBALANCE_MANUALLY_CLEARED lifecycle event alongside order-leg events", async () => {
+    const orderEvent = makeEvent({ ticker: "SPY", side: "BUY" });
+    const clearEvent: EtfRotationOrderAuditEvent = {
+      type: "REBALANCE_MANUALLY_CLEARED",
+      timestamp: new Date(2026, 0, 2).toISOString(),
+      rebalanceMonthKey: "2026-01",
+      configVariantKey: "baseline-2",
+      reason: "Confirmed via Alpaca dashboard that the SELL filled and the BUY never submitted - safe to clear.",
+    };
+
+    await appendEtfRotationOrderAuditEvent(orderEvent, tmpFile);
+    await appendEtfRotationOrderAuditEvent(clearEvent, tmpFile);
+
+    const events = await readEtfRotationOrderAuditLog(100, tmpFile);
+
+    expect(events[0]).toEqual(clearEvent);
+    expect(events[0]!.ticker).toBeUndefined();
+    expect(events[0]!.reason).toContain("safe to clear");
+  });
 });
 
 describe("deriveLegType", () => {

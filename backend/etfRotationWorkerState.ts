@@ -47,6 +47,8 @@ export interface EtfRotationWorkerState {
    */
   rebalanceMonthKey?: string;
   status?: RebalanceStatus;
+  /** Which named config variant (e.g. "baseline-2") this cycle was computed under. */
+  configVariantKey?: string;
   startedAt?: string;
   completedAt?: string;
   /** The RebalanceOrder[] computed for the in-progress/most recent cycle. */
@@ -82,6 +84,55 @@ async function writeState(
   await fs.writeFile(filePath, JSON.stringify(state, null, 2), "utf-8");
 }
 
+export interface RebalanceStateReadResult {
+  state: EtfRotationWorkerState;
+  /**
+   * True when the state file exists but could not be trusted (unparseable
+   * JSON, unexpected shape, or any read error other than "file doesn't
+   * exist yet"). Distinct from a missing file (a normal, safe first-ever
+   * run - "corrupt" is false in that case). getLastRebalanceDateKey/
+   * getRebalanceState above are fine to stay fail-soft for Stage 1's
+   * decision-only read; a future execution-wiring path must use this
+   * instead and fail closed (do not start a new rebalance attempt) when
+   * `corrupt` is true, per docs/ops/ETF_ROTATION_PAPER_EXECUTION_PLAN.md.
+   */
+  corrupt: boolean;
+}
+
+export async function readRebalanceStateStrict(
+  filePath: string = STATE_FILE,
+): Promise<RebalanceStateReadResult> {
+  let raw: string;
+
+  try {
+    raw = await fs.readFile(filePath, "utf-8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return { state: { lastRebalanceDateKey: null }, corrupt: false };
+    }
+
+    // Any other read error (permissions, I/O failure, etc.) - fail closed
+    // rather than silently returning a fresh default.
+    return { state: { lastRebalanceDateKey: null }, corrupt: true };
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(raw);
+
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      "lastRebalanceDateKey" in parsed
+    ) {
+      return { state: parsed as EtfRotationWorkerState, corrupt: false };
+    }
+
+    return { state: { lastRebalanceDateKey: null }, corrupt: true };
+  } catch {
+    return { state: { lastRebalanceDateKey: null }, corrupt: true };
+  }
+}
+
 export async function getLastRebalanceDateKey(
   filePath: string = STATE_FILE,
 ): Promise<string | null> {
@@ -113,6 +164,7 @@ export async function recordRebalancePlanned(
   params: {
     dateKey: string;
     rebalanceMonthKey: string;
+    configVariantKey: string;
     targets: RotationTarget[];
     plannedOrders: RebalanceOrder[];
   },
@@ -122,6 +174,7 @@ export async function recordRebalancePlanned(
     {
       lastRebalanceDateKey: params.dateKey,
       rebalanceMonthKey: params.rebalanceMonthKey,
+      configVariantKey: params.configVariantKey,
       status: "planned",
       startedAt: new Date().toISOString(),
       targets: params.targets,

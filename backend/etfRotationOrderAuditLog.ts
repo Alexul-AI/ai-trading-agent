@@ -6,16 +6,23 @@ const AUDIT_LOG_FILE = path.join(DATA_DIR, "etf-rotation-order-audit.jsonl");
 
 // Per docs/ops/ETF_ROTATION_PAPER_EXECUTION_PLAN.md §7 - a new schema, not a
 // reuse of circuitBreakerAuditLog.ts's event types (which are breaker-
-// lifecycle-specific: tripped/reminder/reset). This is order-execution-leg
-// scoped instead: one event per BUY/SELL leg submitted for a rebalance, so a
-// case like "SELL succeeded, BUY failed" is visible after the fact. The
-// per-ticker decisionJournal.ts row stays a decision-level summary,
-// unchanged - this is a new, separate, execution-level layer underneath it.
+// lifecycle-specific: tripped/reminder/reset). Primarily order-execution-leg
+// scoped: one event per BUY/SELL leg submitted for a rebalance, so a case
+// like "SELL succeeded, BUY failed" is visible after the fact. The per-ticker
+// decisionJournal.ts row stays a decision-level summary, unchanged - this is
+// a new, separate, execution-level layer underneath it.
+//
+// REBALANCE_MANUALLY_CLEARED is the one exception - a rebalance-cycle
+// lifecycle event (a human clearing a failed_needs_review cycle, design doc
+// §11's Stage 2A resolution), not an order leg. Kept in this same log/reader
+// rather than a separate file so a review UI can show one merged timeline
+// instead of stitching two JSONL files together by timestamp.
 export type EtfRotationOrderAuditEventType =
   | "ORDER_SUBMITTED"
   | "ORDER_FILLED"
   | "ORDER_REJECTED"
-  | "ORDER_AMBIGUOUS";
+  | "ORDER_AMBIGUOUS"
+  | "REBALANCE_MANUALLY_CLEARED";
 
 // Audit-only classification of why a leg exists - never drives any
 // execution decision (design doc §11's Stage 2A resolution). Derived at
@@ -32,14 +39,20 @@ export interface EtfRotationOrderAuditEvent {
   timestamp: string;
   rebalanceMonthKey: string;
   configVariantKey: string;
-  ticker: string;
-  side: "BUY" | "SELL";
-  legType: EtfRotationOrderLegType;
-  requestedQty: number;
+  // Order-leg fields - present for ORDER_* events, absent for
+  // REBALANCE_MANUALLY_CLEARED (which isn't about one specific ticker/leg).
+  ticker?: string;
+  side?: "BUY" | "SELL";
+  legType?: EtfRotationOrderLegType;
+  requestedQty?: number;
   submittedQty?: number;
   clientOrderId?: string;
   brokerOrderId?: string;
   error?: string;
+  // Only meaningful (and only ever populated) for REBALANCE_MANUALLY_CLEARED
+  // - the whole point of a manual-only clear is that it always has one,
+  // mirroring circuitBreakerAuditLog.ts's CIRCUIT_BREAKER_RESET convention.
+  reason?: string;
 }
 
 /**
