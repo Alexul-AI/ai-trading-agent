@@ -14,31 +14,45 @@ gaps. It does not change any code, threshold, or execution behavior.
 
 | # | Item | Status |
 |---|---|---|
-| 1 | One worker instance | ❓ Not verifiable from the repo — needs a Render dashboard check |
-| 2 | Persistent disk behavior | ⚠️ Partially confirmed (see below) |
+| 1 | One worker instance | ✅ Confirmed 2026-07-15 — structurally guaranteed, not just observed (see below) |
+| 2 | Persistent disk behavior | ✅ Confirmed 2026-07-15 |
 | 3 | Restart with circuit breaker tripped | ✅ Restart-regression tested 2026-07-15 (simulated locally, not observed in a real production trip) |
 | 4 | Restart with pending/ambiguous order | ✅ Code-fixed + restart-regression tested (PR #34); live-fire verification deferred to first real paper execution |
 | 5 | Audit/journal survives deploy | ✅ Empirically confirmed |
 | 6 | Alerts work after restart | ⚠️ Should work (state-backed), never observed live |
-| 7 | No duplicate worker cycles | ⚠️ Logic exists and is tested, contingent on item 1 |
+| 7 | No duplicate worker cycles | ✅ Confirmed 2026-07-15 — item 1's guarantee resolves this |
 | 8 | Emergency stop documented | ✅ See `EMERGENCY_STOP.md` |
 
 ## 1. One worker instance
 
-Not something the code can confirm on its own — no `render.yaml`, `Procfile`,
-or other deploy-config file exists in this repository (checked root and
-`backend/`); the Render service is configured entirely through Render's
-dashboard.
+**Confirmed 2026-07-15, via the Render dashboard (Scaling panel)**: not just
+"currently 1 instance," but a **structural** guarantee - the dashboard
+states outright, "Scaling is not supported for servers with disks." This
+service (`ai-trading-agent`, Web Service, Node, Starter plan) has a
+persistent disk attached, so Render itself disallows running more than one
+instance as long as that disk stays attached. This is a stronger guarantee
+than an observed-today setting - it can't silently drift to multi-instance
+without someone first deliberately detaching the disk (which would also
+break every persistence assumption in items 2/3/4/5, so it's not something
+that could happen unnoticed).
 
-**How to verify**: in the Render dashboard, open the backend service →
-confirm its plan/scaling settings show exactly 1 instance (not autoscaling,
-not multiple instances). This matters because every safety mechanism below
-that says "same-host only" (the worker lock, the in-memory order-idempotency
-tracker) provides **zero** protection if Render ever runs more than one
-instance of this service with separate memory/disk.
+This matters because every safety mechanism elsewhere in this document that
+says "same-host only" (the worker lock, the order-idempotency tracker) was
+previously an unverified assumption - it's now a confirmed, structurally
+enforced one.
 
-**Status**: open until someone actually looks at the dashboard and records
-the answer here.
+**Same dashboard check also confirmed the environment variables that matter
+most here**: `TRADE_MODE=paper`, `ALLOW_MANUAL_TRADES=false`, and
+`AUTOPILOT_EXECUTE_TRADES` not set at all (which the code treats as `false`,
+since it only enables on an exact `"true"` string match) - consistent with
+every hard boundary in `CLAUDE.md`.
+
+**Caveat worth carrying forward**: if this service is ever scaled for
+availability/performance reasons in the future, the disk would need to come
+off first - at which point items 1, 2, 3, 4, 5, and 7 all need to be
+re-examined from scratch (the whole local-disk state-file design assumes
+single-instance). Not a concern today, but worth flagging so a future
+"let's add another instance" decision doesn't silently reopen this gate.
 
 ## 2. Persistent disk behavior
 
@@ -46,9 +60,18 @@ the answer here.
 empirically across roughly 10 redeploys in one session (per `CLAUDE.md`);
 the audit log and decision journal (item 5) are direct evidence of this.
 
-**Not confirmed**: whether the disk is *shared* across instances if this
-service is ever scaled beyond one instance (see item 1). `autopilotWorkerLock.ts`'s
-own code comment already states this is an open question, not assumed true.
+**Confirmed 2026-07-15, closing the previously-open question**: the
+Render dashboard shows a 1 GB persistent disk mounted at
+`/opt/render/project/src/backend/data`, with root directory set to
+`backend`. Since `process.cwd()` for this service resolves to
+`/opt/render/project/src/backend` (the configured root directory), and
+every state file's path is built as `path.resolve(process.cwd(), "data")`
+(see the four files listed below), the mount path **exactly matches** where
+the code actually reads and writes - not a guess, a direct match between
+the dashboard's own config and the code's own path construction. Combined
+with item 1's confirmation (scaling structurally disabled while this disk
+exists), the "is the disk shared across instances" question is now moot -
+there's only ever one instance to share it with.
 
 All four disk-backed state files resolve their path the same way — relative
 to `process.cwd()`, not an absolute/configured path:
@@ -137,8 +160,9 @@ something to simulate further here.
 
 **Confirmed** — both `circuit-breaker-audit.jsonl` and
 `autopilot-decisions.jsonl` have survived multiple real redeploys in
-practice (same empirical evidence as item 2). Subject to the same open
-question about multi-instance disk-sharing as item 2.
+practice (same empirical evidence as item 2). The multi-instance
+disk-sharing question that used to qualify this is now closed (see item 1) -
+there's only ever one instance for this disk to belong to.
 
 ## 6. Alerts work after restart
 
@@ -163,10 +187,11 @@ claimed / exact-boundary-not-yet-stale refused).
 
 The code's own comment (`autopilotWorkerLock.ts:7-13`) is explicit: this
 protects against an old+new process briefly overlapping on the **same host**
-during a deploy transition. It provides **no** protection if Render ever
-runs genuinely separate instances with separate memory — which is exactly
-item 1's open question. This item's real-world guarantee is only as strong
-as item 1's answer.
+during a deploy transition. It provides **no** protection against genuinely
+separate instances with separate memory - but per item 1, Render structurally
+cannot run more than one instance of this service while its disk is attached,
+so that scenario isn't reachable today. **Confirmed 2026-07-15**, resolved by
+item 1's answer rather than left contingent on it.
 
 ## 8. Emergency stop documented
 
