@@ -16,8 +16,8 @@ gaps. It does not change any code, threshold, or execution behavior.
 |---|---|---|
 | 1 | One worker instance | ❓ Not verifiable from the repo — needs a Render dashboard check |
 | 2 | Persistent disk behavior | ⚠️ Partially confirmed (see below) |
-| 3 | Restart with circuit breaker tripped | ⚠️ Unit-tested only, never observed against a real restart |
-| 4 | Restart with pending/ambiguous order | ✅ Fixed 2026-07-15 — see below |
+| 3 | Restart with circuit breaker tripped | ✅ Restart-regression tested 2026-07-15 (simulated locally, not observed in a real production trip) |
+| 4 | Restart with pending/ambiguous order | ✅ Code-fixed + restart-regression tested (PR #34); live-fire verification deferred to first real paper execution |
 | 5 | Audit/journal survives deploy | ✅ Empirically confirmed |
 | 6 | Alerts work after restart | ⚠️ Should work (state-backed), never observed live |
 | 7 | No duplicate worker cycles | ⚠️ Logic exists and is tested, contingent on item 1 |
@@ -67,57 +67,71 @@ a redeploy differently than another.
 
 ## 3. Restart while circuit breaker is tripped
 
-**Expected behavior**: the sticky-trip state (`applyStickyTrip`,
-`portfolioCircuitBreaker.ts`) is written to `circuit-breaker-state.json` on
-every change, so a restart should reload it and continue blocking new BUYs
-(SELLs stay allowed) — this exact logic is unit-tested in isolation
-(`portfolioCircuitBreaker.test.ts`).
+**Status: restart-regression tested (2026-07-15).** `portfolioCircuitBreaker.ts`'s
+`readState`/`writeState` and the 4 functions that call them
+(`updatePortfolioCircuitBreaker`, `resetPortfolioCircuitBreaker`,
+`getPortfolioCircuitBreakerState`, `recordReminderSent`) gained an optional
+`filePath` parameter (defaulting to the real state file - every production
+call site is unaffected) specifically so this could be tested against a real
+file instead of only in-process pure-logic tests. `portfolioCircuitBreaker.test.ts`
+now covers: a tripped state written by a simulated "previous process" is read
+back with nothing lost (`tripped`/`trippedAt`/`lastReminderSentDate` all
+intact); a fresh `updatePortfolioCircuitBreaker` call against that same file,
+fed equity that's recovered above the peak (which `evaluatePortfolioDrawdown`
+alone would call "not tripped"), still returns `tripped: true` with the
+original `trippedAt` preserved - the sticky rule survives a restart, not just
+one process's lifetime; and `resetPortfolioCircuitBreaker` correctly clears
+`tripped`/`trippedAt`/`lastReminderSentDate` together, verified by reading
+the file back afterward.
 
-**Not yet verified**: against a real process restart while genuinely
-tripped. This has never happened in production paper trading (the breaker
-has not tripped there), so this path has only ever been exercised by unit
-tests, never end-to-end.
-
-**How to test without waiting for a real -15% drawdown**: there's currently
-no "force a trip" mechanism — only `POST /api/autopilot/circuit-breaker/reset`
-exists (which clears a trip, not creates one). Testing this for real would
-require either a temporary lowered threshold in a disposable test run, or
-directly writing a tripped `circuit-breaker-state.json` and restarting the
-process locally to confirm it loads and behaves correctly. Left as a
-follow-up (candidate for PR B), not solved here.
+**What this is, precisely**: a real file-based regression test simulating a
+restart locally (write state → construct as if a fresh process → read/act on
+it), not an observed real Render redeploy while genuinely tripped in
+production - the breaker has never actually tripped there. That gap (an
+actual production restart-while-tripped event) can only be closed by
+observation over time or a deliberate live-fire drill, not by more unit
+tests - noted here so the distinction isn't lost.
 
 ## 4. Restart with pending/ambiguous order state
 
-**This is a real, previously-undocumented gap, found while writing this
-runbook — not a solved item.**
+**Status: code-fixed / restart-regression tested (PR #34, 2026-07-15).
+Live-fire paper verification: deferred until `AUTOPILOT_EXECUTE_TRADES=true`.**
 
-`orderIdempotency.ts`'s `client_order_id` tracker (`createClientOrderIdTracker`,
-`:65-87`) is **in-memory only** — a plain `Map`, held in one process-lifetime
-variable (`server.ts:225`). It is never written to disk. The three other
-state files (circuit breaker, audit log, journal) all persist to `data/`;
-this one does not.
+`orderIdempotency.ts`'s `client_order_id` tracker was in-memory only (a plain
+`Map`, held in one process-lifetime variable, `server.ts:225`) - unlike the
+other three state files (circuit breaker, audit log, journal), which all
+persist to `data/`. A restart during the "ambiguous network error" window
+(order submitted, response lost to a timeout/DNS/connection reset - the
+tracker deliberately does **not** clear the `client_order_id` in this case)
+would wipe that in-memory record; a subsequent retry would mint a **new**
+`client_order_id`, and Alpaca's own duplicate-ID rejection - the mechanism
+this whole system relies on - would have nothing to catch, since the new ID
+doesn't match the old one. A genuine duplicate order was possible in this
+specific, narrow window.
 
-**Concretely**: if the process restarts (a redeploy) while an order is in
-the "ambiguous network error" state — submitted, but the response was lost
-to a timeout/DNS/connection reset, so the tracker deliberately does **not**
-clear the `client_order_id` (`orderIdempotency.ts`, the ambiguous-error
-branch, `server.ts:611-618`) — a restart wipes that in-memory state. The new
-process has no record that an order might already exist for that
-ticker+action. If the autopilot cycle runs again for that ticker afterward,
-it mints a **new** `client_order_id`, and Alpaca's own duplicate-ID rejection
-(the mechanism this whole system relies on) has nothing to catch, since the
-new ID doesn't match the old one. A genuine duplicate order becomes possible
-in this specific, narrow window.
+**Fixed**: `createClientOrderIdTracker` gained an optional `initialState`
+param and a `snapshot()` method; a new `createPersistedClientOrderIdTracker`
+wraps it with a fail-soft read/write layer against
+`data/order-idempotency-state.json`, mirroring `portfolioCircuitBreaker.ts`'s
+own state-file pattern. `getOrCreate`/`clear` on the persisted tracker are
+async and **await** the disk write before returning, so the durability
+guarantee holds even if the process crashes immediately after. `server.ts`
+constructs it via a top-level `await`.
 
-**Why this hasn't caused a problem yet**: `AUTOPILOT_EXECUTE_TRADES` is
-`false`, so no real orders are being submitted — this window doesn't
-currently exist in practice. It becomes live risk the moment paper execution
-is turned on.
+**Tested**: `orderIdempotency.test.ts` includes a real restart-scenario
+regression test (a real temp file, not a mock) - a pending entry left by a
+simulated "previous process" is read back and honored (same `client_order_id`
+returned), not replaced with a fresh one.
 
-**Not fixed in this PR** (docs-only scope) — flagged as a concrete follow-up:
-persisting the tracker (or at minimum, its ambiguous-pending entries) to
-`data/`, the same way the other three state files already do, before
-`AUTOPILOT_EXECUTE_TRADES=true` is ever set.
+**Not yet done, and explicitly called out rather than implied**: this has
+never been exercised against a real order submission, because
+`AUTOPILOT_EXECUTE_TRADES=false` means no real orders are placed at all right
+now. "Restart-regression tested" describes the persistence mechanism in
+isolation, not an end-to-end confirmation against Alpaca's real broker path.
+That confirmation is deferred to whenever paper execution is actually turned
+on - the first real order-submission cycle (or a deliberate fire drill around
+that time) is the natural point to watch this path fire for real, not
+something to simulate further here.
 
 ## 5. Audit/journal survives deploy
 

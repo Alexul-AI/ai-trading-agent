@@ -129,13 +129,16 @@ export function findPeakSinceTracking(
   return { peakEquity, peakEquityAt };
 }
 
-async function ensureDataDir() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-}
-
-async function readState(): Promise<CircuitBreakerState | null> {
+// `filePath` defaults to the real state file; every production call site
+// omits it. The override exists solely so tests can point this at a real
+// temp file directly instead of mocking fs or mutating global
+// process.cwd() - same convention as orderIdempotency.ts's persisted
+// tracker.
+async function readState(
+  filePath: string = STATE_FILE,
+): Promise<CircuitBreakerState | null> {
   try {
-    const raw = await fs.readFile(STATE_FILE, "utf-8");
+    const raw = await fs.readFile(filePath, "utf-8");
     return JSON.parse(raw) as CircuitBreakerState;
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") {
@@ -145,9 +148,12 @@ async function readState(): Promise<CircuitBreakerState | null> {
   }
 }
 
-async function writeState(state: CircuitBreakerState): Promise<void> {
-  await ensureDataDir();
-  await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
+async function writeState(
+  state: CircuitBreakerState,
+  filePath: string = STATE_FILE,
+): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, JSON.stringify(state, null, 2), "utf-8");
 }
 
 export interface CircuitBreakerUpdateResult {
@@ -164,9 +170,10 @@ export interface CircuitBreakerUpdateResult {
 export async function updatePortfolioCircuitBreaker(
   currentEquity: number,
   fetchEquityHistory: FetchEquityHistory,
+  filePath: string = STATE_FILE,
 ): Promise<CircuitBreakerUpdateResult> {
   const now = new Date().toISOString();
-  const existing = await readState();
+  const existing = await readState(filePath);
   const trackingStartDate = existing?.trackingStartDate ?? now;
 
   // A fetch failure never crashes the whole autopilot cycle - a crash here
@@ -212,12 +219,13 @@ export async function updatePortfolioCircuitBreaker(
     lastReminderSentDate: existing?.lastReminderSentDate ?? null,
   };
 
-  await writeState(state);
+  await writeState(state, filePath);
   return { state, justTripped };
 }
 
 export async function resetPortfolioCircuitBreaker(
   currentEquity: number,
+  filePath: string = STATE_FILE,
 ): Promise<CircuitBreakerState> {
   const now = new Date().toISOString();
   const state: CircuitBreakerState = {
@@ -229,20 +237,25 @@ export async function resetPortfolioCircuitBreaker(
     dataStale: false,
     lastReminderSentDate: null,
   };
-  await writeState(state);
+  await writeState(state, filePath);
   return state;
 }
 
-export async function getPortfolioCircuitBreakerState(): Promise<CircuitBreakerState | null> {
-  return readState();
+export async function getPortfolioCircuitBreakerState(
+  filePath: string = STATE_FILE,
+): Promise<CircuitBreakerState | null> {
+  return readState(filePath);
 }
 
 // Called at most once per calendar day while tripped, right after
 // shouldSendDailyReminder confirms a reminder should go out - see
 // autopilotWorker.ts's single per-cycle circuit-breaker update call site.
-export async function recordReminderSent(todayDateKey: string): Promise<void> {
-  const existing = await readState();
+export async function recordReminderSent(
+  todayDateKey: string,
+  filePath: string = STATE_FILE,
+): Promise<void> {
+  const existing = await readState(filePath);
   if (!existing) return;
 
-  await writeState({ ...existing, lastReminderSentDate: todayDateKey });
+  await writeState({ ...existing, lastReminderSentDate: todayDateKey }, filePath);
 }
