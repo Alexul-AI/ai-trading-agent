@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  assertValidEtfRotationConfig,
   computeMomentumReturnPercent,
   computeRebalanceOrders,
   decideRotationTargets,
@@ -12,6 +13,56 @@ import {
   type EtfRotationConfig,
   type RotationTarget,
 } from "./etfRotationStrategy.js";
+
+describe("assertValidEtfRotationConfig", () => {
+  it("does not throw for the shipped baseline (holdCount=2)", () => {
+    expect(() =>
+      assertValidEtfRotationConfig(ETF_ROTATION_MVP_BASELINE_CONFIG),
+    ).not.toThrow();
+  });
+
+  it("does not throw for the hold3 candidate (holdCount=3)", () => {
+    expect(() =>
+      assertValidEtfRotationConfig(ETF_ROTATION_HOLD3_CANDIDATE_CONFIG),
+    ).not.toThrow();
+  });
+
+  it("throws when holdCount is below 2", () => {
+    const config: EtfRotationConfig = {
+      ...ETF_ROTATION_MVP_BASELINE_CONFIG,
+      holdCount: 1,
+    };
+
+    expect(() => assertValidEtfRotationConfig(config)).toThrow(/holdCount/);
+  });
+
+  it("throws when holdCount is 0", () => {
+    const config: EtfRotationConfig = {
+      ...ETF_ROTATION_MVP_BASELINE_CONFIG,
+      holdCount: 0,
+    };
+
+    expect(() => assertValidEtfRotationConfig(config)).toThrow(/holdCount/);
+  });
+
+  it("throws when holdCount exceeds universe.length", () => {
+    const config: EtfRotationConfig = {
+      ...ETF_ROTATION_MVP_BASELINE_CONFIG,
+      holdCount: 6, // universe has 5 tickers
+    };
+
+    expect(() => assertValidEtfRotationConfig(config)).toThrow(/holdCount/);
+  });
+
+  it("does not throw exactly at the universe.length upper bound", () => {
+    const config: EtfRotationConfig = {
+      ...ETF_ROTATION_MVP_BASELINE_CONFIG,
+      holdCount: ETF_ROTATION_MVP_BASELINE_CONFIG.universe.length,
+    };
+
+    expect(() => assertValidEtfRotationConfig(config)).not.toThrow();
+  });
+});
 
 describe("computeMomentumReturnPercent", () => {
   it("computes the trailing return over the lookback window", () => {

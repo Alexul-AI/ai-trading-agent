@@ -19,6 +19,25 @@ export interface EtfRotationConfig {
   holdCount: number;
 }
 
+/**
+ * Fails loud at load time (docs/ops/ETF_ROTATION_PAPER_EXECUTION_PLAN.md
+ * §11's Stage 2A resolution), not per-cycle: bucket/position caps are
+ * deliberately bypassed for this strategy (see the design doc's §3), so
+ * holdCount is this strategy's only concentration control - a config with
+ * holdCount < 2 would create a single 100%-of-equity position, and
+ * holdCount > universe.length could never be satisfied at all (asking for
+ * more concentrated slots than there are tickers to fill them). Note "max
+ * slot weight <= 50%" (100/holdCount <= 50) is algebraically identical to
+ * holdCount >= 2 - this is one rule, not two separate checks.
+ */
+export function assertValidEtfRotationConfig(config: EtfRotationConfig): void {
+  if (config.holdCount < 2 || config.holdCount > config.universe.length) {
+    throw new Error(
+      `Invalid EtfRotationConfig: holdCount (${config.holdCount}) must satisfy 2 <= holdCount <= universe.length (${config.universe.length}).`,
+    );
+  }
+}
+
 // Universe: SPY (US broad), QQQ (growth/Nasdaq proxy), EFA (international),
 // TLT (bonds), GLD (commodities/gold) - matches the roadmap's Phase 2
 // universe description. Momentum lookback (126 trading days, ~6 months) and
@@ -38,6 +57,7 @@ export const ETF_ROTATION_MVP_BASELINE_CONFIG: EtfRotationConfig = {
   trendFilterSmaPeriod: 200,
   holdCount: 2,
 };
+assertValidEtfRotationConfig(ETF_ROTATION_MVP_BASELINE_CONFIG);
 
 // PR #28's hold-count sweep: holdCount=3 improved return and/or drawdown in
 // 4 of 5 windows and fixed the 2022 bear-heavy concentration problem the
@@ -49,6 +69,7 @@ export const ETF_ROTATION_HOLD3_CANDIDATE_CONFIG: EtfRotationConfig = {
   ...ETF_ROTATION_MVP_BASELINE_CONFIG,
   holdCount: 3,
 };
+assertValidEtfRotationConfig(ETF_ROTATION_HOLD3_CANDIDATE_CONFIG);
 
 // Kept for any existing import of the old name - always points at the
 // currently-validated production default (the baseline, not the candidate).
