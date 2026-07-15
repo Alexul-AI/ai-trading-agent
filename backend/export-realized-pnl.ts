@@ -276,20 +276,25 @@ async function main() {
 
   await fs.mkdir(REPORT_DIR, { recursive: true });
 
+  const tradesCsvHeader = [
+    "trade_date",
+    "ticker",
+    "action",
+    "shares",
+    "fill_price_usd",
+    "gross_amount_usd",
+    "matched_buy_date",
+    "matched_buy_price_usd",
+    "realized_pnl_usd",
+    "cost_basis_method",
+  ];
   const tradesCsvRows: (string | number)[][] = [
-    [
-      "trade_date",
-      "ticker",
-      "action",
-      "shares",
-      "fill_price_usd",
-      "gross_amount_usd",
-      "matched_buy_date",
-      "matched_buy_price_usd",
-      "realized_pnl_usd",
-      "cost_basis_method",
-    ],
-    [`# ${NON_ADVICE_NOTE}`],
+    tradesCsvHeader,
+    // Padded to the same column count as the header, not a lone 1-column
+    // row - CSV has no universal "comment row" convention, and a short row
+    // mixed into an otherwise-rectangular table risks being read as a
+    // malformed data row by strict parsers/accounting-software imports.
+    [`# ${NON_ADVICE_NOTE}`, ...Array(tradesCsvHeader.length - 1).fill("")],
   ];
   for (const r of rows) {
     tradesCsvRows.push([
