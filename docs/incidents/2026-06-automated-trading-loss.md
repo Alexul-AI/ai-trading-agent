@@ -134,6 +134,22 @@ review, not by a fresh investigation into this specific event.
   *targeted* regression test proving the original bug is fixed, since the
   original bug itself was never precisely identified.
 
+## Independent confirmation (2026-07-15)
+
+`backend/export-realized-pnl.ts` (added for the tax/reporting gate, unrelated
+to this incident originally) independently pulls realized P&L straight from
+Alpaca's own closed-order history via FIFO matching - a real run against the
+current paper account showed a total realized P&L of **-$11,868.22**,
+broker-side confirmation in the same ballpark as this incident's traced
+~$13,444 loss (not an exact match - different calculation basis, FIFO vs
+whatever the JNLC ledger entry reflects - but consistent with the same
+event, not a separate one). **This number belongs to this incident, not to
+the current risk-controlled strategy** - it predates `strategyEngine.ts`'s
+cooldown logic and every safeguard listed under "Corrective actions" above.
+Read carefully when using this export's output for anything else: don't let
+this historical loss get folded into risk-adjusted return numbers for the
+current strategy without excluding this window.
+
 ## Remaining risks
 
 - If the original root cause was a class of bug not touched by any of the
