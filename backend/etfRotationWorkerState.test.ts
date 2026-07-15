@@ -8,6 +8,7 @@ import {
   getLastRebalanceDateKey,
   getRebalanceState,
   isRebalanceMonthDone,
+  readRebalanceStateStrict,
   recordRebalanceDateKey,
   recordRebalanceExecuting,
   recordRebalancePlanned,
@@ -92,6 +93,7 @@ describe("etfRotationWorkerState", () => {
         {
           dateKey: "2026-07-14",
           rebalanceMonthKey: "2026-07",
+          configVariantKey: "baseline-2",
           targets,
           plannedOrders,
         },
@@ -120,6 +122,7 @@ describe("etfRotationWorkerState", () => {
         {
           dateKey: "2026-07-14",
           rebalanceMonthKey: "2026-07",
+          configVariantKey: "baseline-2",
           targets,
           plannedOrders,
         },
@@ -129,6 +132,7 @@ describe("etfRotationWorkerState", () => {
       const state = await getRebalanceState(filePath);
       expect(state.status).toBe("planned");
       expect(state.rebalanceMonthKey).toBe("2026-07");
+      expect(state.configVariantKey).toBe("baseline-2");
       expect(state.lastRebalanceDateKey).toBe("2026-07-14");
       expect(state.startedAt).toBeDefined();
       expect(state.completedAt).toBeUndefined();
@@ -143,6 +147,7 @@ describe("etfRotationWorkerState", () => {
         {
           dateKey: "2026-07-14",
           rebalanceMonthKey: "2026-07",
+          configVariantKey: "baseline-2",
           targets: [],
           plannedOrders: [],
         },
@@ -163,6 +168,7 @@ describe("etfRotationWorkerState", () => {
         {
           dateKey: "2026-07-14",
           rebalanceMonthKey: "2026-07",
+          configVariantKey: "baseline-2",
           targets: [],
           plannedOrders: [],
         },
@@ -183,6 +189,7 @@ describe("etfRotationWorkerState", () => {
         {
           dateKey: "2026-07-14",
           rebalanceMonthKey: "2026-07",
+          configVariantKey: "baseline-2",
           targets: [],
           plannedOrders: [],
         },
@@ -254,5 +261,59 @@ describe("isRebalanceMonthDone", () => {
   it("is false for cancelled", () => {
     const state = stateWith({ rebalanceMonthKey: "2026-07", status: "cancelled" });
     expect(isRebalanceMonthDone(state, "2026-07")).toBe(false);
+  });
+});
+
+describe("readRebalanceStateStrict", () => {
+  it("reports corrupt: false when no file exists yet (a normal, safe first-ever run)", async () => {
+    await withTempStateFile(async (filePath) => {
+      const result = await readRebalanceStateStrict(filePath);
+
+      expect(result.corrupt).toBe(false);
+      expect(result.state.lastRebalanceDateKey).toBeNull();
+    });
+  });
+
+  it("reports corrupt: true when the file exists but is unparseable JSON", async () => {
+    await withTempStateFile(async (filePath) => {
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, "{not valid json", "utf-8");
+
+      const result = await readRebalanceStateStrict(filePath);
+
+      expect(result.corrupt).toBe(true);
+    });
+  });
+
+  it("reports corrupt: true when the file parses but lacks the expected shape", async () => {
+    await withTempStateFile(async (filePath) => {
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, JSON.stringify({ somethingElse: true }), "utf-8");
+
+      const result = await readRebalanceStateStrict(filePath);
+
+      expect(result.corrupt).toBe(true);
+    });
+  });
+
+  it("reports corrupt: false and returns the real state for a valid file", async () => {
+    await withTempStateFile(async (filePath) => {
+      await recordRebalancePlanned(
+        {
+          dateKey: "2026-07-14",
+          rebalanceMonthKey: "2026-07",
+          configVariantKey: "baseline-2",
+          targets: [],
+          plannedOrders: [],
+        },
+        filePath,
+      );
+
+      const result = await readRebalanceStateStrict(filePath);
+
+      expect(result.corrupt).toBe(false);
+      expect(result.state.status).toBe("planned");
+      expect(result.state.rebalanceMonthKey).toBe("2026-07");
+    });
   });
 });

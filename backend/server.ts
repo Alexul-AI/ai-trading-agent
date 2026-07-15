@@ -20,6 +20,14 @@ import {
 } from "./portfolioCircuitBreaker.js";
 import { appendCircuitBreakerAuditEvent } from "./circuitBreakerAuditLog.js";
 import {
+  readRebalanceStateStrict,
+  recordRebalanceTerminal,
+} from "./etfRotationWorkerState.js";
+import {
+  appendEtfRotationOrderAuditEvent,
+  readEtfRotationOrderAuditLog,
+} from "./etfRotationOrderAuditLog.js";
+import {
   classifyOrderError,
   createPersistedClientOrderIdTracker,
   type AlpacaErrorLike,
@@ -1177,6 +1185,130 @@ app.get("/api/autopilot/circuit-breaker/review", async (_req, res) => {
     res.status(500).json({ error: "Failed to load circuit breaker review" });
   }
 });
+
+// Read-only, no admin gate - same convention as the circuit-breaker review
+// endpoint above (surfaces data that already exists elsewhere, nothing new
+// is computed that would need to be kept private). Per
+// docs/ops/ETF_ROTATION_PAPER_EXECUTION_PLAN.md §11's Stage 2A resolution:
+// this is the "manual review" surface for a rebalance left in
+// failed_needs_review, assembling one merged view instead of requiring a
+// human to grep the audit log and cross-reference Alpaca's dashboard by
+// hand. Uses the fail-closed reader (readRebalanceStateStrict) so a
+// corrupt/unreadable state file is surfaced explicitly (stateReadError)
+// rather than silently presenting a blank, fresh-looking state.
+app.get("/api/autopilot/etf-rotation/review", async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  try {
+    const [stateResult, recentOrderEvents, portfolio] = await Promise.all([
+      readRebalanceStateStrict(),
+      readEtfRotationOrderAuditLog(20),
+      getPortfolioSnapshot(),
+    ]);
+
+    res.json({
+      stateReadError: stateResult.corrupt,
+      status: stateResult.state.status ?? null,
+      rebalanceMonthKey: stateResult.state.rebalanceMonthKey ?? null,
+      configVariantKey: stateResult.state.configVariantKey ?? null,
+      lastRebalanceDateKey: stateResult.state.lastRebalanceDateKey,
+      startedAt: stateResult.state.startedAt ?? null,
+      completedAt: stateResult.state.completedAt ?? null,
+      targets: stateResult.state.targets ?? null,
+      plannedOrders: stateResult.state.plannedOrders ?? null,
+      recentOrderAuditEvents: recentOrderEvents,
+      positions: portfolio.positions,
+      cash: portfolio.balance,
+      currentEquity: portfolio.equity,
+    });
+  } catch (error) {
+    console.error("[API] /api/autopilot/etf-rotation/review failed:", error);
+    res.status(500).json({ error: "Failed to load ETF Rotation review" });
+  }
+});
+
+const etfRotationClearReviewSchema = z.object({
+  reason: z
+    .string()
+    .trim()
+    .min(1, "A reason is required to clear an ETF Rotation review state."),
+});
+
+// Admin-gated manual clear for a rebalance stuck in failed_needs_review
+// (docs/ops/ETF_ROTATION_PAPER_EXECUTION_PLAN.md §11's Stage 2A resolution)
+// - mirrors the circuit-breaker reset endpoint's exact reason-required,
+// audited pattern. Deliberately refuses (409) unless the current state is
+// actually failed_needs_review - this is not a general-purpose reset, only
+// an acknowledgement of one specific stuck condition. No automatic clear
+// and no manual state-file editing are ever part of normal operation; this
+// endpoint is the only sanctioned way to clear it. Transitions status to
+// "cancelled" (via recordRebalanceTerminal) - never to "executed"/"partial",
+// since a human clearing a review is acknowledging an interrupted attempt,
+// not vouching that it succeeded. This never calls executeSafeTrade and
+// does not itself trigger a new rebalance attempt - it only re-opens the
+// monthly gate (isRebalanceMonthDone) for the next scheduled cycle to try
+// again from scratch.
+app.post(
+  "/api/autopilot/etf-rotation/clear-review",
+  requireAdminToken,
+  async (req, res) => {
+    const parsedBody = etfRotationClearReviewSchema.safeParse(req.body);
+
+    if (!parsedBody.success) {
+      res.status(400).json({
+        error:
+          parsedBody.error.flatten().fieldErrors.reason?.[0] ??
+          "A reason is required to clear an ETF Rotation review state.",
+      });
+      return;
+    }
+
+    const { reason } = parsedBody.data;
+
+    try {
+      const { state, corrupt } = await readRebalanceStateStrict();
+
+      if (corrupt || state.status !== "failed_needs_review") {
+        res.status(409).json({
+          error:
+            "No ETF Rotation rebalance is currently in failed_needs_review - nothing to clear.",
+          status: corrupt ? null : (state.status ?? null),
+        });
+        return;
+      }
+
+      await recordRebalanceTerminal("cancelled");
+
+      await appendEtfRotationOrderAuditEvent({
+        type: "REBALANCE_MANUALLY_CLEARED",
+        timestamp: new Date().toISOString(),
+        rebalanceMonthKey: state.rebalanceMonthKey ?? "unknown",
+        configVariantKey: state.configVariantKey ?? "unknown",
+        reason,
+      });
+
+      const confirmationMessage = `ETF Rotation rebalance manually cleared from failed_needs_review.\nMonth: ${
+        state.rebalanceMonthKey ?? "unknown"
+      }\nReason: ${reason}`;
+
+      broadcastSSE({
+        type: "notification",
+        level: "info",
+        message: confirmationMessage,
+      });
+
+      await sendTelegramAlert(confirmationMessage);
+
+      res.json({ status: "cleared" });
+    } catch (error) {
+      console.error(
+        "[API] /api/autopilot/etf-rotation/clear-review failed:",
+        error,
+      );
+      res.status(500).json({ error: "Failed to clear ETF Rotation review" });
+    }
+  },
+);
 
 app.post("/api/trade", requireAdminToken, async (req, res) => {
   if (!areManualTradesAllowed()) {
