@@ -5,6 +5,7 @@ import path from "path";
 import { describe, expect, it } from "vitest";
 
 import {
+  decideEtfRotationGateAction,
   getLastRebalanceDateKey,
   getRebalanceState,
   isRebalanceMonthDone,
@@ -14,6 +15,7 @@ import {
   recordRebalancePlanned,
   recordRebalanceTerminal,
   type EtfRotationWorkerState,
+  type RebalanceStateReadResult,
 } from "./etfRotationWorkerState.js";
 import type { RebalanceOrder, RotationTarget } from "./etfRotationStrategy.js";
 
@@ -315,5 +317,114 @@ describe("readRebalanceStateStrict", () => {
       expect(result.state.status).toBe("planned");
       expect(result.state.rebalanceMonthKey).toBe("2026-07");
     });
+  });
+});
+
+describe("decideEtfRotationGateAction", () => {
+  function resultWith(
+    overrides: Partial<EtfRotationWorkerState>,
+    corrupt = false,
+  ): RebalanceStateReadResult {
+    return {
+      state: { lastRebalanceDateKey: null, ...overrides },
+      corrupt,
+    };
+  }
+
+  it("fails closed on a corrupt state file, regardless of anything else in the (untrusted) state", () => {
+    const result = resultWith(
+      { rebalanceMonthKey: "2026-07", status: "executing" },
+      true,
+    );
+    expect(decideEtfRotationGateAction(result, "2026-07")).toBe(
+      "state_corrupt_fail_closed",
+    );
+  });
+
+  it("treats a leftover 'executing' status as needing review, not resumable", () => {
+    const result = resultWith({
+      rebalanceMonthKey: "2026-07",
+      status: "executing",
+    });
+    expect(decideEtfRotationGateAction(result, "2026-07")).toBe(
+      "stale_executing_needs_review",
+    );
+  });
+
+  it("blocks on an existing failed_needs_review, even for an earlier month", () => {
+    const result = resultWith({
+      rebalanceMonthKey: "2026-06",
+      status: "failed_needs_review",
+    });
+    expect(decideEtfRotationGateAction(result, "2026-07")).toBe(
+      "blocked_failed_needs_review",
+    );
+  });
+
+  it("reports already_done_this_month for a matching month with status executed", () => {
+    const result = resultWith({
+      rebalanceMonthKey: "2026-07",
+      status: "executed",
+    });
+    expect(decideEtfRotationGateAction(result, "2026-07")).toBe(
+      "already_done_this_month",
+    );
+  });
+
+  it("reports already_done_this_month for a matching month with an accepted partial", () => {
+    const result = resultWith({
+      rebalanceMonthKey: "2026-07",
+      status: "partial",
+    });
+    expect(decideEtfRotationGateAction(result, "2026-07")).toBe(
+      "already_done_this_month",
+    );
+  });
+
+  it("proceeds to plan when no rebalance has ever been recorded", () => {
+    const result = resultWith({});
+    expect(decideEtfRotationGateAction(result, "2026-07")).toBe(
+      "proceed_to_plan",
+    );
+  });
+
+  it("proceeds to plan for a new month even if the previous month completed successfully", () => {
+    const result = resultWith({
+      rebalanceMonthKey: "2026-06",
+      status: "executed",
+    });
+    expect(decideEtfRotationGateAction(result, "2026-07")).toBe(
+      "proceed_to_plan",
+    );
+  });
+
+  it("proceeds to plan when the same month is only 'planned' so far (nothing executed yet)", () => {
+    const result = resultWith({
+      rebalanceMonthKey: "2026-07",
+      status: "planned",
+    });
+    expect(decideEtfRotationGateAction(result, "2026-07")).toBe(
+      "proceed_to_plan",
+    );
+  });
+
+  it("proceeds to plan after a manual clear (cancelled) for the same month", () => {
+    const result = resultWith({
+      rebalanceMonthKey: "2026-07",
+      status: "cancelled",
+    });
+    expect(decideEtfRotationGateAction(result, "2026-07")).toBe(
+      "proceed_to_plan",
+    );
+  });
+
+  it("proceeds to plan after a plain failed (not needs-review) for the same month", () => {
+    const result = resultWith({
+      rebalanceMonthKey: "2026-07",
+      status: "failed",
+    });
+    expect(decideEtfRotationGateAction(result, "2026-07")).toBe(
+      "proceed_to_plan",
+    );
   });
 });

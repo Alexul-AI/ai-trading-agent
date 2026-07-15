@@ -18,14 +18,15 @@ import {
   computeRebalanceOrders,
   decideRotationTargets,
   ETF_ROTATION_CONFIG_VARIANTS,
-  isMonthlyRebalanceDate,
   resolveEtfRotationConfigVariant,
   type EtfRotationConfig,
   type RebalanceOrder,
 } from "./etfRotationStrategy.js";
 import {
-  getLastRebalanceDateKey,
-  recordRebalanceDateKey,
+  decideEtfRotationGateAction,
+  readRebalanceStateStrict,
+  recordRebalancePlanned,
+  recordRebalanceTerminal,
 } from "./etfRotationWorkerState.js";
 import { getNewsSentiment, getInsiderActivity } from "./agent.js";
 import {
@@ -1328,13 +1329,34 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       );
     }
 
-    const lastRebalanceDateKey = await getLastRebalanceDateKey();
-    const isRebalanceDay = isMonthlyRebalanceDate(
-      latestDateKey,
-      lastRebalanceDateKey,
-    );
+    // Strict gate/state adoption (Stage 2D, PR #45) - replaces the old
+    // getLastRebalanceDateKey/isMonthlyRebalanceDate pair entirely, per
+    // docs/ops/ETF_ROTATION_PAPER_EXECUTION_PLAN.md's Stage 2D plan. The old
+    // pair only knew "did the month change" - decideEtfRotationGateAction
+    // additionally fails closed on a corrupt state file, detects a stale
+    // "executing" leftover from a crash mid-sequence (transitions it to
+    // failed_needs_review rather than resuming), and blocks on an existing
+    // failed_needs_review until a human clears it via the admin-gated
+    // POST /api/autopilot/etf-rotation/clear-review endpoint (server.ts).
+    // Still zero calls to executeSafeTrade anywhere below - this PR only
+    // changes which cycles are allowed to compute a plan, not execution.
+    const monthKey = latestDateKey.slice(0, 7);
+    const stateResult = await readRebalanceStateStrict();
+    const gateAction = decideEtfRotationGateAction(stateResult, monthKey);
 
-    if (!isRebalanceDay) {
+    if (gateAction === "state_corrupt_fail_closed") {
+      const alertMessage =
+        "ETF Rotation state file is unreadable/corrupt - failing closed, no new rebalance attempted this cycle. Investigate data/etf-rotation-worker-state.json.";
+
+      options.broadcastSSE({
+        type: "notification",
+        level: "error",
+        message: alertMessage,
+      });
+      if (options.sendTelegramAlert) {
+        await options.sendTelegramAlert(alertMessage);
+      }
+
       return config.universe.map((ticker) => ({
         ticker,
         timestamp,
@@ -1343,9 +1365,100 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         confidence: 0,
         suggestedShares: 0,
         reasonType: "NOT_REBALANCE_DAY",
-        reason: `Not a monthly rebalance day (latest bar ${latestDateKey}, last rebalance ${
-          lastRebalanceDateKey ?? "never"
-        }).`,
+        reason: alertMessage,
+        finalStatus: "blocked",
+        signalStatus: "blocked",
+        executionStatus: "not_attempted",
+        isSignalReady: false,
+        blockReasonCategory: "error",
+        blockReasonCode: "ETF_ROTATION_STATE_CORRUPT",
+        blockReasonDetail: alertMessage,
+        executed: false,
+        skippedReason: alertMessage,
+      }));
+    }
+
+    if (gateAction === "stale_executing_needs_review") {
+      // A previous process left the cycle mid-sequence (crash between SELL
+      // and BUY legs, or between planning and execution starting) - never
+      // resumed, per the design doc's Stage 2A resolution. This branch is
+      // added and tested now even though "executing" can't be reached by
+      // any live code path until the execution-wiring PR exists.
+      await recordRebalanceTerminal("failed_needs_review");
+
+      const alertMessage =
+        'ETF Rotation found a stuck "executing" rebalance from a previous cycle/restart - marked failed_needs_review. Blocked until cleared via POST /api/autopilot/etf-rotation/clear-review.';
+
+      options.broadcastSSE({
+        type: "notification",
+        level: "error",
+        message: alertMessage,
+      });
+      if (options.sendTelegramAlert) {
+        await options.sendTelegramAlert(alertMessage);
+      }
+
+      return config.universe.map((ticker) => ({
+        ticker,
+        timestamp,
+        price: currentPriceByTicker.get(ticker) ?? 0,
+        action: "HOLD",
+        confidence: 0,
+        suggestedShares: 0,
+        reasonType: "NOT_REBALANCE_DAY",
+        reason: alertMessage,
+        finalStatus: "blocked",
+        signalStatus: "blocked",
+        executionStatus: "not_attempted",
+        isSignalReady: false,
+        blockReasonCategory: "safety_cap",
+        blockReasonCode: "ETF_ROTATION_STALE_EXECUTING",
+        blockReasonDetail: alertMessage,
+        executed: false,
+        skippedReason: alertMessage,
+      }));
+    }
+
+    if (gateAction === "blocked_failed_needs_review") {
+      // Quiet on repeat cycles (unlike the one-time alert above) - the
+      // transition into failed_needs_review already alerted once; staying
+      // blocked every subsequent cycle until a human clears it shouldn't
+      // re-alert every cycle.
+      const reason = `ETF Rotation is blocked in failed_needs_review (month ${
+        stateResult.state.rebalanceMonthKey ?? "unknown"
+      }) - clear via POST /api/autopilot/etf-rotation/clear-review before further rebalancing.`;
+
+      return config.universe.map((ticker) => ({
+        ticker,
+        timestamp,
+        price: currentPriceByTicker.get(ticker) ?? 0,
+        action: "HOLD",
+        confidence: 0,
+        suggestedShares: 0,
+        reasonType: "NOT_REBALANCE_DAY",
+        reason,
+        finalStatus: "blocked",
+        signalStatus: "blocked",
+        executionStatus: "not_attempted",
+        isSignalReady: false,
+        blockReasonCategory: "safety_cap",
+        blockReasonCode: "ETF_ROTATION_FAILED_NEEDS_REVIEW",
+        blockReasonDetail: reason,
+        executed: false,
+        skippedReason: reason,
+      }));
+    }
+
+    if (gateAction === "already_done_this_month") {
+      return config.universe.map((ticker) => ({
+        ticker,
+        timestamp,
+        price: currentPriceByTicker.get(ticker) ?? 0,
+        action: "HOLD",
+        confidence: 0,
+        suggestedShares: 0,
+        reasonType: "NOT_REBALANCE_DAY",
+        reason: `Already rebalanced this month (${monthKey}, status ${stateResult.state.status}).`,
         finalStatus: "hold",
         signalStatus: "hold",
         executionStatus: "not_attempted",
@@ -1353,6 +1466,8 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         executed: false,
       }));
     }
+
+    // gateAction === "proceed_to_plan" falls through below.
 
     // Fails closed (skips the rebalance rather than computing targets off
     // partial history) if any universe ticker doesn't yet have enough bars
@@ -1403,11 +1518,19 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       config.universe,
     );
 
-    // Recorded even though nothing executes yet (Stage 1) - the monthly
-    // gate's job is "did we already compute this month's targets," which is
-    // true as soon as targets are computed, independent of execution. Stage
-    // 2 will not need to change this.
-    await recordRebalanceDateKey(latestDateKey);
+    // Status "planned" - the monthly gate (isRebalanceMonthDone) only
+    // treats this month as done once a later PR's execution reaches
+    // "executed"/"partial", so until that PR exists this plan gets
+    // recomputed fresh every cycle for the rest of the month. Expected and
+    // harmless (nothing executes, decisions are idempotent to recompute) -
+    // see the Stage 2D plan's question 2.
+    await recordRebalancePlanned({
+      dateKey: latestDateKey,
+      rebalanceMonthKey: monthKey,
+      configVariantKey: ETF_ROTATION_CONFIG_VARIANT_KEY,
+      targets,
+      plannedOrders: orders,
+    });
 
     const targetByTicker = new Map(targets.map((target) => [target.ticker, target]));
     const sellByTicker = new Map(

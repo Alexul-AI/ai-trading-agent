@@ -218,3 +218,54 @@ export function isRebalanceMonthDone(
     TERMINAL_SUCCESS_STATUSES.includes(state.status)
   );
 }
+
+/**
+ * What the live worker's ETF Rotation cycle should do this cycle, given the
+ * current persisted state. Pure - no I/O, no side effects - so the whole
+ * decision matrix is unit-testable without a real file or a live worker.
+ * Per docs/ops/ETF_ROTATION_PAPER_EXECUTION_PLAN.md's Stage 2D plan (the
+ * "8 questions" section): this is the single place that resolves restart/
+ * corruption/gate-done precedence, so the orchestration code (autopilotWorker.ts)
+ * never has to re-derive it inline.
+ *
+ * Precedence, checked in this order:
+ * 1. A corrupt/unreadable state file fails closed - never plan over state we
+ *    can't trust, and never silently treat it as a fresh start.
+ * 2. A leftover "executing" status (found by a fresh process after a crash
+ *    mid-sequence) is never resumed - it must be treated as needing a human's
+ *    attention, the same as an already-tripped failed_needs_review.
+ * 3. An existing failed_needs_review blocks further attempts until the
+ *    admin-gated clear-review endpoint is used (see server.ts) - checked
+ *    before the month-done check so a stuck cycle from an earlier month
+ *    doesn't get silently overtaken by "well, it's a new month now."
+ * 4. Otherwise, defer entirely to isRebalanceMonthDone.
+ */
+export type EtfRotationGateAction =
+  | "state_corrupt_fail_closed"
+  | "stale_executing_needs_review"
+  | "blocked_failed_needs_review"
+  | "already_done_this_month"
+  | "proceed_to_plan";
+
+export function decideEtfRotationGateAction(
+  stateResult: RebalanceStateReadResult,
+  monthKey: string,
+): EtfRotationGateAction {
+  if (stateResult.corrupt) {
+    return "state_corrupt_fail_closed";
+  }
+
+  if (stateResult.state.status === "executing") {
+    return "stale_executing_needs_review";
+  }
+
+  if (stateResult.state.status === "failed_needs_review") {
+    return "blocked_failed_needs_review";
+  }
+
+  if (isRebalanceMonthDone(stateResult.state, monthKey)) {
+    return "already_done_this_month";
+  }
+
+  return "proceed_to_plan";
+}
