@@ -10,6 +10,20 @@ code, no env var, and does not run any fire drill.
 
 ## 1. Pre-flight checklist (before touching `AUTOPILOT_EXECUTE_TRADES`)
 
+- [ ] **Confirm which strategy will actually run.** `GET /api/autopilot/status`'s
+      `strategyVersion` field is the ground truth - as of 2026-07-15 it
+      reports `v1.2-confluence-scoring` (the original baseline strategy,
+      `strategyEngine.ts`, 13-ticker universe), because `autopilotWorker.ts`
+      does not import or call anything from `etfRotationStrategy.ts` - **ETF
+      Rotation is not wired into any live/autopilot code path**, only into
+      the standalone `backtest-etf-rotation*.ts` research scripts. Flipping
+      `AUTOPILOT_EXECUTE_TRADES=true` today would start paper-trading the
+      baseline strategy, not ETF Rotation. If the intent is to test ETF
+      Rotation specifically (the actual subject of this project's Phase 2
+      research), that integration must be built first - see
+      `docs/product/ROADMAP.md` Phase 3's status note. Don't let this
+      checklist's other items create a false sense that everything is ready
+      when this one, most consequential fact hasn't been confirmed.
 - [ ] Re-read `docs/ops/PAPER_INFRASTRUCTURE_GATE.md`'s current status summary
       in full - don't rely on memory of what it said on 2026-07-15. Confirm
       nothing has drifted (code changes, Render plan/config changes).
@@ -51,15 +65,28 @@ code, no env var, and does not run any fire drill.
 
 ## 2. How to flip it (mechanical steps)
 
-1. In the Render dashboard, set `AUTOPILOT_EXECUTE_TRADES=true` for the
-   `ai-trading-agent` service's environment.
+**`AUTOPILOT_EXECUTE_TRADES=true` alone is not sufficient** - confirmed via
+a real 2026-07-15 check (see "Verification log" below): `AUTOPILOT_ALLOW_BUY`
+and `AUTOPILOT_ALLOW_SELL` are separate gates (`autopilotWorker.ts:240-241`),
+each defaulting to `false` unless explicitly set to the exact string
+`"true"`, checked independently inside `analyzeTicker` (`:1023`/`:1033`)
+*after* the `AUTOPILOT_EXECUTE_TRADES` check already passes. As of
+2026-07-15 both are `false` - setting only `AUTOPILOT_EXECUTE_TRADES=true`
+would still block every BUY and SELL with an explicit
+"execution blocked" log line, not silently do nothing.
+
+1. In the Render dashboard, set **all three** relevant to what should
+   actually happen: `AUTOPILOT_EXECUTE_TRADES=true`, and `AUTOPILOT_ALLOW_BUY=true`/
+   `AUTOPILOT_ALLOW_SELL=true` for whichever side(s) should be allowed to
+   execute (both, typically, for a normal paper-execution start).
 2. Trigger (or wait for) the resulting redeploy.
 3. Confirm the change actually took effect - two independent checks, not
    just one:
    - Render's own deploy logs show the startup line
      `[SERVER] Autopilot: enabled / execution` (not `/ dry-run` -
      `server.ts:1373-1376`).
-   - `GET /api/autopilot/status` reports `"executeTrades": true` in the
+   - `GET /api/autopilot/status` reports `"executeTrades": true` **and**
+     `"allowBuy"`/`"allowSell"` matching what was intended, in the
      response body (`autopilotWorker.ts`'s `getStatus()`).
 4. Do not consider this "done" until both checks agree - a log line alone
    could reflect a stale deploy; the live status endpoint is the
@@ -114,6 +141,36 @@ cap/circuit breaker each observed firing correctly at least once), gate 4
 `GOLIVE_CRITERIA.md` directly when judging whether a given stretch of paper
 execution actually clears these - this document doesn't restate their exact
 wording so the two can't quietly diverge.
+
+## Verification log
+
+Real, dated pre-flight checks - not hypothetical. Append future checks here
+rather than overwriting, so drift over time is visible.
+
+**2026-07-15** (read-only `GET` requests against the live Render deployment,
+no state changed):
+- `GET /api/autopilot/status`: `enabled: true`, `executeTrades: false`,
+  `allowBuy: false`, `allowSell: false`, `tradeMode: "paper"`,
+  `strategyVersion: "v1.2-confluence-scoring"`, `tickers`: the 13-ticker
+  baseline universe (not the 5-ETF Rotation universe) - **confirms ETF
+  Rotation is not the live strategy today** (see the pre-flight checklist's
+  first item, above).
+- `GET /api/autopilot/circuit-breaker/review`: `tripped: false`,
+  `drawdownFromPeakPercent: 0`, `positions: {}`, `cash: 88131.18`.
+- `GET /api/portfolio`: `equity: 88131.18`, `positions: {}` (empty).
+- `GET /api/orders`: `[]` (no open orders).
+- **Reading**: the paper account is currently clean - no leftover positions
+  or open orders from the 2026-06 runaway-script incident (`docs/incidents/2026-06-automated-trading-loss.md`)
+  or anything else, fully in cash. Equity (~$88,131) is consistent with that
+  incident's traced loss, not a new or separate issue.
+- **Not verified in this pass**: Telegram alerting (no read-only way to
+  confirm a real alert was recently received without sending a test one).
+
+**Decision recorded alongside this check (2026-07-15)**: do not enable
+execution now. ETF Rotation is not wired into `autopilotWorker.ts` - ETF
+Rotation live-integration is the next major piece of work, to be scoped as
+its own dedicated design effort (see `docs/product/ROADMAP.md` Phase 3),
+not assumed to be a quick follow-up to this checklist.
 
 ## Explicitly out of scope for this document
 
