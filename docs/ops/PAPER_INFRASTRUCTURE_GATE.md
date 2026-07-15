@@ -88,10 +88,11 @@ previously an unverified assumption - it's now a confirmed, structurally
 enforced one.
 
 **Same dashboard check also confirmed the environment variables that matter
-most here**: `TRADE_MODE=paper`, `ALLOW_MANUAL_TRADES=false`, and
-`AUTOPILOT_EXECUTE_TRADES` not set at all (which the code treats as `false`,
-since it only enables on an exact `"true"` string match) - consistent with
-every hard boundary in `CLAUDE.md`.
+most here**: `TRADE_MODE=paper`, `ALLOW_MANUAL_TRADES=false`, and (as of this
+writing) `AUTOPILOT_EXECUTE_TRADES=false` explicitly set in Render's
+environment - consistent with every hard boundary in `CLAUDE.md`. This is a
+2026-07-15 snapshot, not a permanent fact - re-check the actual value in
+Render before ever flipping execution, rather than trusting this document.
 
 **Caveat worth carrying forward**: if this service is ever scaled for
 availability/performance reasons in the future, the disk would need to come
