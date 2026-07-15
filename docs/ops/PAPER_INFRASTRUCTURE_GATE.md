@@ -14,31 +14,76 @@ gaps. It does not change any code, threshold, or execution behavior.
 
 | # | Item | Status |
 |---|---|---|
-| 1 | One worker instance | ❓ Not verifiable from the repo — needs a Render dashboard check |
-| 2 | Persistent disk behavior | ⚠️ Partially confirmed (see below) |
+| 1 | One worker instance | ✅ Confirmed 2026-07-15 — structurally guaranteed, not just observed (see below) |
+| 2 | Persistent disk behavior | ✅ Confirmed 2026-07-15 |
 | 3 | Restart with circuit breaker tripped | ✅ Restart-regression tested 2026-07-15 (simulated locally, not observed in a real production trip) |
 | 4 | Restart with pending/ambiguous order | ✅ Code-fixed + restart-regression tested (PR #34); live-fire verification deferred to first real paper execution |
 | 5 | Audit/journal survives deploy | ✅ Empirically confirmed |
 | 6 | Alerts work after restart | ⚠️ Should work (state-backed), never observed live |
-| 7 | No duplicate worker cycles | ⚠️ Logic exists and is tested, contingent on item 1 |
+| 7 | No duplicate worker cycles | ✅ Materially addressed 2026-07-15 — bounded by the current no-scaling Render topology, not a strengthened lock |
 | 8 | Emergency stop documented | ✅ See `EMERGENCY_STOP.md` |
+
+## Current overall status (2026-07-15)
+
+**7 of 8 materially addressed for pre-paper readiness.** Deliberately not
+"7 of 8 closed" - item 7 in particular is bounded by the current Render
+topology, not a fix to the lock's own architecture (see item 7 below).
+
+Materially addressed:
+1. Single Render instance — verified through the Scaling UI's "not
+   supported for servers with disks" limitation.
+2. Persistent disk — verified via the Render dashboard, mount path matches
+   the code's own path construction exactly.
+3. Circuit breaker restart persistence — local file-based regression
+   tested.
+4. Pending/ambiguous order idempotency — persisted and restart-regression
+   tested.
+5. Audit/journal persistence — documented and disk-backed.
+7. Duplicate worker cycles — bounded by the current no-scaling Render
+   topology plus the existing best-effort lock; not a distributed lock,
+   and doesn't need to be one on this topology.
+8. Emergency stop — documented (`EMERGENCY_STOP.md`).
+
+Remaining:
+6. Alerts surviving a real restart/deploy while halted — deferred until
+   observation over time or a deliberate, separately-decided fire drill.
+   Not something a dashboard check or more unit tests can close.
+
+**What this does not mean**: it does not mean `AUTOPILOT_EXECUTE_TRADES`
+should be turned on now. That's a separate decision, gated on (at minimum)
+deciding what to do about item 6, and is out of scope for this document
+(see "Explicitly out of scope," below).
 
 ## 1. One worker instance
 
-Not something the code can confirm on its own — no `render.yaml`, `Procfile`,
-or other deploy-config file exists in this repository (checked root and
-`backend/`); the Render service is configured entirely through Render's
-dashboard.
+**Confirmed 2026-07-15, via the Render dashboard (Scaling panel)**: not just
+"currently 1 instance," but a **structural** guarantee - the dashboard
+states outright, "Scaling is not supported for servers with disks." This
+service (`ai-trading-agent`, Web Service, Node, Starter plan) has a
+persistent disk attached, so Render itself disallows running more than one
+instance as long as that disk stays attached. This is a stronger guarantee
+than an observed-today setting - it can't silently drift to multi-instance
+without someone first deliberately detaching the disk (which would also
+break every persistence assumption in items 2/3/4/5, so it's not something
+that could happen unnoticed).
 
-**How to verify**: in the Render dashboard, open the backend service →
-confirm its plan/scaling settings show exactly 1 instance (not autoscaling,
-not multiple instances). This matters because every safety mechanism below
-that says "same-host only" (the worker lock, the in-memory order-idempotency
-tracker) provides **zero** protection if Render ever runs more than one
-instance of this service with separate memory/disk.
+This matters because every safety mechanism elsewhere in this document that
+says "same-host only" (the worker lock, the order-idempotency tracker) was
+previously an unverified assumption - it's now a confirmed, structurally
+enforced one.
 
-**Status**: open until someone actually looks at the dashboard and records
-the answer here.
+**Same dashboard check also confirmed the environment variables that matter
+most here**: `TRADE_MODE=paper`, `ALLOW_MANUAL_TRADES=false`, and
+`AUTOPILOT_EXECUTE_TRADES` not set at all (which the code treats as `false`,
+since it only enables on an exact `"true"` string match) - consistent with
+every hard boundary in `CLAUDE.md`.
+
+**Caveat worth carrying forward**: if this service is ever scaled for
+availability/performance reasons in the future, the disk would need to come
+off first - at which point items 1, 2, 3, 4, 5, and 7 all need to be
+re-examined from scratch (the whole local-disk state-file design assumes
+single-instance). Not a concern today, but worth flagging so a future
+"let's add another instance" decision doesn't silently reopen this gate.
 
 ## 2. Persistent disk behavior
 
@@ -46,9 +91,18 @@ the answer here.
 empirically across roughly 10 redeploys in one session (per `CLAUDE.md`);
 the audit log and decision journal (item 5) are direct evidence of this.
 
-**Not confirmed**: whether the disk is *shared* across instances if this
-service is ever scaled beyond one instance (see item 1). `autopilotWorkerLock.ts`'s
-own code comment already states this is an open question, not assumed true.
+**Confirmed 2026-07-15, closing the previously-open question**: the
+Render dashboard shows a 1 GB persistent disk mounted at
+`/opt/render/project/src/backend/data`, with root directory set to
+`backend`. Since `process.cwd()` for this service resolves to
+`/opt/render/project/src/backend` (the configured root directory), and
+every state file's path is built as `path.resolve(process.cwd(), "data")`
+(see the four files listed below), the mount path **exactly matches** where
+the code actually reads and writes - not a guess, a direct match between
+the dashboard's own config and the code's own path construction. Combined
+with item 1's confirmation (scaling structurally disabled while this disk
+exists), the "is the disk shared across instances" question is now moot -
+there's only ever one instance to share it with.
 
 All four disk-backed state files resolve their path the same way — relative
 to `process.cwd()`, not an absolute/configured path:
@@ -137,8 +191,9 @@ something to simulate further here.
 
 **Confirmed** — both `circuit-breaker-audit.jsonl` and
 `autopilot-decisions.jsonl` have survived multiple real redeploys in
-practice (same empirical evidence as item 2). Subject to the same open
-question about multi-instance disk-sharing as item 2.
+practice (same empirical evidence as item 2). The multi-instance
+disk-sharing question that used to qualify this is now closed (see item 1) -
+there's only ever one instance for this disk to belong to.
 
 ## 6. Alerts work after restart
 
@@ -163,10 +218,19 @@ claimed / exact-boundary-not-yet-stale refused).
 
 The code's own comment (`autopilotWorkerLock.ts:7-13`) is explicit: this
 protects against an old+new process briefly overlapping on the **same host**
-during a deploy transition. It provides **no** protection if Render ever
-runs genuinely separate instances with separate memory — which is exactly
-item 1's open question. This item's real-world guarantee is only as strong
-as item 1's answer.
+during a deploy transition. It provides **no** protection against genuinely
+separate instances with separate memory - that hasn't changed and isn't
+being claimed to have changed.
+
+**Materially addressed 2026-07-15, precisely stated**: the lock itself is
+still best-effort, not a real distributed lock - nothing was strengthened
+in the code. What changed is that item 1 confirmed a genuinely separate
+host isn't reachable *for this service, on its current Render topology*
+(scaling structurally disabled while the disk is attached) - so the lock's
+known weak spot is currently a non-issue by construction, not because the
+mechanism itself became more robust. If this service is ever scaled
+(item 1's own caveat), this item reopens along with it - worth remembering
+as "bounded by topology," not "solved."
 
 ## 8. Emergency stop documented
 
