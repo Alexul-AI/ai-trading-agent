@@ -13,12 +13,14 @@ code, no env var, and does not run any fire drill.
 - [ ] Re-read `docs/ops/PAPER_INFRASTRUCTURE_GATE.md`'s current status summary
       in full - don't rely on memory of what it said on 2026-07-15. Confirm
       nothing has drifted (code changes, Render plan/config changes).
-- [ ] **Item 6 explicitly decided, not silently skipped**: either (a) a
-      controlled fire drill was run and passed, with evidence recorded in
-      the gate doc, or (b) the risk is explicitly accepted as deferred/
-      observed-over-time. Either is acceptable - what's not acceptable is
-      turning execution on without this line having been consciously
-      checked one way or the other.
+- [ ] **Item 6 (alerts surviving a real restart while halted)**: already
+      explicitly accepted as a deferred risk for paper execution
+      (`docs/ops/PAPER_INFRASTRUCTURE_GATE.md`, decided 2026-07-15) - no
+      further action needed here for paper. That acceptance is scoped to
+      paper only, though - if this checklist is ever being used to prepare
+      for **micro-live** capital instead, item 6 must be revisited first
+      (real observation or a deliberate fire drill), not carried forward
+      silently.
 - [ ] Confirm the Render service's disk/instance topology hasn't changed
       since the gate was last verified (still one instance, still has the
       persistent disk attached, still mounted at

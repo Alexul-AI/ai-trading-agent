@@ -19,15 +19,18 @@ gaps. It does not change any code, threshold, or execution behavior.
 | 3 | Restart with circuit breaker tripped | ✅ Restart-regression tested 2026-07-15 (simulated locally, not observed in a real production trip) |
 | 4 | Restart with pending/ambiguous order | ✅ Code-fixed + restart-regression tested (PR #34); live-fire verification deferred to first real paper execution |
 | 5 | Audit/journal survives deploy | ✅ Empirically confirmed |
-| 6 | Alerts work after restart | ⚠️ Should work (state-backed), never observed live |
+| 6 | Alerts work after restart | 🟡 Accepted as deferred risk for paper (2026-07-15) - must be revisited before micro-live |
 | 7 | No duplicate worker cycles | ✅ Materially addressed 2026-07-15 — bounded by the current no-scaling Render topology, not a strengthened lock |
 | 8 | Emergency stop documented | ✅ See `EMERGENCY_STOP.md` |
 
 ## Current overall status (2026-07-15)
 
-**7 of 8 materially addressed for pre-paper readiness.** Deliberately not
-"7 of 8 closed" - item 7 in particular is bounded by the current Render
-topology, not a fix to the lock's own architecture (see item 7 below).
+**All 8 items now have an explicit disposition for paper readiness: 7
+materially addressed, 1 (item 6) consciously accepted as a deferred risk
+scoped to paper only.** Deliberately not "8 of 8 closed" - item 7 is bounded
+by the current Render topology rather than a fix to the lock's own
+architecture (see item 7 below), and item 6's deferral is a decision with a
+scope and an expiry (revisit before micro-live), not a resolution.
 
 Materially addressed:
 1. Single Render instance — verified through the Scaling UI's "not
@@ -44,15 +47,27 @@ Materially addressed:
    and doesn't need to be one on this topology.
 8. Emergency stop — documented (`EMERGENCY_STOP.md`).
 
-Remaining:
-6. Alerts surviving a real restart/deploy while halted — deferred until
-   observation over time or a deliberate, separately-decided fire drill.
-   Not something a dashboard check or more unit tests can close.
+Deferred (decided, not just open):
+6. Alerts surviving a real restart/deploy while halted — **explicitly
+   accepted as a deferred risk for paper execution (2026-07-15)**, not a
+   dedicated fire drill. Reasoning: the mechanism this item would verify is
+   notification continuity, not the safety mechanism itself - item 3
+   already independently confirms new BUYs stay blocked across a restart
+   regardless of whether a reminder fires on schedule. A fire drill would
+   mean manually editing the live state file via Render's Shell to force a
+   halt, then a real redeploy, purely to observe alert behavior - real
+   action on production infrastructure for an observability question, not
+   a capital-protection one. This service also redeploys on every merged
+   PR, so if the breaker ever does trip during paper execution, a natural
+   redeploy will likely occur during that window anyway, giving a real
+   observation without manufacturing one. **This deferral is scoped to
+   paper only - it must be explicitly revisited (fire drill or real
+   observation) before micro-live capital, not silently carried forward.**
 
 **What this does not mean**: it does not mean `AUTOPILOT_EXECUTE_TRADES`
-should be turned on now. That's a separate decision, gated on (at minimum)
-deciding what to do about item 6, and is out of scope for this document
-(see "Explicitly out of scope," below).
+should be turned on now - that remains a separate decision. It also does not
+mean item 6 is closed - "accepted as deferred for paper" is a decision with
+a scope (paper only), not a resolution of the underlying question.
 
 ## 1. One worker instance
 
@@ -197,12 +212,37 @@ there's only ever one instance for this disk to belong to.
 
 ## 6. Alerts work after restart
 
+**Status: accepted as a deferred risk for paper execution (2026-07-15).
+Not a fire drill, not a resolution - revisit before micro-live.**
+
 Reminder logic (`shouldSendDailyReminder`, `lastReminderSentDate` field) is
 part of the persisted circuit-breaker state, so it should correctly resume
 its once-per-day cadence after a restart rather than re-firing or going
 silent. This has not been observed against a real restart during an actual
 halt (the breaker has never tripped in production), so it's a reasonable
 inference from the state being persisted, not an empirical confirmation.
+
+**Decision and reasoning (2026-07-15)**: rather than run a controlled fire
+drill to close this now, the risk is explicitly accepted for the paper
+stage. What this item would verify - alert/notification continuity - is
+distinct from the actual safety mechanism (new BUYs staying blocked across
+a restart), which item 3 already confirms independently via a real
+file-based regression test. A fire drill to close this item specifically
+would mean manually forcing a halted state onto the live Render disk (via
+its Shell) and triggering a real redeploy purely to watch alert behavior -
+a deliberate action on production infrastructure whose payoff is
+observability, not capital protection. This service also redeploys on
+every merged PR, so if the breaker ever genuinely trips during paper
+execution, a natural redeploy is likely to land during that window anyway,
+producing a real observation without manufacturing one.
+
+**Explicit scope of this decision - not a general "good enough forever"**:
+this acceptance applies to the paper stage only. Before any micro-live
+capital, this must be revisited - either via a real observed occurrence
+during paper trading, or a deliberate, separately-approved fire drill at
+that point. Carrying this deferral forward silently into the live-readiness
+discussion would be exactly the kind of judgment-call drift `GOLIVE_CRITERIA.md`
+exists to prevent.
 
 ## 7. No duplicate worker cycles
 
