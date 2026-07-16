@@ -25,15 +25,19 @@ import {
 import {
   decideEtfRotationGateAction,
   readRebalanceStateStrict,
+  recordRebalanceExecuting,
   recordRebalancePlanned,
   recordRebalanceTerminal,
   type RebalanceStatus,
 } from "./etfRotationWorkerState.js";
 import type { OrderErrorClassification } from "./orderIdempotency.js";
-import type {
-  EtfRotationExecutionStatus,
-  EtfRotationSubmitOrderLegResult,
+import {
+  executeEtfRotationOrders,
+  type EtfRotationExecutionStatus,
+  type EtfRotationSubmitOrderLeg,
+  type EtfRotationSubmitOrderLegResult,
 } from "./etfRotationExecution.js";
+import { appendEtfRotationOrderAuditEvent } from "./etfRotationOrderAuditLog.js";
 import { getNewsSentiment, getInsiderActivity } from "./agent.js";
 import {
   updatePortfolioCircuitBreaker,
@@ -126,7 +130,13 @@ export type ExecutionStatus =
   | "dry_run"
   | "blocked"
   | "executed"
-  | "failed";
+  | "failed"
+  // Only reachable via the ETF Rotation execution path (PR #47b) - the
+  // baseline path's executeSafeTrade call never distinguishes this from
+  // "failed" (see analyzeTicker's own success/failure branch). An
+  // ambiguous leg's outcome genuinely isn't known - never treated as a
+  // silent success or a confident rejection (design doc §8).
+  | "ambiguous";
 
 export type DecisionFinalStatus =
   | "hold"
@@ -1388,6 +1398,132 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     const config = ETF_ROTATION_ACTIVE_CONFIG;
     const timestamp = new Date().toISOString();
 
+    // Strict gate/state adoption (Stage 2D, PR #45), read BEFORE any
+    // market-data fetch (PR #47b) - a corrupt state file or a stuck
+    // failed_needs_review/executing must block the cycle even when
+    // fetchAlpacaBars itself would fail or be slow; the old ordering (bars
+    // first, state after) meant these restart hazards were never even
+    // evaluated on a bad market-data day. decideEtfRotationGateAction
+    // (etfRotationWorkerState.ts) fails closed on a corrupt state file,
+    // detects a stale "executing" leftover from a crash mid-sequence
+    // (transitions it to failed_needs_review rather than resuming), and
+    // blocks on an existing failed_needs_review until a human clears it via
+    // the admin-gated POST /api/autopilot/etf-rotation/clear-review endpoint
+    // (server.ts). None of these first three checks need today's date, so
+    // monthKey is passed as null here - see decideEtfRotationGateAction's
+    // own doc comment for why this is an explicit, tested part of its
+    // contract, not an accident of internal check ordering.
+    const stateResult = await readRebalanceStateStrict();
+    const preBarsGateAction = decideEtfRotationGateAction(stateResult, null);
+    const noPricesYet = new Map<string, number>();
+
+    if (preBarsGateAction === "state_corrupt_fail_closed") {
+      const alertMessage =
+        "ETF Rotation state file is unreadable/corrupt - failing closed, no new rebalance attempted this cycle. Investigate data/etf-rotation-worker-state.json.";
+
+      options.broadcastSSE({
+        type: "notification",
+        level: "error",
+        message: alertMessage,
+      });
+      if (options.sendTelegramAlert) {
+        await options.sendTelegramAlert(alertMessage);
+      }
+
+      return config.universe.map((ticker) => ({
+        ticker,
+        timestamp,
+        price: noPricesYet.get(ticker) ?? 0,
+        action: "HOLD",
+        confidence: 0,
+        suggestedShares: 0,
+        reasonType: "NOT_REBALANCE_DAY",
+        reason: alertMessage,
+        finalStatus: "blocked",
+        signalStatus: "blocked",
+        executionStatus: "not_attempted",
+        isSignalReady: false,
+        blockReasonCategory: "error",
+        blockReasonCode: "ETF_ROTATION_STATE_CORRUPT",
+        blockReasonDetail: alertMessage,
+        executed: false,
+        skippedReason: alertMessage,
+      }));
+    }
+
+    if (preBarsGateAction === "stale_executing_needs_review") {
+      // A previous process left the cycle mid-sequence (crash between SELL
+      // and BUY legs, or between planning and execution starting) - never
+      // resumed, per the design doc's Stage 2A resolution. Reachable for
+      // real now that executeEtfRotationOrders is wired in below.
+      await recordRebalanceTerminal("failed_needs_review");
+
+      const alertMessage =
+        'ETF Rotation found a stuck "executing" rebalance from a previous cycle/restart - marked failed_needs_review. Blocked until cleared via POST /api/autopilot/etf-rotation/clear-review.';
+
+      options.broadcastSSE({
+        type: "notification",
+        level: "error",
+        message: alertMessage,
+      });
+      if (options.sendTelegramAlert) {
+        await options.sendTelegramAlert(alertMessage);
+      }
+
+      return config.universe.map((ticker) => ({
+        ticker,
+        timestamp,
+        price: noPricesYet.get(ticker) ?? 0,
+        action: "HOLD",
+        confidence: 0,
+        suggestedShares: 0,
+        reasonType: "NOT_REBALANCE_DAY",
+        reason: alertMessage,
+        finalStatus: "blocked",
+        signalStatus: "blocked",
+        executionStatus: "not_attempted",
+        isSignalReady: false,
+        blockReasonCategory: "safety_cap",
+        blockReasonCode: "ETF_ROTATION_STALE_EXECUTING",
+        blockReasonDetail: alertMessage,
+        executed: false,
+        skippedReason: alertMessage,
+      }));
+    }
+
+    if (preBarsGateAction === "blocked_failed_needs_review") {
+      // Quiet on repeat cycles (unlike the one-time alert above) - the
+      // transition into failed_needs_review already alerted once; staying
+      // blocked every subsequent cycle until a human clears it shouldn't
+      // re-alert every cycle.
+      const reason = `ETF Rotation is blocked in failed_needs_review (month ${
+        stateResult.state.rebalanceMonthKey ?? "unknown"
+      }) - clear via POST /api/autopilot/etf-rotation/clear-review before further rebalancing.`;
+
+      return config.universe.map((ticker) => ({
+        ticker,
+        timestamp,
+        price: noPricesYet.get(ticker) ?? 0,
+        action: "HOLD",
+        confidence: 0,
+        suggestedShares: 0,
+        reasonType: "NOT_REBALANCE_DAY",
+        reason,
+        finalStatus: "blocked",
+        signalStatus: "blocked",
+        executionStatus: "not_attempted",
+        isSignalReady: false,
+        blockReasonCategory: "safety_cap",
+        blockReasonCode: "ETF_ROTATION_FAILED_NEEDS_REVIEW",
+        blockReasonDetail: reason,
+        executed: false,
+        skippedReason: reason,
+      }));
+    }
+
+    // preBarsGateAction === "needs_month_key" - no restart hazard applies;
+    // safe (and necessary) to fetch market data now.
+
     const barsByTicker = new Map<string, AlpacaBar[]>();
 
     await Promise.all(
@@ -1424,125 +1560,13 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       );
     }
 
-    // Strict gate/state adoption (Stage 2D, PR #45) - replaces the old
-    // getLastRebalanceDateKey/isMonthlyRebalanceDate pair entirely, per
-    // docs/ops/ETF_ROTATION_PAPER_EXECUTION_PLAN.md's Stage 2D plan. The old
-    // pair only knew "did the month change" - decideEtfRotationGateAction
-    // additionally fails closed on a corrupt state file, detects a stale
-    // "executing" leftover from a crash mid-sequence (transitions it to
-    // failed_needs_review rather than resuming), and blocks on an existing
-    // failed_needs_review until a human clears it via the admin-gated
-    // POST /api/autopilot/etf-rotation/clear-review endpoint (server.ts).
-    // Still zero calls to executeSafeTrade anywhere below - this PR only
-    // changes which cycles are allowed to compute a plan, not execution.
     const monthKey = latestDateKey.slice(0, 7);
-    const stateResult = await readRebalanceStateStrict();
+    // Same stateResult as above, now with the real monthKey - only
+    // "already_done_this_month" or "proceed_to_plan" are structurally
+    // reachable here (the other three already returned above); calling the
+    // same single-source-of-truth function again avoids re-deriving
+    // isRebalanceMonthDone's logic inline a second time.
     const gateAction = decideEtfRotationGateAction(stateResult, monthKey);
-
-    if (gateAction === "state_corrupt_fail_closed") {
-      const alertMessage =
-        "ETF Rotation state file is unreadable/corrupt - failing closed, no new rebalance attempted this cycle. Investigate data/etf-rotation-worker-state.json.";
-
-      options.broadcastSSE({
-        type: "notification",
-        level: "error",
-        message: alertMessage,
-      });
-      if (options.sendTelegramAlert) {
-        await options.sendTelegramAlert(alertMessage);
-      }
-
-      return config.universe.map((ticker) => ({
-        ticker,
-        timestamp,
-        price: currentPriceByTicker.get(ticker) ?? 0,
-        action: "HOLD",
-        confidence: 0,
-        suggestedShares: 0,
-        reasonType: "NOT_REBALANCE_DAY",
-        reason: alertMessage,
-        finalStatus: "blocked",
-        signalStatus: "blocked",
-        executionStatus: "not_attempted",
-        isSignalReady: false,
-        blockReasonCategory: "error",
-        blockReasonCode: "ETF_ROTATION_STATE_CORRUPT",
-        blockReasonDetail: alertMessage,
-        executed: false,
-        skippedReason: alertMessage,
-      }));
-    }
-
-    if (gateAction === "stale_executing_needs_review") {
-      // A previous process left the cycle mid-sequence (crash between SELL
-      // and BUY legs, or between planning and execution starting) - never
-      // resumed, per the design doc's Stage 2A resolution. This branch is
-      // added and tested now even though "executing" can't be reached by
-      // any live code path until the execution-wiring PR exists.
-      await recordRebalanceTerminal("failed_needs_review");
-
-      const alertMessage =
-        'ETF Rotation found a stuck "executing" rebalance from a previous cycle/restart - marked failed_needs_review. Blocked until cleared via POST /api/autopilot/etf-rotation/clear-review.';
-
-      options.broadcastSSE({
-        type: "notification",
-        level: "error",
-        message: alertMessage,
-      });
-      if (options.sendTelegramAlert) {
-        await options.sendTelegramAlert(alertMessage);
-      }
-
-      return config.universe.map((ticker) => ({
-        ticker,
-        timestamp,
-        price: currentPriceByTicker.get(ticker) ?? 0,
-        action: "HOLD",
-        confidence: 0,
-        suggestedShares: 0,
-        reasonType: "NOT_REBALANCE_DAY",
-        reason: alertMessage,
-        finalStatus: "blocked",
-        signalStatus: "blocked",
-        executionStatus: "not_attempted",
-        isSignalReady: false,
-        blockReasonCategory: "safety_cap",
-        blockReasonCode: "ETF_ROTATION_STALE_EXECUTING",
-        blockReasonDetail: alertMessage,
-        executed: false,
-        skippedReason: alertMessage,
-      }));
-    }
-
-    if (gateAction === "blocked_failed_needs_review") {
-      // Quiet on repeat cycles (unlike the one-time alert above) - the
-      // transition into failed_needs_review already alerted once; staying
-      // blocked every subsequent cycle until a human clears it shouldn't
-      // re-alert every cycle.
-      const reason = `ETF Rotation is blocked in failed_needs_review (month ${
-        stateResult.state.rebalanceMonthKey ?? "unknown"
-      }) - clear via POST /api/autopilot/etf-rotation/clear-review before further rebalancing.`;
-
-      return config.universe.map((ticker) => ({
-        ticker,
-        timestamp,
-        price: currentPriceByTicker.get(ticker) ?? 0,
-        action: "HOLD",
-        confidence: 0,
-        suggestedShares: 0,
-        reasonType: "NOT_REBALANCE_DAY",
-        reason,
-        finalStatus: "blocked",
-        signalStatus: "blocked",
-        executionStatus: "not_attempted",
-        isSignalReady: false,
-        blockReasonCategory: "safety_cap",
-        blockReasonCode: "ETF_ROTATION_FAILED_NEEDS_REVIEW",
-        blockReasonDetail: reason,
-        executed: false,
-        skippedReason: reason,
-      }));
-    }
 
     if (gateAction === "already_done_this_month") {
       return config.universe.map((ticker) => ({
@@ -1613,12 +1637,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       config.universe,
     );
 
-    // Status "planned" - the monthly gate (isRebalanceMonthDone) only
-    // treats this month as done once a later PR's execution reaches
-    // "executed"/"partial", so until that PR exists this plan gets
-    // recomputed fresh every cycle for the rest of the month. Expected and
-    // harmless (nothing executes, decisions are idempotent to recompute) -
-    // see the Stage 2D plan's question 2.
+    // Status "planned".
     await recordRebalancePlanned({
       dateKey: latestDateKey,
       rebalanceMonthKey: monthKey,
@@ -1639,80 +1658,266 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         .map((order) => [order.ticker, order]),
     );
 
+    if (!AUTOPILOT_EXECUTE_TRADES) {
+      // Global off switch (PR #47b) - the adapter is never even reached,
+      // not merely told not to act. Preserves Stage 1/PR45's exact dry-run
+      // decision shape unchanged whenever execution stays disabled
+      // (today's real Render value) - this PR changes zero observable
+      // behavior unless AUTOPILOT_EXECUTE_TRADES is explicitly flipped,
+      // which it is not here or in Render.
+      return config.universe.map((ticker): AutopilotDecisionLog => {
+        const price = currentPriceByTicker.get(ticker) ?? 0;
+        const buyOrder = buyByTicker.get(ticker);
+        const sellOrder = sellByTicker.get(ticker);
+        const target = targetByTicker.get(ticker);
+
+        if (buyOrder) {
+          const reason = sellOrder
+            ? `Momentum/trend rebalance: continuing top pick at target weight ${target?.weightPercent.toFixed(
+                1,
+              )}% - liquidated ${sellOrder.shares} existing shares and rebuilt to ${
+                buyOrder.shares
+              } shares.`
+            : `Momentum/trend rebalance: new top pick at target weight ${target?.weightPercent.toFixed(
+                1,
+              )}% - buying ${buyOrder.shares} shares.`;
+
+          return {
+            ticker,
+            timestamp,
+            price,
+            action: "BUY",
+            confidence: 1,
+            suggestedShares: buyOrder.shares,
+            reasonType: "REBALANCE_BUY",
+            reason,
+            finalStatus: "signal_ready",
+            signalStatus: "ready",
+            executionStatus: "dry_run",
+            isSignalReady: true,
+            executionBlockReasonCategory: "dry_run",
+            executionBlockReasonCode: "ETF_ROTATION_STAGE_1_NO_EXECUTION",
+            executionBlockReasonDetail:
+              "ETF Rotation execution is disabled (AUTOPILOT_EXECUTE_TRADES=false).",
+            executed: false,
+          };
+        }
+
+        if (sellOrder) {
+          return {
+            ticker,
+            timestamp,
+            price,
+            action: "SELL",
+            confidence: 1,
+            suggestedShares: sellOrder.shares,
+            reasonType: "REBALANCE_SELL",
+            reason: `Momentum/trend rebalance: no longer a top pick or failed the trend filter - liquidating ${sellOrder.shares} shares.`,
+            finalStatus: "signal_ready",
+            signalStatus: "ready",
+            executionStatus: "dry_run",
+            isSignalReady: true,
+            executionBlockReasonCategory: "dry_run",
+            executionBlockReasonCode: "ETF_ROTATION_STAGE_1_NO_EXECUTION",
+            executionBlockReasonDetail:
+              "ETF Rotation execution is disabled (AUTOPILOT_EXECUTE_TRADES=false).",
+            executed: false,
+          };
+        }
+
+        return {
+          ticker,
+          timestamp,
+          price,
+          action: "HOLD",
+          confidence: 0,
+          suggestedShares: 0,
+          reasonType: "REBALANCE_HOLD",
+          reason: "Not currently held and not selected in this rebalance.",
+          finalStatus: "hold",
+          signalStatus: "hold",
+          executionStatus: "not_attempted",
+          isSignalReady: false,
+          executed: false,
+        };
+      });
+    }
+
+    // AUTOPILOT_EXECUTE_TRADES is true - transition to executing and call
+    // the adapter. This is the only place "executing" is ever written in
+    // this file, and only reached when the global flag genuinely allows
+    // it. Still requires the relevant side gate per leg (checked inside
+    // executeEtfRotationOrders) and AUTOPILOT_STRATEGY=etf_rotation to
+    // even be in this function at all - none of which are set in Render.
+    await recordRebalanceExecuting();
+
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (
+      ticker,
+      action,
+      requestedShares,
+    ) =>
+      mapExecuteSafeTradeResultToLegOutcome(
+        await options.executeSafeTrade(ticker, action, requestedShares),
+      );
+
+    const executionResult = await executeEtfRotationOrders({
+      rebalanceMonthKey: monthKey,
+      configVariantKey: ETF_ROTATION_CONFIG_VARIANT_KEY,
+      orders,
+      executionGates: {
+        executeTradesEnabled: AUTOPILOT_EXECUTE_TRADES,
+        allowBuy: AUTOPILOT_ALLOW_BUY,
+        allowSell: AUTOPILOT_ALLOW_SELL,
+      },
+      submitOrderLeg,
+      appendAuditEvent: appendEtfRotationOrderAuditEvent,
+      refreshPortfolioSnapshot: options.getPortfolioSnapshot,
+      currentPriceByTicker,
+      now: () => new Date().toISOString(),
+    });
+
+    await recordRebalanceTerminal(
+      mapEtfRotationExecutionStatusToRebalanceStatus(executionResult.status),
+    );
+
+    // Build the final per-ticker decisions from what actually happened this
+    // cycle - the first time this can show a real (not hardcoded dry_run)
+    // executionStatus for the rotation path.
+    const acceptedByTicker = new Map(
+      executionResult.acceptedOrders.map((outcome) => [outcome.ticker, outcome]),
+    );
+    const failedByTicker = new Map(
+      executionResult.failedOrders.map((outcome) => [outcome.ticker, outcome]),
+    );
+    const blockedByTicker = new Map(
+      executionResult.blockedOrders.map((outcome) => [outcome.ticker, outcome]),
+    );
+    const ambiguousByTicker = new Map(
+      executionResult.ambiguousOrders.map((outcome) => [outcome.ticker, outcome]),
+    );
+
     return config.universe.map((ticker): AutopilotDecisionLog => {
       const price = currentPriceByTicker.get(ticker) ?? 0;
-      const buyOrder = buyByTicker.get(ticker);
-      const sellOrder = sellByTicker.get(ticker);
       const target = targetByTicker.get(ticker);
+      const weightNote = target
+        ? ` at target weight ${target.weightPercent.toFixed(1)}%`
+        : "";
 
-      if (buyOrder) {
-        const reason = sellOrder
-          ? `Momentum/trend rebalance: continuing top pick at target weight ${target?.weightPercent.toFixed(
-              1,
-            )}% - liquidated ${sellOrder.shares} existing shares and rebuilt to ${
-              buyOrder.shares
-            } shares.`
-          : `Momentum/trend rebalance: new top pick at target weight ${target?.weightPercent.toFixed(
-              1,
-            )}% - buying ${buyOrder.shares} shares.`;
+      const accepted = acceptedByTicker.get(ticker);
+      const failed = failedByTicker.get(ticker);
+      const blocked = blockedByTicker.get(ticker);
+      const ambiguous = ambiguousByTicker.get(ticker);
+      const outcome = accepted ?? failed ?? ambiguous ?? blocked;
 
+      if (!outcome) {
         return {
           ticker,
           timestamp,
           price,
-          action: "BUY",
-          confidence: 1,
-          suggestedShares: buyOrder.shares,
-          reasonType: "REBALANCE_BUY",
-          reason,
-          finalStatus: "signal_ready",
-          signalStatus: "ready",
-          executionStatus: "dry_run",
-          isSignalReady: true,
-          executionBlockReasonCategory: "dry_run",
-          executionBlockReasonCode: "ETF_ROTATION_STAGE_1_NO_EXECUTION",
-          executionBlockReasonDetail:
-            "ETF Rotation execution is not yet wired to order submission (Stage 1: decision-only).",
+          action: "HOLD",
+          confidence: 0,
+          suggestedShares: 0,
+          reasonType: "REBALANCE_HOLD",
+          reason: "Not currently held and not selected in this rebalance.",
+          finalStatus: "hold",
+          signalStatus: "hold",
+          executionStatus: "not_attempted",
+          isSignalReady: false,
           executed: false,
         };
       }
 
-      if (sellOrder) {
+      const reasonType = outcome.action === "BUY" ? "REBALANCE_BUY" : "REBALANCE_SELL";
+
+      if (accepted) {
+        const submittedQty = accepted.submittedQty ?? accepted.requestedQty;
         return {
           ticker,
           timestamp,
           price,
-          action: "SELL",
+          action: accepted.action,
           confidence: 1,
-          suggestedShares: sellOrder.shares,
-          reasonType: "REBALANCE_SELL",
-          reason: `Momentum/trend rebalance: no longer a top pick or failed the trend filter - liquidating ${sellOrder.shares} shares.`,
-          finalStatus: "signal_ready",
+          suggestedShares: submittedQty,
+          reasonType,
+          reason: `Momentum/trend rebalance${weightNote} - ${
+            accepted.action === "BUY" ? "bought" : "sold"
+          } ${submittedQty} shares (broker-accepted, not fill-confirmed).`,
+          finalStatus: "executed",
           signalStatus: "ready",
-          executionStatus: "dry_run",
+          executionStatus: "executed",
           isSignalReady: true,
-          executionBlockReasonCategory: "dry_run",
-          executionBlockReasonCode: "ETF_ROTATION_STAGE_1_NO_EXECUTION",
-          executionBlockReasonDetail:
-            "ETF Rotation execution is not yet wired to order submission (Stage 1: decision-only).",
-          executed: false,
+          executed: true,
         };
       }
 
+      if (failed) {
+        const detail = failed.error ?? "Order rejected by broker.";
+        return {
+          ticker,
+          timestamp,
+          price,
+          action: failed.action,
+          confidence: 1,
+          suggestedShares: failed.submittedQty ?? failed.requestedQty,
+          reasonType,
+          reason: `Momentum/trend rebalance${weightNote} - ${failed.action} rejected: ${detail}`,
+          finalStatus: "execution_failed",
+          signalStatus: "ready",
+          executionStatus: "failed",
+          isSignalReady: true,
+          executionBlockReasonCategory: "broker",
+          executionBlockReasonCode: "ETF_ROTATION_ORDER_REJECTED",
+          executionBlockReasonDetail: detail,
+          executed: false,
+          skippedReason: detail,
+        };
+      }
+
+      if (ambiguous) {
+        const detail =
+          ambiguous.error ?? "Order outcome could not be confirmed.";
+        return {
+          ticker,
+          timestamp,
+          price,
+          action: ambiguous.action,
+          confidence: 1,
+          suggestedShares: ambiguous.submittedQty ?? ambiguous.requestedQty,
+          reasonType,
+          reason: `Momentum/trend rebalance${weightNote} - ${ambiguous.action} outcome could not be confirmed: ${detail} Needs manual review.`,
+          finalStatus: "error",
+          signalStatus: "ready",
+          executionStatus: "ambiguous",
+          isSignalReady: true,
+          executionBlockReasonCategory: "broker",
+          executionBlockReasonCode: "ETF_ROTATION_ORDER_AMBIGUOUS",
+          executionBlockReasonDetail: detail,
+          executed: false,
+          skippedReason: detail,
+        };
+      }
+
+      // blocked
+      const blockedOutcome = blocked!;
+      const detail = blockedOutcome.blockReason ?? "Order blocked before submission.";
       return {
         ticker,
         timestamp,
         price,
-        action: "HOLD",
+        action: blockedOutcome.action,
         confidence: 0,
-        suggestedShares: 0,
-        reasonType: "REBALANCE_HOLD",
-        reason: "Not currently held and not selected in this rebalance.",
-        finalStatus: "hold",
-        signalStatus: "hold",
-        executionStatus: "not_attempted",
+        suggestedShares: blockedOutcome.requestedQty,
+        reasonType,
+        reason: `Momentum/trend rebalance${weightNote} - ${blockedOutcome.action} not attempted: ${detail}`,
+        finalStatus: "blocked",
+        signalStatus: "blocked",
+        executionStatus: "blocked",
         isSignalReady: false,
+        executionBlockReasonCategory: "other",
+        executionBlockReasonCode: "ETF_ROTATION_ORDER_BLOCKED",
+        executionBlockReasonDetail: detail,
         executed: false,
+        skippedReason: detail,
       };
     });
   }
