@@ -3,8 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   computeOverallExecutionStatus,
   executeEtfRotationOrders,
-  type EtfRotationExecuteSafeTrade,
   type EtfRotationExecutionGates,
+  type EtfRotationSubmitOrderLeg,
 } from "./etfRotationExecution.js";
 import type {
   EtfRotationOrderAuditEvent,
@@ -39,21 +39,18 @@ function collectingAuditRecorder(): {
   };
 }
 
-function throwingExecuteSafeTrade(): EtfRotationExecuteSafeTrade {
+function throwingSubmitOrderLeg(): EtfRotationSubmitOrderLeg {
   return async () => {
     throw new Error(
-      "executeSafeTrade should NEVER be called for this test scenario.",
+      "submitOrderLeg should NEVER be called for this test scenario.",
     );
   };
 }
 
-function successfulExecuteSafeTrade(
+function acceptingSubmitOrderLeg(
   brokerOrderId = "broker-1",
-): EtfRotationExecuteSafeTrade {
-  return async () => ({
-    status: "success",
-    order: { id: brokerOrderId },
-  });
+): EtfRotationSubmitOrderLeg {
+  return async () => ({ outcome: "accepted", brokerOrderId });
 }
 
 const baseParams = {
@@ -68,7 +65,7 @@ const baseParams = {
 };
 
 describe("executeEtfRotationOrders - global execute-trades gate", () => {
-  it("never calls executeSafeTrade when AUTOPILOT_EXECUTE_TRADES is false, and blocks every leg", async () => {
+  it("never calls submitOrderLeg when AUTOPILOT_EXECUTE_TRADES is false, and blocks every leg", async () => {
     const orders: RebalanceOrder[] = [
       { ticker: "SPY", action: "BUY", shares: 10, targetWeightPercent: 50 },
       { ticker: "GLD", action: "SELL", shares: 5 },
@@ -79,55 +76,55 @@ describe("executeEtfRotationOrders - global execute-trades gate", () => {
       ...baseParams,
       orders,
       executionGates: { ...ALLOW_ALL, executeTradesEnabled: false },
-      executeSafeTrade: throwingExecuteSafeTrade(),
+      submitOrderLeg: throwingSubmitOrderLeg(),
       appendAuditEvent: audit.appendAuditEvent,
       refreshPortfolioSnapshot: async () => makeSnapshot(100000),
     });
 
     expect(result.status).toBe("not_attempted");
     expect(result.blockedOrders).toHaveLength(2);
-    expect(result.executedOrders).toHaveLength(0);
+    expect(result.acceptedOrders).toHaveLength(0);
     expect(audit.events).toHaveLength(0);
   });
 });
 
 describe("executeEtfRotationOrders - per-leg side gates", () => {
-  it("blocks a SELL leg when AUTOPILOT_ALLOW_SELL is false, without calling executeSafeTrade for it", async () => {
+  it("blocks a SELL leg when AUTOPILOT_ALLOW_SELL is false, without calling submitOrderLeg for it", async () => {
     const orders: RebalanceOrder[] = [
       { ticker: "GLD", action: "SELL", shares: 5 },
     ];
-    const executeSafeTrade = vi.fn(throwingExecuteSafeTrade());
+    const submitOrderLeg = vi.fn(throwingSubmitOrderLeg());
 
     const result = await executeEtfRotationOrders({
       ...baseParams,
       orders,
       executionGates: { ...ALLOW_ALL, allowSell: false },
-      executeSafeTrade,
+      submitOrderLeg,
       appendAuditEvent: async () => {},
       refreshPortfolioSnapshot: async () => makeSnapshot(100000),
     });
 
-    expect(executeSafeTrade).not.toHaveBeenCalled();
+    expect(submitOrderLeg).not.toHaveBeenCalled();
     expect(result.blockedOrders).toHaveLength(1);
     expect(result.blockedOrders[0]!.blockReason).toContain("AUTOPILOT_ALLOW_SELL");
   });
 
-  it("blocks a BUY leg when AUTOPILOT_ALLOW_BUY is false, without calling executeSafeTrade for it", async () => {
+  it("blocks a BUY leg when AUTOPILOT_ALLOW_BUY is false, without calling submitOrderLeg for it", async () => {
     const orders: RebalanceOrder[] = [
       { ticker: "SPY", action: "BUY", shares: 10, targetWeightPercent: 50 },
     ];
-    const executeSafeTrade = vi.fn(throwingExecuteSafeTrade());
+    const submitOrderLeg = vi.fn(throwingSubmitOrderLeg());
 
     const result = await executeEtfRotationOrders({
       ...baseParams,
       orders,
       executionGates: { ...ALLOW_ALL, allowBuy: false },
-      executeSafeTrade,
+      submitOrderLeg,
       appendAuditEvent: async () => {},
       refreshPortfolioSnapshot: async () => makeSnapshot(100000),
     });
 
-    expect(executeSafeTrade).not.toHaveBeenCalled();
+    expect(submitOrderLeg).not.toHaveBeenCalled();
     expect(result.blockedOrders).toHaveLength(1);
     expect(result.blockedOrders[0]!.blockReason).toContain("AUTOPILOT_ALLOW_BUY");
   });
@@ -142,22 +139,22 @@ describe("executeEtfRotationOrders - per-leg side gates", () => {
       ...baseParams,
       orders,
       executionGates: { ...ALLOW_ALL, allowSell: false },
-      executeSafeTrade: successfulExecuteSafeTrade(),
+      submitOrderLeg: acceptingSubmitOrderLeg(),
       appendAuditEvent: async () => {},
       refreshPortfolioSnapshot: async () => makeSnapshot(100000),
     });
 
     expect(result.blockedOrders.map((o) => o.ticker)).toEqual(["GLD"]);
-    expect(result.executedOrders.map((o) => o.ticker)).toEqual(["SPY"]);
+    expect(result.acceptedOrders.map((o) => o.ticker)).toEqual(["SPY"]);
   });
 });
 
 describe("executeEtfRotationOrders - SELL-before-BUY sequencing", () => {
-  it("calls executeSafeTrade for all SELL legs before any BUY leg", async () => {
+  it("calls submitOrderLeg for all SELL legs before any BUY leg", async () => {
     const callOrder: string[] = [];
-    const executeSafeTrade: EtfRotationExecuteSafeTrade = async (ticker, action) => {
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (ticker, action) => {
       callOrder.push(`${ticker}:${action}`);
-      return { status: "success", order: { id: `broker-${ticker}` } };
+      return { outcome: "accepted", brokerOrderId: `broker-${ticker}` };
     };
 
     const orders: RebalanceOrder[] = [
@@ -177,7 +174,7 @@ describe("executeEtfRotationOrders - SELL-before-BUY sequencing", () => {
       ]),
       orders,
       executionGates: ALLOW_ALL,
-      executeSafeTrade,
+      submitOrderLeg,
       appendAuditEvent: async () => {},
       refreshPortfolioSnapshot: async () => makeSnapshot(100000),
     });
@@ -187,14 +184,14 @@ describe("executeEtfRotationOrders - SELL-before-BUY sequencing", () => {
 });
 
 describe("executeEtfRotationOrders - failed SELL blocks its paired BUY", () => {
-  it("does not call executeSafeTrade for a ticker's BUY leg when that same ticker's SELL leg failed", async () => {
+  it("does not call submitOrderLeg for a ticker's BUY leg when that same ticker's SELL leg was rejected", async () => {
     const buyAttempts: string[] = [];
-    const executeSafeTrade: EtfRotationExecuteSafeTrade = async (ticker, action) => {
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (ticker, action) => {
       if (action === "SELL" && ticker === "SPY") {
-        return { status: "rejected", reason: "insufficient shares to sell" };
+        return { outcome: "rejected", reason: "insufficient shares to sell" };
       }
       buyAttempts.push(ticker);
-      return { status: "success", order: { id: `broker-${ticker}` } };
+      return { outcome: "accepted", brokerOrderId: `broker-${ticker}` };
     };
 
     // SPY continues as a target (both a SELL of old shares and a BUY to
@@ -209,7 +206,7 @@ describe("executeEtfRotationOrders - failed SELL blocks its paired BUY", () => {
       ...baseParams,
       orders,
       executionGates: ALLOW_ALL,
-      executeSafeTrade,
+      submitOrderLeg,
       appendAuditEvent: async () => {},
       refreshPortfolioSnapshot: async () => makeSnapshot(100000),
     });
@@ -221,13 +218,13 @@ describe("executeEtfRotationOrders - failed SELL blocks its paired BUY", () => {
     expect(result.failedOrders.map((o) => `${o.ticker}:${o.action}`)).toEqual([
       "SPY:SELL",
     ]);
-    expect(result.executedOrders.map((o) => o.ticker)).toEqual(["QQQ"]);
+    expect(result.acceptedOrders.map((o) => o.ticker)).toEqual(["QQQ"]);
     expect(result.status).toBe("partial");
   });
 });
 
 describe("executeEtfRotationOrders - audit events per outcome", () => {
-  it("writes ORDER_SUBMITTED then ORDER_FILLED for a successful leg", async () => {
+  it("writes ORDER_SUBMITTED then ORDER_ACCEPTED for an accepted leg", async () => {
     const audit = collectingAuditRecorder();
     const orders: RebalanceOrder[] = [
       { ticker: "SPY", action: "BUY", shares: 10, targetWeightPercent: 50 },
@@ -237,36 +234,33 @@ describe("executeEtfRotationOrders - audit events per outcome", () => {
       ...baseParams,
       orders,
       executionGates: ALLOW_ALL,
-      executeSafeTrade: successfulExecuteSafeTrade("broker-abc"),
+      submitOrderLeg: acceptingSubmitOrderLeg("broker-abc"),
       appendAuditEvent: audit.appendAuditEvent,
       refreshPortfolioSnapshot: async () => makeSnapshot(100000),
     });
 
     expect(audit.events.map((e) => e.type)).toEqual([
       "ORDER_SUBMITTED",
-      "ORDER_FILLED",
+      "ORDER_ACCEPTED",
     ]);
     expect(audit.events[1]!.brokerOrderId).toBe("broker-abc");
   });
 
-  it("writes ORDER_REJECTED for a definitive (non-ambiguous) rejection", async () => {
+  it("writes ORDER_REJECTED when submitOrderLeg returns outcome: rejected", async () => {
     const audit = collectingAuditRecorder();
     const orders: RebalanceOrder[] = [
       { ticker: "GLD", action: "SELL", shares: 5 },
     ];
-    const executeSafeTrade: EtfRotationExecuteSafeTrade = async () => {
-      const error = new Error("insufficient buying power") as Error & {
-        response?: { status: number; data: { message: string } };
-      };
-      error.response = { status: 403, data: { message: "forbidden" } };
-      throw error;
-    };
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async () => ({
+      outcome: "rejected",
+      reason: "insufficient buying power",
+    });
 
     const result = await executeEtfRotationOrders({
       ...baseParams,
       orders,
       executionGates: ALLOW_ALL,
-      executeSafeTrade,
+      submitOrderLeg,
       appendAuditEvent: audit.appendAuditEvent,
       refreshPortfolioSnapshot: async () => makeSnapshot(100000),
     });
@@ -280,20 +274,21 @@ describe("executeEtfRotationOrders - audit events per outcome", () => {
     expect(result.status).toBe("failed");
   });
 
-  it("writes ORDER_AMBIGUOUS for a thrown error with no response (network-level failure)", async () => {
+  it("writes ORDER_AMBIGUOUS when submitOrderLeg returns outcome: ambiguous", async () => {
     const audit = collectingAuditRecorder();
     const orders: RebalanceOrder[] = [
       { ticker: "GLD", action: "SELL", shares: 5 },
     ];
-    const executeSafeTrade: EtfRotationExecuteSafeTrade = async () => {
-      throw new Error("socket hang up");
-    };
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async () => ({
+      outcome: "ambiguous",
+      reason: "socket hang up - broker acknowledgement unknown",
+    });
 
     const result = await executeEtfRotationOrders({
       ...baseParams,
       orders,
       executionGates: ALLOW_ALL,
-      executeSafeTrade,
+      submitOrderLeg,
       appendAuditEvent: audit.appendAuditEvent,
       refreshPortfolioSnapshot: async () => makeSnapshot(100000),
     });
@@ -307,6 +302,33 @@ describe("executeEtfRotationOrders - audit events per outcome", () => {
     expect(result.status).toBe("ambiguous");
   });
 
+  it("treats an unexpected thrown error from submitOrderLeg as ambiguous, never a silent success or confident rejection", async () => {
+    const audit = collectingAuditRecorder();
+    const orders: RebalanceOrder[] = [
+      { ticker: "GLD", action: "SELL", shares: 5 },
+    ];
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async () => {
+      throw new Error("unexpected bug in the injected wrapper");
+    };
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: ALLOW_ALL,
+      submitOrderLeg,
+      appendAuditEvent: audit.appendAuditEvent,
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+    });
+
+    expect(result.ambiguousOrders).toHaveLength(1);
+    expect(result.acceptedOrders).toHaveLength(0);
+    expect(result.failedOrders).toHaveLength(0);
+    expect(audit.events.map((e) => e.type)).toEqual([
+      "ORDER_SUBMITTED",
+      "ORDER_AMBIGUOUS",
+    ]);
+  });
+
   it("does not write any audit event for a blocked (never-attempted) leg", async () => {
     const audit = collectingAuditRecorder();
     const orders: RebalanceOrder[] = [
@@ -317,7 +339,7 @@ describe("executeEtfRotationOrders - audit events per outcome", () => {
       ...baseParams,
       orders,
       executionGates: { ...ALLOW_ALL, allowBuy: false },
-      executeSafeTrade: throwingExecuteSafeTrade(),
+      submitOrderLeg: throwingSubmitOrderLeg(),
       appendAuditEvent: audit.appendAuditEvent,
       refreshPortfolioSnapshot: async () => makeSnapshot(100000),
     });
@@ -336,15 +358,15 @@ describe("executeEtfRotationOrders - cash-aware BUY resizing", () => {
       ...baseParams,
       orders,
       executionGates: ALLOW_ALL,
-      executeSafeTrade: successfulExecuteSafeTrade(),
+      submitOrderLeg: acceptingSubmitOrderLeg(),
       appendAuditEvent: async () => {},
       // $500/share, only $10,000 available -> can afford 20 shares, not 100.
       refreshPortfolioSnapshot: async () => makeSnapshot(10000),
     });
 
-    expect(result.executedOrders).toHaveLength(1);
-    expect(result.executedOrders[0]!.requestedQty).toBe(100);
-    expect(result.executedOrders[0]!.submittedQty).toBe(20);
+    expect(result.acceptedOrders).toHaveLength(1);
+    expect(result.acceptedOrders[0]!.requestedQty).toBe(100);
+    expect(result.acceptedOrders[0]!.submittedQty).toBe(20);
   });
 
   it("blocks a BUY leg entirely when refreshed cash can't afford even one share", async () => {
@@ -356,7 +378,7 @@ describe("executeEtfRotationOrders - cash-aware BUY resizing", () => {
       ...baseParams,
       orders,
       executionGates: ALLOW_ALL,
-      executeSafeTrade: throwingExecuteSafeTrade(),
+      submitOrderLeg: throwingSubmitOrderLeg(),
       appendAuditEvent: async () => {},
       refreshPortfolioSnapshot: async () => makeSnapshot(100), // $100 cash, SPY is $500/share
     });
@@ -367,9 +389,9 @@ describe("executeEtfRotationOrders - cash-aware BUY resizing", () => {
 
   it("decrements the available cash pool across multiple BUY legs in the same cycle", async () => {
     const submittedQtyByTicker: Record<string, number> = {};
-    const executeSafeTrade: EtfRotationExecuteSafeTrade = async (ticker, _action, shares) => {
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (ticker, _action, shares) => {
       submittedQtyByTicker[ticker] = shares;
-      return { status: "success", order: { id: `broker-${ticker}` } };
+      return { outcome: "accepted", brokerOrderId: `broker-${ticker}` };
     };
 
     // $50,000 available. SPY wants 100 shares @ $500 = $50,000 (all of it).
@@ -383,7 +405,7 @@ describe("executeEtfRotationOrders - cash-aware BUY resizing", () => {
       ...baseParams,
       orders,
       executionGates: ALLOW_ALL,
-      executeSafeTrade,
+      submitOrderLeg,
       appendAuditEvent: async () => {},
       refreshPortfolioSnapshot: async () => makeSnapshot(50000),
     });
@@ -406,7 +428,7 @@ describe("executeEtfRotationOrders - state machine isolation", () => {
       ...baseParams,
       orders,
       executionGates: ALLOW_ALL,
-      executeSafeTrade: successfulExecuteSafeTrade(),
+      submitOrderLeg: acceptingSubmitOrderLeg(),
       appendAuditEvent: async () => {},
       refreshPortfolioSnapshot: async () => {
         refreshCalls.push(1);
@@ -414,14 +436,14 @@ describe("executeEtfRotationOrders - state machine isolation", () => {
       },
     });
 
-    // The only injected side effects are appendAuditEvent, executeSafeTrade,
+    // The only injected side effects are appendAuditEvent, submitOrderLeg,
     // and refreshPortfolioSnapshot - all supplied by the caller. This
     // module has no import of etfRotationWorkerState.ts at all, so there is
     // no code path here that could write planned/executing/executed state.
     expect(refreshCalls).toHaveLength(1);
     expect(result).toEqual({
-      status: "executed",
-      executedOrders: result.executedOrders,
+      status: "accepted",
+      acceptedOrders: result.acceptedOrders,
       failedOrders: [],
       blockedOrders: [],
       ambiguousOrders: [],
@@ -430,39 +452,39 @@ describe("executeEtfRotationOrders - state machine isolation", () => {
 });
 
 describe("computeOverallExecutionStatus", () => {
-  it("is 'executed' for an empty order set (nothing needed)", () => {
+  it("is 'accepted' for an empty order set (nothing needed)", () => {
     expect(
-      computeOverallExecutionStatus({ executed: 0, failed: 0, blocked: 0, ambiguous: 0, total: 0 }),
-    ).toBe("executed");
+      computeOverallExecutionStatus({ accepted: 0, failed: 0, blocked: 0, ambiguous: 0, total: 0 }),
+    ).toBe("accepted");
   });
 
   it("is 'ambiguous' whenever any leg is ambiguous, regardless of other outcomes", () => {
     expect(
-      computeOverallExecutionStatus({ executed: 3, failed: 0, blocked: 0, ambiguous: 1, total: 4 }),
+      computeOverallExecutionStatus({ accepted: 3, failed: 0, blocked: 0, ambiguous: 1, total: 4 }),
     ).toBe("ambiguous");
   });
 
-  it("is 'executed' when every leg executed", () => {
+  it("is 'accepted' when every leg was accepted", () => {
     expect(
-      computeOverallExecutionStatus({ executed: 4, failed: 0, blocked: 0, ambiguous: 0, total: 4 }),
-    ).toBe("executed");
+      computeOverallExecutionStatus({ accepted: 4, failed: 0, blocked: 0, ambiguous: 0, total: 4 }),
+    ).toBe("accepted");
   });
 
-  it("is 'blocked' when nothing executed or failed, only blocked", () => {
+  it("is 'blocked' when nothing accepted or failed, only blocked", () => {
     expect(
-      computeOverallExecutionStatus({ executed: 0, failed: 0, blocked: 3, ambiguous: 0, total: 3 }),
+      computeOverallExecutionStatus({ accepted: 0, failed: 0, blocked: 3, ambiguous: 0, total: 3 }),
     ).toBe("blocked");
   });
 
-  it("is 'partial' when some legs executed and others did not", () => {
+  it("is 'partial' when some legs accepted and others did not", () => {
     expect(
-      computeOverallExecutionStatus({ executed: 2, failed: 1, blocked: 0, ambiguous: 0, total: 3 }),
+      computeOverallExecutionStatus({ accepted: 2, failed: 1, blocked: 0, ambiguous: 0, total: 3 }),
     ).toBe("partial");
   });
 
-  it("is 'failed' when nothing executed but some legs failed", () => {
+  it("is 'failed' when nothing accepted but some legs failed", () => {
     expect(
-      computeOverallExecutionStatus({ executed: 0, failed: 2, blocked: 1, ambiguous: 0, total: 3 }),
+      computeOverallExecutionStatus({ accepted: 0, failed: 2, blocked: 1, ambiguous: 0, total: 3 }),
     ).toBe("failed");
   });
 });

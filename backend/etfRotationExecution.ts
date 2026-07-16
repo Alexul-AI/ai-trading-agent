@@ -5,9 +5,8 @@
 // resizing, per-leg audit trail) can be built and fully unit-tested before
 // a later PR ever makes it reachable from the live worker cycle. This file
 // deliberately does not import anything from autopilotWorker.ts or
-// server.ts - `executeSafeTrade` and every other side effect are received
-// as injected dependencies, so tests never need real Alpaca calls or a
-// live worker.
+// server.ts - order submission is received as an injected dependency, so
+// tests never need real Alpaca calls or a live worker.
 //
 // This module never touches the rebalance state machine
 // (etfRotationWorkerState.ts) - no import from that file exists here. The
@@ -15,6 +14,31 @@
 // this function's returned EtfRotationExecutionResult into a
 // planned/executing/executed/partial/failed/failed_needs_review
 // transition; this adapter only reports what it attempted.
+//
+// IMPORTANT for the execution-wiring PR (caught in review before merge,
+// not self-caught): the injected `submitOrderLeg` is deliberately NOT the
+// real `executeSafeTrade` (server.ts)'s own signature - that function's
+// outer try/catch already collapses both `definitive_rejection` and
+// `ambiguous_network_error` (see orderIdempotency.ts's classifyOrderError,
+// used internally) into an identical `{ status: "error", reason: message }`
+// shape before it ever resolves. A wrapper written around the *unmodified*
+// `executeSafeTrade` cannot recover that lost distinction - the
+// classification has to be preserved *inside* whatever produces the
+// result this adapter receives. `submitOrderLeg` therefore requires its
+// caller to return one of exactly three outcomes directly
+// (accepted/rejected/ambiguous), forcing the execution-wiring PR to either
+// change `executeSafeTrade` itself (or a sibling function sharing its
+// internals) to stop discarding the classification, rather than silently
+// wrapping the function as-is and losing ambiguous-vs-definitive handling.
+//
+// Also note: "accepted" here means the broker accepted the order request
+// (`executeSafeTrade` returns right after `alpaca.createOrder(...)`
+// resolves, with no fill-confirmation poll) - it is not a claim that the
+// order has actually filled. Deliberately not called "filled"/"executed"
+// at this layer for that reason; a future PR mapping this adapter's
+// result into the rebalance state machine's own "executed" terminal
+// status is a separate, visible decision to make explicitly, not implied
+// by matching vocabulary here.
 
 import {
   deriveLegType,
@@ -22,28 +46,29 @@ import {
   type EtfRotationOrderLegType,
 } from "./etfRotationOrderAuditLog.js";
 import type { RebalanceOrder } from "./etfRotationStrategy.js";
-import { classifyOrderError, type AlpacaErrorLike } from "./orderIdempotency.js";
 import type { PortfolioSnapshot } from "./src/strategy/portfolioSafety.js";
 
-// Deliberately not imported from autopilotWorker.ts/server.ts - a narrower,
-// locally-declared type that the real `executeSafeTrade` (server.ts) is
-// structurally assignable to (its extra orderType/limitPrice/stopLoss/
-// takeProfit/requestedNotional params are all optional, and its own
-// `action: string` parameter is wider than "BUY"|"SELL", so it satisfies
-// this signature without any wrapper). ETF Rotation orders are always
-// whole-share, no bracket, no notional - the real function's extra
-// parameters are never needed here.
-export interface EtfRotationExecuteSafeTradeResult {
-  status: string;
+export type EtfRotationOrderLegOutcomeKind = "accepted" | "rejected" | "ambiguous";
+
+export interface EtfRotationSubmitOrderLegResult {
+  outcome: EtfRotationOrderLegOutcomeKind;
+  /** Only meaningful for "accepted". */
+  brokerOrderId?: string;
+  /** Only meaningful for "rejected"/"ambiguous" - why the leg didn't cleanly succeed. */
   reason?: string;
-  [key: string]: unknown;
 }
 
-export type EtfRotationExecuteSafeTrade = (
+// Deliberately NOT the real executeSafeTrade's signature - see the
+// file-level comment above. The caller is contractually required to
+// classify the outcome itself and never leak an unclassified thrown
+// error; if it does throw anyway, this adapter treats that defensively as
+// "ambiguous" (see attemptLeg below), never as a silent success or a
+// confident rejection.
+export type EtfRotationSubmitOrderLeg = (
   ticker: string,
   action: "BUY" | "SELL",
   requestedShares: number,
-) => Promise<EtfRotationExecuteSafeTradeResult>;
+) => Promise<EtfRotationSubmitOrderLegResult>;
 
 export interface EtfRotationExecutionGates {
   /** AUTOPILOT_EXECUTE_TRADES - global off switch. False blocks every leg, uniformly. */
@@ -61,7 +86,6 @@ export interface EtfRotationLegOutcome {
   requestedQty: number;
   /** The actually-attempted quantity, which may be less than requestedQty for a cash-resized BUY leg. Absent if never attempted (blocked). */
   submittedQty?: number;
-  clientOrderId?: string;
   brokerOrderId?: string;
   error?: string;
   /** Only set for blockedOrders - why this leg was never attempted. */
@@ -71,14 +95,15 @@ export interface EtfRotationLegOutcome {
 export type EtfRotationExecutionStatus =
   | "not_attempted"
   | "blocked"
-  | "executed"
+  | "accepted"
   | "partial"
   | "failed"
   | "ambiguous";
 
 export interface EtfRotationExecutionResult {
   status: EtfRotationExecutionStatus;
-  executedOrders: EtfRotationLegOutcome[];
+  /** Legs the broker accepted (not fill-confirmed - see the file-level comment). */
+  acceptedOrders: EtfRotationLegOutcome[];
   failedOrders: EtfRotationLegOutcome[];
   blockedOrders: EtfRotationLegOutcome[];
   ambiguousOrders: EtfRotationLegOutcome[];
@@ -89,7 +114,7 @@ export interface ExecuteEtfRotationOrdersParams {
   configVariantKey: string;
   orders: RebalanceOrder[];
   executionGates: EtfRotationExecutionGates;
-  executeSafeTrade: EtfRotationExecuteSafeTrade;
+  submitOrderLeg: EtfRotationSubmitOrderLeg;
   appendAuditEvent: (event: EtfRotationOrderAuditEvent) => Promise<void>;
   refreshPortfolioSnapshot: () => Promise<PortfolioSnapshot>;
   /**
@@ -109,32 +134,29 @@ export interface ExecuteEtfRotationOrdersParams {
  * counts. Extracted and directly tested (same convention as every other
  * risk-adjacent decision in this project) rather than left inline.
  *
- * Priority: an empty order set is trivially "executed" (nothing needed).
+ * Priority: an empty order set is trivially "accepted" (nothing needed).
  * Any ambiguous leg wins over everything else - §8's "never assume
  * success" rule means one uncertain leg makes the whole cycle worth a
  * human's attention, regardless of how many other legs succeeded. Full
- * success only when every leg executed. "blocked" only when nothing was
- * attempted at all (every leg gate-blocked or paired-SELL-blocked) and
- * nothing failed. Any executed leg alongside a non-executed one is
- * "partial". Otherwise "failed" (attempted and failed, nothing succeeded).
+ * acceptance only when every leg was accepted. "blocked" only when
+ * nothing was attempted at all (every leg gate-blocked or paired-SELL-
+ * blocked) and nothing failed. Any accepted leg alongside a non-accepted
+ * one is "partial". Otherwise "failed" (attempted and failed, nothing
+ * accepted).
  */
 export function computeOverallExecutionStatus(counts: {
-  executed: number;
+  accepted: number;
   failed: number;
   blocked: number;
   ambiguous: number;
   total: number;
 }): EtfRotationExecutionStatus {
-  if (counts.total === 0) return "executed";
+  if (counts.total === 0) return "accepted";
   if (counts.ambiguous > 0) return "ambiguous";
-  if (counts.executed === counts.total) return "executed";
-  if (counts.executed === 0 && counts.failed === 0) return "blocked";
-  if (counts.executed > 0) return "partial";
+  if (counts.accepted === counts.total) return "accepted";
+  if (counts.accepted === 0 && counts.failed === 0) return "blocked";
+  if (counts.accepted > 0) return "partial";
   return "failed";
-}
-
-function isDefinitiveFailureStatus(status: string): boolean {
-  return status === "rejected" || status === "error";
 }
 
 function extractErrorMessage(error: unknown): string {
@@ -147,19 +169,11 @@ function extractErrorMessage(error: unknown): string {
   }
 }
 
-function extractBrokerOrderId(result: EtfRotationExecuteSafeTradeResult): string | undefined {
-  const order = result.order;
-  if (order && typeof order === "object" && "id" in order) {
-    const id = (order as { id?: unknown }).id;
-    return typeof id === "string" ? id : undefined;
-  }
-  return undefined;
-}
-
 /**
- * Translates a rebalance's computed orders into real (paper) executions -
- * SELL legs first, then a refreshed-cash-aware pass over BUY legs. Never
- * called from any live path yet (see the file-level comment above).
+ * Translates a rebalance's computed orders into real (paper) order
+ * submissions - SELL legs first, then a refreshed-cash-aware pass over BUY
+ * legs. Never called from any live path yet (see the file-level comment
+ * above).
  */
 export async function executeEtfRotationOrders(
   params: ExecuteEtfRotationOrdersParams,
@@ -169,14 +183,14 @@ export async function executeEtfRotationOrders(
     configVariantKey,
     orders,
     executionGates,
-    executeSafeTrade,
+    submitOrderLeg,
     appendAuditEvent,
     refreshPortfolioSnapshot,
     currentPriceByTicker,
     now,
   } = params;
 
-  const executedOrders: EtfRotationLegOutcome[] = [];
+  const acceptedOrders: EtfRotationLegOutcome[] = [];
   const failedOrders: EtfRotationLegOutcome[] = [];
   const blockedOrders: EtfRotationLegOutcome[] = [];
   const ambiguousOrders: EtfRotationLegOutcome[] = [];
@@ -201,13 +215,13 @@ export async function executeEtfRotationOrders(
   function finalize(): EtfRotationExecutionResult {
     return {
       status: computeOverallExecutionStatus({
-        executed: executedOrders.length,
+        accepted: acceptedOrders.length,
         failed: failedOrders.length,
         blocked: blockedOrders.length,
         ambiguous: ambiguousOrders.length,
         total: orders.length,
       }),
-      executedOrders,
+      acceptedOrders,
       failedOrders,
       blockedOrders,
       ambiguousOrders,
@@ -218,7 +232,7 @@ export async function executeEtfRotationOrders(
     return finalize();
   }
 
-  // Global off switch - every leg blocked uniformly, executeSafeTrade never
+  // Global off switch - every leg blocked uniformly, submitOrderLeg never
   // called for anything. Distinct from a per-leg side-gate block below (a
   // different reason, worth distinguishing in the returned status).
   if (!executionGates.executeTradesEnabled) {
@@ -230,7 +244,7 @@ export async function executeEtfRotationOrders(
     }
     return {
       status: "not_attempted",
-      executedOrders,
+      acceptedOrders,
       failedOrders,
       blockedOrders,
       ambiguousOrders,
@@ -258,34 +272,25 @@ export async function executeEtfRotationOrders(
       submittedQty,
     });
 
+    let legResult: EtfRotationSubmitOrderLegResult;
+
     try {
-      const result = await executeSafeTrade(order.ticker, order.action, submittedQty);
+      legResult = await submitOrderLeg(order.ticker, order.action, submittedQty);
+    } catch (error) {
+      // submitOrderLeg is contractually required to classify and never
+      // throw - but if it does anyway, treat it the safest possible way:
+      // as ambiguous (we genuinely don't know what happened), never as a
+      // confident rejection and never as a silent success.
+      legResult = { outcome: "ambiguous", reason: extractErrorMessage(error) };
+    }
 
-      if (isDefinitiveFailureStatus(result.status)) {
-        outcome.error = result.reason ?? `executeSafeTrade returned status "${result.status}".`;
-        failedOrders.push(outcome);
-        if (order.action === "SELL") sellFailedTickers.add(order.ticker);
-
-        await appendAuditEvent({
-          type: "ORDER_REJECTED",
-          timestamp: now(),
-          rebalanceMonthKey,
-          configVariantKey,
-          ticker: order.ticker,
-          side: order.action,
-          legType: outcome.legType,
-          requestedQty: order.shares,
-          submittedQty,
-          error: outcome.error,
-        });
-        return;
-      }
-
-      outcome.brokerOrderId = extractBrokerOrderId(result);
-      executedOrders.push(outcome);
+    if (legResult.outcome === "rejected") {
+      outcome.error = legResult.reason ?? "Order leg rejected.";
+      failedOrders.push(outcome);
+      if (order.action === "SELL") sellFailedTickers.add(order.ticker);
 
       await appendAuditEvent({
-        type: "ORDER_FILLED",
+        type: "ORDER_REJECTED",
         timestamp: now(),
         rebalanceMonthKey,
         configVariantKey,
@@ -294,50 +299,52 @@ export async function executeEtfRotationOrders(
         legType: outcome.legType,
         requestedQty: order.shares,
         submittedQty,
-        brokerOrderId: outcome.brokerOrderId,
+        error: outcome.error,
       });
-    } catch (error) {
-      const classification = classifyOrderError(error as AlpacaErrorLike);
-      outcome.error = extractErrorMessage(error);
-
-      if (classification === "ambiguous_network_error") {
-        // Never assumed successful (design doc §8/§3) - but the order may
-        // genuinely have reached Alpaca, so a paired BUY is blocked the
-        // same as a confirmed SELL failure, and cash is conservatively
-        // treated as possibly spent by the caller's own bookkeeping below.
-        ambiguousOrders.push(outcome);
-        if (order.action === "SELL") sellFailedTickers.add(order.ticker);
-
-        await appendAuditEvent({
-          type: "ORDER_AMBIGUOUS",
-          timestamp: now(),
-          rebalanceMonthKey,
-          configVariantKey,
-          ticker: order.ticker,
-          side: order.action,
-          legType: outcome.legType,
-          requestedQty: order.shares,
-          submittedQty,
-          error: outcome.error,
-        });
-      } else {
-        failedOrders.push(outcome);
-        if (order.action === "SELL") sellFailedTickers.add(order.ticker);
-
-        await appendAuditEvent({
-          type: "ORDER_REJECTED",
-          timestamp: now(),
-          rebalanceMonthKey,
-          configVariantKey,
-          ticker: order.ticker,
-          side: order.action,
-          legType: outcome.legType,
-          requestedQty: order.shares,
-          submittedQty,
-          error: outcome.error,
-        });
-      }
+      return;
     }
+
+    if (legResult.outcome === "ambiguous") {
+      // Never assumed successful (design doc §8/§3) - the order may
+      // genuinely have reached the broker, so a paired BUY is blocked the
+      // same as a confirmed SELL failure, and cash is conservatively
+      // treated as possibly spent by the caller's own bookkeeping below.
+      outcome.error = legResult.reason ?? "Order leg outcome could not be confirmed.";
+      ambiguousOrders.push(outcome);
+      if (order.action === "SELL") sellFailedTickers.add(order.ticker);
+
+      await appendAuditEvent({
+        type: "ORDER_AMBIGUOUS",
+        timestamp: now(),
+        rebalanceMonthKey,
+        configVariantKey,
+        ticker: order.ticker,
+        side: order.action,
+        legType: outcome.legType,
+        requestedQty: order.shares,
+        submittedQty,
+        error: outcome.error,
+      });
+      return;
+    }
+
+    // "accepted" - see the file-level comment: broker-accepted, not
+    // fill-confirmed.
+    outcome.brokerOrderId = legResult.brokerOrderId;
+    acceptedOrders.push(outcome);
+
+    await appendAuditEvent({
+      type: "ORDER_ACCEPTED",
+      timestamp: now(),
+      rebalanceMonthKey,
+      configVariantKey,
+      ticker: order.ticker,
+      side: order.action,
+      legType: outcome.legType,
+      requestedQty: order.shares,
+      submittedQty,
+      brokerOrderId: outcome.brokerOrderId,
+    });
   }
 
   // SELL legs first - frees cash/positions before BUY sizing below.
@@ -401,7 +408,7 @@ export async function executeEtfRotationOrders(
       continue;
     }
 
-    const executedCountBefore = executedOrders.length;
+    const acceptedCountBefore = acceptedOrders.length;
     const ambiguousCountBefore = ambiguousOrders.length;
 
     await attemptLeg(order, sizedQty);
@@ -411,7 +418,7 @@ export async function executeEtfRotationOrders(
     // is treated conservatively (assume spent) per the comment above;
     // a definitive failure spends nothing.
     if (
-      executedOrders.length > executedCountBefore ||
+      acceptedOrders.length > acceptedCountBefore ||
       ambiguousOrders.length > ambiguousCountBefore
     ) {
       availableCash -= sizedQty * price;
