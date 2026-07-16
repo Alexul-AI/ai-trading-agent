@@ -238,18 +238,26 @@ export function isRebalanceMonthDone(
  *    admin-gated clear-review endpoint is used (see server.ts) - checked
  *    before the month-done check so a stuck cycle from an earlier month
  *    doesn't get silently overtaken by "well, it's a new month now."
- * 4. Otherwise, defer entirely to isRebalanceMonthDone.
+ * 4. `monthKey === null` -> `"needs_month_key"`. None of the first three
+ *    hazards need today's date at all - only the remaining month-done
+ *    check does. This lets a caller check for restart hazards *before*
+ *    fetching market data (which is where `monthKey` normally comes from),
+ *    per the PR #47b wiring plan, as an explicit, tested part of this
+ *    function's contract - not by relying on the undocumented accident
+ *    that the first three checks happen to run before the fourth.
+ * 5. Otherwise, defer entirely to isRebalanceMonthDone.
  */
 export type EtfRotationGateAction =
   | "state_corrupt_fail_closed"
   | "stale_executing_needs_review"
   | "blocked_failed_needs_review"
+  | "needs_month_key"
   | "already_done_this_month"
   | "proceed_to_plan";
 
 export function decideEtfRotationGateAction(
   stateResult: RebalanceStateReadResult,
-  monthKey: string,
+  monthKey: string | null,
 ): EtfRotationGateAction {
   if (stateResult.corrupt) {
     return "state_corrupt_fail_closed";
@@ -261,6 +269,10 @@ export function decideEtfRotationGateAction(
 
   if (stateResult.state.status === "failed_needs_review") {
     return "blocked_failed_needs_review";
+  }
+
+  if (monthKey === null) {
+    return "needs_month_key";
   }
 
   if (isRebalanceMonthDone(stateResult.state, monthKey)) {

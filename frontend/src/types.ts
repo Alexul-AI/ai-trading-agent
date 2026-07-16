@@ -61,7 +61,11 @@ export type ExecutionStatus =
   | "dry_run"
   | "blocked"
   | "executed"
-  | "failed";
+  | "failed"
+  // Only reachable via the ETF Rotation execution path - an outcome the
+  // broker never confirmed one way or the other (never a silent success
+  // or a confident rejection).
+  | "ambiguous";
 
 export type DecisionFinalStatus =
   | "hold"

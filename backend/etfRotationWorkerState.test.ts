@@ -427,4 +427,53 @@ describe("decideEtfRotationGateAction", () => {
       "proceed_to_plan",
     );
   });
+
+  describe("monthKey: null (pre-bars-fetch check, PR #47b)", () => {
+    it("still fails closed on a corrupt state file even with monthKey null", () => {
+      const result = resultWith(
+        { rebalanceMonthKey: "2026-07", status: "executing" },
+        true,
+      );
+      expect(decideEtfRotationGateAction(result, null)).toBe(
+        "state_corrupt_fail_closed",
+      );
+    });
+
+    it("still treats a leftover 'executing' status as needing review with monthKey null", () => {
+      const result = resultWith({
+        rebalanceMonthKey: "2026-07",
+        status: "executing",
+      });
+      expect(decideEtfRotationGateAction(result, null)).toBe(
+        "stale_executing_needs_review",
+      );
+    });
+
+    it("still blocks on an existing failed_needs_review with monthKey null", () => {
+      const result = resultWith({
+        rebalanceMonthKey: "2026-06",
+        status: "failed_needs_review",
+      });
+      expect(decideEtfRotationGateAction(result, null)).toBe(
+        "blocked_failed_needs_review",
+      );
+    });
+
+    it("reports needs_month_key when no restart hazard applies and monthKey is null", () => {
+      const result = resultWith({
+        rebalanceMonthKey: "2026-06",
+        status: "executed",
+      });
+      expect(decideEtfRotationGateAction(result, null)).toBe(
+        "needs_month_key",
+      );
+    });
+
+    it("reports needs_month_key for a fresh state (never rebalanced) with monthKey null", () => {
+      const result = resultWith({});
+      expect(decideEtfRotationGateAction(result, null)).toBe(
+        "needs_month_key",
+      );
+    });
+  });
 });

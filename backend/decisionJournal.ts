@@ -8,7 +8,11 @@ export type ExecutionStatus =
   | "dry_run"
   | "blocked"
   | "executed"
-  | "failed";
+  | "failed"
+  // Only reachable via the ETF Rotation execution path (autopilotWorker.ts's
+  // PR #47b) - an ambiguous leg's outcome genuinely isn't known, never
+  // treated as a silent success or a confident rejection.
+  | "ambiguous";
 
 export type DecisionFinalStatus =
   | "hold"
