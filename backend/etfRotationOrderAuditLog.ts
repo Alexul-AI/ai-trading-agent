@@ -17,9 +17,16 @@ const AUDIT_LOG_FILE = path.join(DATA_DIR, "etf-rotation-order-audit.jsonl");
 // §11's Stage 2A resolution), not an order leg. Kept in this same log/reader
 // rather than a separate file so a review UI can show one merged timeline
 // instead of stitching two JSONL files together by timestamp.
+//
+// ORDER_ACCEPTED, not ORDER_FILLED (renamed in PR #46 review, before this
+// was ever wired to anything real): the broker accepting an order request
+// (executeSafeTrade returns right after alpaca.createOrder(...) resolves,
+// with no fill-confirmation poll) is not the same claim as the order
+// having actually filled. Naming it "filled" would have overclaimed
+// certainty this log doesn't have.
 export type EtfRotationOrderAuditEventType =
   | "ORDER_SUBMITTED"
-  | "ORDER_FILLED"
+  | "ORDER_ACCEPTED"
   | "ORDER_REJECTED"
   | "ORDER_AMBIGUOUS"
   | "REBALANCE_MANUALLY_CLEARED";

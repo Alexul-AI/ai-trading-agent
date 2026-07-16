@@ -55,8 +55,8 @@ describe("etfRotationOrderAuditLog", () => {
       legType: "exit_removed",
       requestedQty: 12,
     });
-    const buyFilled = makeEvent({
-      type: "ORDER_FILLED",
+    const buyAccepted = makeEvent({
+      type: "ORDER_ACCEPTED",
       timestamp: new Date(2026, 0, 1, 0, 0, 1).toISOString(),
       ticker: "SPY",
       side: "BUY",
@@ -76,17 +76,17 @@ describe("etfRotationOrderAuditLog", () => {
     });
 
     await appendEtfRotationOrderAuditEvent(sell, tmpFile);
-    await appendEtfRotationOrderAuditEvent(buyFilled, tmpFile);
+    await appendEtfRotationOrderAuditEvent(buyAccepted, tmpFile);
     await appendEtfRotationOrderAuditEvent(rejected, tmpFile);
 
     const events = await readEtfRotationOrderAuditLog(100, tmpFile);
 
     expect(events.map((event) => event.type)).toEqual([
       "ORDER_REJECTED",
-      "ORDER_FILLED",
+      "ORDER_ACCEPTED",
       "ORDER_SUBMITTED",
     ]);
-    expect(events[1]).toEqual(buyFilled);
+    expect(events[1]).toEqual(buyAccepted);
   });
 
   it("respects the limit, keeping the most recent entries", async () => {
