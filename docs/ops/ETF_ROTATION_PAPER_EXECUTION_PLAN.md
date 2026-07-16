@@ -180,6 +180,20 @@ All three open questions above are now resolved, ahead of any Stage 2B implement
 
 21 tests for this file (264/264 total across the whole suite), typecheck clean - covering the global gate, per-leg gates, SELL-before-BUY ordering, a failed SELL blocking its paired BUY while an unrelated ticker's BUY proceeds normally, all three audit-event outcomes (accepted/rejected/ambiguous) plus an unexpected thrown error from `submitOrderLeg` itself being treated as ambiguous (never a silent success or confident rejection), cash resizing (including the multi-leg cash-pool decrement), and confirming the adapter's return value has no state-machine side effects.
 
+## PR #47 — wiring plan (2026-07-16)
+
+Split into two PRs, per the same "isolated primitive before wiring" discipline used throughout (PR #43 before #44's endpoints, PR #46's adapter before this).
+
+**PR #47a** (this PR) closes the one real gap PR #46's review found: `executeSafeTrade`'s outer `try`/`catch` (`server.ts:672-681`) collapsed `definitive_rejection` and `ambiguous_network_error` into an identical `{ status: "error", reason }` before a caller could ever see the difference - no wrapper written around the *unmodified* function could recover it. Fixed with a small, additive `ClassifiedOrderError extends Error` class: the inner `catch`'s two re-throw sites (`:622`, `:630`) now throw `new ClassifiedOrderError(classification, orderError)` instead of the raw error, and the outer `catch` includes `classification` in its returned object when applicable. Zero behavior change for any existing caller - all of them only ever read `status`/`reason`.
+
+Also added two pure, directly-tested bridge functions in `autopilotWorker.ts` (not wired into `runEtfRotationCycle` yet - `executeEtfRotationOrders` still has zero call sites there, confirmed via `git diff --stat`):
+- `mapExecuteSafeTradeResultToLegOutcome` - `executeSafeTrade`'s result → `etfRotationExecution.ts`'s `{ outcome: "accepted"|"rejected"|"ambiguous" }` contract.
+- `mapEtfRotationExecutionStatusToRebalanceStatus` - the one deliberate vocabulary bridge: `"accepted"` → `"executed"`, `"partial"` → `"partial"`, `"failed"` → `"failed"`, `"ambiguous"` → `"failed_needs_review"` (same "stop, a human should look" posture already used for a restart-interrupted cycle), `"blocked"`/`"not_attempted"` → `"cancelled"` (nothing wrong, nothing attempted, let the gate reopen next cycle).
+
+12 new tests (276/276 total), typecheck clean.
+
+**PR #47b** (not started) will actually call `executeEtfRotationOrders` from `runEtfRotationCycle`'s `"proceed_to_plan"` branch - the first point in the whole ETF Rotation effort where a real order could be submitted, still requiring `AUTOPILOT_STRATEGY=etf_rotation` + `AUTOPILOT_EXECUTE_TRADES=true` + the relevant side gate, none of which are set that way in Render.
+
 ## What this document does not do
 
-Neither this document nor PR #43/#44 wire anything into `autopilotWorker.ts`'s live `runOnce()`/`runEtfRotationCycle` path, call `executeSafeTrade`, or touch `.env`/Render's environment. Stage 2's actual order-execution wiring is a separate, future PR, following this design (and closing the two integration hazards above first), still gated behind the same env vars and still requiring explicit approval before merge — and, per the standing project rule, no execution is ever performed on the user's behalf regardless of any of this.
+Nothing merged so far (through PR #47a) wires `executeEtfRotationOrders` into `autopilotWorker.ts`'s live `runOnce()`/`runEtfRotationCycle` path, and nothing touches `.env`/Render's environment. PR #47b is a separate, future PR, still gated behind the same env vars and still requiring explicit approval before merge — and, per the standing project rule, no execution is ever performed on the user's behalf regardless of any of this.

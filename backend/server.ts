@@ -31,6 +31,7 @@ import {
   classifyOrderError,
   createPersistedClientOrderIdTracker,
   type AlpacaErrorLike,
+  type OrderErrorClassification,
 } from "./orderIdempotency.js";
 import { createAdminAuth } from "./src/auth/adminAuth.js";
 import {
@@ -410,6 +411,24 @@ async function getDashboardSnapshot() {
   };
 }
 
+// Carries classifyOrderError's classification through executeSafeTrade's
+// own outer try/catch below, which otherwise collapses every failure into
+// an identical { status: "error", reason } - losing the ambiguous-vs-
+// definitive distinction before any caller ever sees it. Purely additive:
+// nothing here changes existing behavior for any current caller of
+// executeSafeTrade (all of them only ever read status/reason), but a
+// caller that wants the classification (the ETF Rotation execution
+// adapter, etfRotationExecution.ts) can now recover it.
+class ClassifiedOrderError extends Error {
+  readonly classification: OrderErrorClassification;
+
+  constructor(classification: OrderErrorClassification, cause: unknown) {
+    super(cause instanceof Error ? cause.message : "Unknown trade error");
+    this.name = "ClassifiedOrderError";
+    this.classification = classification;
+  }
+}
+
 async function executeSafeTrade(
   rawTicker: string,
   rawAction: string,
@@ -619,7 +638,7 @@ async function executeSafeTrade(
         // request won't fix it, safe to free up this ticker+action for a
         // fresh attempt.
         await clientOrderIdTracker.clear(ticker, action);
-        throw orderError;
+        throw new ClassifiedOrderError(classification, orderError);
       } else {
         // Ambiguous network error (timeout, DNS, connection reset) - we
         // genuinely don't know if Alpaca received it. Deliberately do NOT
@@ -627,7 +646,7 @@ async function executeSafeTrade(
         // reuses this same client_order_id, so if it turns out this
         // attempt did land, that retry resolves safely via the duplicate
         // branch above instead of submitting a second real order.
-        throw orderError;
+        throw new ClassifiedOrderError(classification, orderError);
       }
     }
 
@@ -677,6 +696,8 @@ async function executeSafeTrade(
     return {
       status: "error",
       reason: message,
+      classification:
+        error instanceof ClassifiedOrderError ? error.classification : undefined,
     };
   }
 }

@@ -8,9 +8,13 @@ import {
   getSafeBuySharesForBucketCap,
   getSafeSellShares,
   isSignalReadyDecision,
+  mapEtfRotationExecutionStatusToRebalanceStatus,
+  mapExecuteSafeTradeResultToLegOutcome,
   type AutopilotDecisionLog,
+  type ExecuteSafeTradeResult,
   type PortfolioSnapshot,
 } from "./autopilotWorker.js";
+import type { EtfRotationExecutionStatus } from "./etfRotationExecution.js";
 
 function makePortfolio(
   equity: number,
@@ -412,4 +416,94 @@ describe("buildSignalKey", () => {
       buildSignalKey(makeDecision({ reasonType: "STOP_LOSS" })),
     );
   });
+});
+
+describe("mapExecuteSafeTradeResultToLegOutcome", () => {
+  function makeResult(
+    overrides: Partial<ExecuteSafeTradeResult> = {},
+  ): ExecuteSafeTradeResult {
+    return { status: "success", ...overrides };
+  }
+
+  it("maps a success result to accepted, extracting the broker order id", () => {
+    const result = makeResult({ status: "success", order: { id: "broker-123" } });
+
+    expect(mapExecuteSafeTradeResultToLegOutcome(result)).toEqual({
+      outcome: "accepted",
+      brokerOrderId: "broker-123",
+    });
+  });
+
+  it("maps a success result with no order id to accepted with brokerOrderId undefined", () => {
+    const result = makeResult({ status: "success" });
+
+    expect(mapExecuteSafeTradeResultToLegOutcome(result)).toEqual({
+      outcome: "accepted",
+      brokerOrderId: undefined,
+    });
+  });
+
+  it("maps an error result classified as ambiguous_network_error to ambiguous", () => {
+    const result = makeResult({
+      status: "error",
+      reason: "socket hang up",
+      classification: "ambiguous_network_error",
+    });
+
+    expect(mapExecuteSafeTradeResultToLegOutcome(result)).toEqual({
+      outcome: "ambiguous",
+      reason: "socket hang up",
+    });
+  });
+
+  it("maps an error result classified as definitive_rejection to rejected", () => {
+    const result = makeResult({
+      status: "error",
+      reason: "insufficient buying power",
+      classification: "definitive_rejection",
+    });
+
+    expect(mapExecuteSafeTradeResultToLegOutcome(result)).toEqual({
+      outcome: "rejected",
+      reason: "insufficient buying power",
+    });
+  });
+
+  it("maps an early gate-check rejected result (no classification at all) to rejected", () => {
+    const result = makeResult({
+      status: "rejected",
+      reason: "Portfolio circuit breaker tripped",
+    });
+
+    expect(mapExecuteSafeTradeResultToLegOutcome(result)).toEqual({
+      outcome: "rejected",
+      reason: "Portfolio circuit breaker tripped",
+    });
+  });
+
+  it("maps an error result with no classification (unclassified failure) to rejected, never ambiguous by default", () => {
+    const result = makeResult({ status: "error", reason: "Unknown trade error" });
+
+    expect(mapExecuteSafeTradeResultToLegOutcome(result)).toEqual({
+      outcome: "rejected",
+      reason: "Unknown trade error",
+    });
+  });
+});
+
+describe("mapEtfRotationExecutionStatusToRebalanceStatus", () => {
+  const cases: Array<[EtfRotationExecutionStatus, string]> = [
+    ["accepted", "executed"],
+    ["partial", "partial"],
+    ["failed", "failed"],
+    ["ambiguous", "failed_needs_review"],
+    ["blocked", "cancelled"],
+    ["not_attempted", "cancelled"],
+  ];
+
+  for (const [input, expected] of cases) {
+    it(`maps "${input}" to "${expected}"`, () => {
+      expect(mapEtfRotationExecutionStatusToRebalanceStatus(input)).toBe(expected);
+    });
+  }
 });
