@@ -27,7 +27,13 @@ import {
   readRebalanceStateStrict,
   recordRebalancePlanned,
   recordRebalanceTerminal,
+  type RebalanceStatus,
 } from "./etfRotationWorkerState.js";
+import type { OrderErrorClassification } from "./orderIdempotency.js";
+import type {
+  EtfRotationExecutionStatus,
+  EtfRotationSubmitOrderLegResult,
+} from "./etfRotationExecution.js";
 import { getNewsSentiment, getInsiderActivity } from "./agent.js";
 import {
   updatePortfolioCircuitBreaker,
@@ -79,6 +85,18 @@ interface AlpacaBarsResponse {
 export interface ExecuteSafeTradeResult {
   status: string;
   reason?: string;
+  /**
+   * Only ever populated for a status: "error" result whose underlying
+   * failure was classified by orderIdempotency.ts's classifyOrderError
+   * (server.ts's ClassifiedOrderError) - distinguishes "definitely
+   * rejected" from "ambiguous, might have actually gone through" for a
+   * caller that needs that distinction (the ETF Rotation execution
+   * adapter, etfRotationExecution.ts - see mapExecuteSafeTradeResultToLegOutcome
+   * below). Absent for a "rejected" early-gate-check result (circuit
+   * breaker, risk manager) - those are always definitively rejected,
+   * there's no ambiguity to classify.
+   */
+  classification?: OrderErrorClassification;
   [key: string]: unknown;
 }
 
@@ -624,6 +642,83 @@ export function isSignalReadyDecision(decision: AutopilotDecisionLog): boolean {
     (decision.suggestedShares > 0 || (decision.suggestedNotional ?? 0) > 0) &&
     !decision.skippedReason
   );
+}
+
+// ETF Rotation Stage 2D, PR #47a - two pure bridge functions between
+// executeSafeTrade's (server.ts) result shape and etfRotationExecution.ts's
+// contract, and between that adapter's own result vocabulary and the
+// rebalance state machine's (etfRotationWorkerState.ts). Neither function
+// is wired into runEtfRotationCycle yet - see docs/ops/
+// ETF_ROTATION_PAPER_EXECUTION_PLAN.md's PR #47 plan for the follow-up PR
+// that actually calls executeEtfRotationOrders from the live cycle.
+
+/**
+ * Bridges executeSafeTrade's (server.ts) loose result shape into
+ * etfRotationExecution.ts's `EtfRotationSubmitOrderLegResult` contract.
+ * `executeSafeTrade`'s own outer try/catch collapses every failure into
+ * `{ status: "error", reason }` - `classification` (populated only via
+ * server.ts's ClassifiedOrderError, see the comment on
+ * ExecuteSafeTradeResult above) is what lets this function tell "ambiguous,
+ * might have gone through" apart from every other kind of failure, which
+ * the adapter must never conflate (design doc §3/§8's "never assume
+ * success" rule).
+ */
+export function mapExecuteSafeTradeResultToLegOutcome(
+  result: ExecuteSafeTradeResult,
+): EtfRotationSubmitOrderLegResult {
+  if (result.status === "success") {
+    const order = result.order;
+    const brokerOrderId =
+      order && typeof order === "object" && "id" in order
+        ? (order as { id?: unknown }).id
+        : undefined;
+
+    return {
+      outcome: "accepted",
+      brokerOrderId: typeof brokerOrderId === "string" ? brokerOrderId : undefined,
+    };
+  }
+
+  if (result.classification === "ambiguous_network_error") {
+    return { outcome: "ambiguous", reason: result.reason };
+  }
+
+  // Any other non-success status - an early gate-check "rejected" (circuit
+  // breaker, risk manager) or a classified "definitive_rejection" - is a
+  // confirmed, not ambiguous, failure.
+  return { outcome: "rejected", reason: result.reason };
+}
+
+/**
+ * Bridges etfRotationExecution.ts's own result vocabulary into the
+ * rebalance state machine's (etfRotationWorkerState.ts) terminal
+ * RebalanceStatus values. The one deliberate word-mapping decision flagged
+ * in the design doc: "accepted" (the adapter's word - broker-accepted, not
+ * fill-confirmed, see etfRotationExecution.ts's file comment) becomes
+ * "executed" (the state machine's word) here, explicitly, rather than the
+ * two layers silently sharing a word with different actual meanings.
+ * "ambiguous" maps to "failed_needs_review" - the same "stop and let a
+ * human check" posture that state already has for a restart-interrupted
+ * cycle. "blocked"/"not_attempted" map to "cancelled" - nothing went
+ * wrong, nothing was attempted, the monthly gate should simply reopen next
+ * cycle (isRebalanceMonthDone never treats "cancelled" as done).
+ */
+export function mapEtfRotationExecutionStatusToRebalanceStatus(
+  status: EtfRotationExecutionStatus,
+): Exclude<RebalanceStatus, "planned" | "executing"> {
+  switch (status) {
+    case "accepted":
+      return "executed";
+    case "partial":
+      return "partial";
+    case "failed":
+      return "failed";
+    case "ambiguous":
+      return "failed_needs_review";
+    case "blocked":
+    case "not_attempted":
+      return "cancelled";
+  }
 }
 
 async function fetchAlpacaBarsUncached(
