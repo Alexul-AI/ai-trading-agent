@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   computeOverallExecutionStatus,
+  computeRampMaxShares,
   executeEtfRotationOrders,
+  resolveRampMaxPositionEquityPercent,
   type EtfRotationExecutionGates,
   type EtfRotationSubmitOrderLeg,
 } from "./etfRotationExecution.js";
@@ -486,5 +488,213 @@ describe("computeOverallExecutionStatus", () => {
     expect(
       computeOverallExecutionStatus({ accepted: 0, failed: 2, blocked: 1, ambiguous: 0, total: 3 }),
     ).toBe("failed");
+  });
+});
+
+describe("executeEtfRotationOrders - ramp cap", () => {
+  it("ramp unset reproduces byte-identical behavior to the existing cash-resize test (regression)", async () => {
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 100, targetWeightPercent: 50 },
+    ];
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: { ...ALLOW_ALL, rampMaxPositionEquityPercent: undefined },
+      submitOrderLeg: acceptingSubmitOrderLeg(),
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => makeSnapshot(10000),
+    });
+
+    expect(result.acceptedOrders).toHaveLength(1);
+    expect(result.acceptedOrders[0]!.requestedQty).toBe(100);
+    expect(result.acceptedOrders[0]!.submittedQty).toBe(20);
+  });
+
+  it("ramp binding tighter than cash resizes the BUY leg to the ramp-derived count", async () => {
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 100, targetWeightPercent: 50 },
+    ];
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: { ...ALLOW_ALL, rampMaxPositionEquityPercent: 10 },
+      submitOrderLeg: acceptingSubmitOrderLeg(),
+      appendAuditEvent: async () => {},
+      // $100,000 equity/cash - cash alone would afford 200 shares, but a
+      // 10% ramp caps this leg to floor(0.10 * 100000 / 500) = 20 shares.
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+    });
+
+    expect(result.acceptedOrders).toHaveLength(1);
+    expect(result.acceptedOrders[0]!.requestedQty).toBe(100);
+    expect(result.acceptedOrders[0]!.submittedQty).toBe(20);
+  });
+
+  it("cash binding tighter than ramp keeps the existing cash-specific block wording, not the ramp wording", async () => {
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 10, targetWeightPercent: 50 },
+    ];
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      // Generous ramp (50% of a large equity) - not the binding constraint
+      // here; cash is scarce despite equity being large (makeSnapshot ties
+      // balance/equity together, so this is constructed directly).
+      executionGates: { ...ALLOW_ALL, rampMaxPositionEquityPercent: 50 },
+      submitOrderLeg: throwingSubmitOrderLeg(),
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => ({
+        balance: 100, // $100 cash, SPY is $500/share
+        equity: 1000000,
+        currency: "USD",
+        positions: {},
+      }),
+    });
+
+    expect(result.blockedOrders).toHaveLength(1);
+    expect(result.blockedOrders[0]!.blockReason).toContain("Insufficient available cash");
+    expect(result.blockedOrders[0]!.blockReason).not.toContain("RAMP_MAX_POSITION_PERCENT");
+  });
+
+  it("ramp exactly zero fully blocks a BUY leg without ever calling submitOrderLeg", async () => {
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 10, targetWeightPercent: 50 },
+    ];
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: { ...ALLOW_ALL, rampMaxPositionEquityPercent: 0 },
+      submitOrderLeg: throwingSubmitOrderLeg(),
+      appendAuditEvent: async () => {},
+      // Cash is generous - proves ramp=0 alone is what blocks this, not cash.
+      refreshPortfolioSnapshot: async () => makeSnapshot(1000000),
+    });
+
+    expect(result.blockedOrders).toHaveLength(1);
+    expect(result.blockedOrders[0]!.blockReason).toContain(
+      "AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT",
+    );
+    // "not_attempted" is reserved for the global executeTradesEnabled=false
+    // gate specifically - a ramp-caused block (nothing accepted, nothing
+    // failed) is "blocked", per computeOverallExecutionStatus's own rules.
+    expect(result.status).toBe("blocked");
+  });
+
+  it("caps two independent BUY legs to their own ramp-derived count, not a shared pool", async () => {
+    const submittedQtyByTicker: Record<string, number> = {};
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (ticker, _action, shares) => {
+      submittedQtyByTicker[ticker] = shares;
+      return { outcome: "accepted", brokerOrderId: `broker-${ticker}` };
+    };
+
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 100, targetWeightPercent: 50 },
+      { ticker: "QQQ", action: "BUY", shares: 100, targetWeightPercent: 50 },
+    ];
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: { ...ALLOW_ALL, rampMaxPositionEquityPercent: 10 },
+      submitOrderLeg,
+      appendAuditEvent: async () => {},
+      // $100,000 equity, plenty of cash - ramp is the only binding ceiling.
+      // SPY @ $500: floor(0.10 * 100000 / 500) = 20.
+      // QQQ @ $400: floor(0.10 * 100000 / 400) = 25.
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+    });
+
+    expect(submittedQtyByTicker.SPY).toBe(20);
+    expect(submittedQtyByTicker.QQQ).toBe(25);
+    expect(result.acceptedOrders).toHaveLength(2);
+  });
+
+  it("applies the ramp cap the same way to a same-ticker SELL+BUY (rebuild_target) pair", async () => {
+    const submittedQtyByTicker: Record<string, number> = {};
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (ticker, action, shares) => {
+      if (action === "BUY") submittedQtyByTicker[ticker] = shares;
+      return { outcome: "accepted", brokerOrderId: `broker-${ticker}-${action}` };
+    };
+
+    // SPY continues as a target (SELL of old shares, BUY to rebuild) -
+    // the rebuild BUY leg should be ramp-capped exactly like a fresh-open
+    // BUY leg, regardless of its legType.
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "SELL", shares: 20 },
+      { ticker: "SPY", action: "BUY", shares: 100, targetWeightPercent: 50 },
+    ];
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: { ...ALLOW_ALL, rampMaxPositionEquityPercent: 10 },
+      submitOrderLeg,
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+    });
+
+    expect(submittedQtyByTicker.SPY).toBe(20);
+    expect(result.acceptedOrders.map((o) => `${o.ticker}:${o.action}`)).toEqual([
+      "SPY:SELL",
+      "SPY:BUY",
+    ]);
+  });
+});
+
+describe("computeRampMaxShares", () => {
+  it("is Infinity when the ramp percent is undefined (uncapped)", () => {
+    expect(computeRampMaxShares(500, 100000, undefined)).toBe(Infinity);
+  });
+
+  it("floors the share count for a normal percent", () => {
+    expect(computeRampMaxShares(500, 100000, 10)).toBe(20);
+  });
+
+  it("is 0 when the ramp percent is 0", () => {
+    expect(computeRampMaxShares(500, 100000, 0)).toBe(0);
+  });
+});
+
+describe("resolveRampMaxPositionEquityPercent", () => {
+  it("returns undefined when the env var is genuinely absent", () => {
+    expect(resolveRampMaxPositionEquityPercent(undefined)).toBeUndefined();
+  });
+
+  it("parses a normal value", () => {
+    expect(resolveRampMaxPositionEquityPercent("10")).toBe(10);
+  });
+
+  it("returns 0 (not undefined) when explicitly set to zero - the footgun case", () => {
+    expect(resolveRampMaxPositionEquityPercent("0")).toBe(0);
+  });
+
+  it("throws on a negative value", () => {
+    expect(() => resolveRampMaxPositionEquityPercent("-5")).toThrow();
+  });
+
+  it("throws on a value over 100", () => {
+    expect(() => resolveRampMaxPositionEquityPercent("150")).toThrow();
+  });
+
+  it("throws on a non-numeric value", () => {
+    expect(() => resolveRampMaxPositionEquityPercent("abc")).toThrow();
+  });
+
+  it("throws on a partially-numeric value instead of silently truncating it (parseFloat footgun)", () => {
+    // Number.parseFloat("10abc") === 10 - a strict parse must reject this,
+    // not silently accept the leading numeric portion.
+    expect(() => resolveRampMaxPositionEquityPercent("10abc")).toThrow();
+  });
+
+  it("throws on a value with an embedded unit/word", () => {
+    expect(() => resolveRampMaxPositionEquityPercent("5 percent")).toThrow();
+  });
+
+  it("tolerates surrounding whitespace but still parses correctly", () => {
+    expect(resolveRampMaxPositionEquityPercent(" 10 \n")).toBe(10);
   });
 });

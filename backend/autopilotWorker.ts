@@ -32,7 +32,9 @@ import {
 } from "./etfRotationWorkerState.js";
 import type { OrderErrorClassification } from "./orderIdempotency.js";
 import {
+  computeRampMaxShares,
   executeEtfRotationOrders,
+  resolveRampMaxPositionEquityPercent,
   type EtfRotationExecutionStatus,
   type EtfRotationSubmitOrderLeg,
   type EtfRotationSubmitOrderLegResult,
@@ -455,6 +457,16 @@ const AUTOPILOT_ETF_ROTATION_BARS_DAYS = Number.parseInt(
   10,
 );
 const ETF_ROTATION_WARMUP_TRADING_DAYS = 210;
+
+// Fails loud at process startup on a bad value (see
+// resolveRampMaxPositionEquityPercent's own doc comment) - unset stays
+// uncapped (current, unchanged behavior); this is the paper-execution ramp
+// gate for the first real BUYs, a sibling of AUTOPILOT_ALLOW_BUY/SELL, not
+// a strategy config.
+const AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT =
+  resolveRampMaxPositionEquityPercent(
+    process.env.AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT,
+  );
 
 function toIsoDate(date: Date): string {
   return date.toISOString().split("T")[0] ?? date.toISOString();
@@ -1768,6 +1780,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
         executeTradesEnabled: AUTOPILOT_EXECUTE_TRADES,
         allowBuy: AUTOPILOT_ALLOW_BUY,
         allowSell: AUTOPILOT_ALLOW_SELL,
+        rampMaxPositionEquityPercent: AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT,
       },
       submitOrderLeg,
       appendAuditEvent: appendEtfRotationOrderAuditEvent,
@@ -1831,6 +1844,21 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
 
       if (accepted) {
         const submittedQty = accepted.submittedQty ?? accepted.requestedQty;
+        // Independently recomputed (not threaded through EtfRotationLegOutcome,
+        // which is unchanged by this feature) - true regardless of whether cash
+        // also happened to bind, since it asks "would the ramp cap alone have
+        // reduced this request" rather than reading the already-combined
+        // ramp+cash result backwards.
+        const rampCapped =
+          accepted.action === "BUY" &&
+          computeRampMaxShares(
+            price,
+            portfolio.equity,
+            AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT,
+          ) < accepted.requestedQty;
+        const rampNote = rampCapped
+          ? ` (ramp-capped from ${accepted.requestedQty})`
+          : "";
         return {
           ticker,
           timestamp,
@@ -1841,7 +1869,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           reasonType,
           reason: `Momentum/trend rebalance${weightNote} - ${
             accepted.action === "BUY" ? "bought" : "sold"
-          } ${submittedQty} shares (broker-accepted, not fill-confirmed).`,
+          } ${submittedQty} shares (broker-accepted, not fill-confirmed).${rampNote}`,
           finalStatus: "executed",
           signalStatus: "ready",
           executionStatus: "executed",
