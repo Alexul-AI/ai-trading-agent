@@ -77,6 +77,16 @@ export interface EtfRotationExecutionGates {
   allowBuy: boolean;
   /** AUTOPILOT_ALLOW_SELL - checked per SELL leg, independent of allowBuy. */
   allowSell: boolean;
+  /**
+   * AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT - caps any single BUY
+   * leg's dollar size to this percent of refreshed equity, independent of
+   * cash affordability and independent per leg (not a shared pool - the
+   * number of BUY legs that appear in a cycle isn't fixed, since a pick can
+   * fail the trend filter and drop to cash; a shared pool would silently
+   * change per-position sizing based on how many picks happened to
+   * qualify). undefined = uncapped (current, unchanged behavior).
+   */
+  rampMaxPositionEquityPercent?: number;
 }
 
 export interface EtfRotationLegOutcome {
@@ -157,6 +167,51 @@ export function computeOverallExecutionStatus(counts: {
   if (counts.accepted === 0 && counts.failed === 0) return "blocked";
   if (counts.accepted > 0) return "partial";
   return "failed";
+}
+
+/**
+ * Pure sizing ceiling for the paper-execution ramp - a per-position cap
+ * on how many shares a single BUY leg may request, independent of cash
+ * affordability. `undefined` means uncapped (current, unchanged
+ * behavior) - returning `Infinity` rather than `order.shares` itself so
+ * the caller can combine this with the existing cash ceiling via a plain
+ * `Math.min` without a separate "is this capped at all" branch.
+ */
+export function computeRampMaxShares(
+  price: number,
+  equity: number,
+  rampMaxPositionEquityPercent: number | undefined,
+): number {
+  if (rampMaxPositionEquityPercent === undefined) return Infinity;
+  return Math.max(
+    0,
+    Math.floor((rampMaxPositionEquityPercent / 100) * equity / price),
+  );
+}
+
+/**
+ * Fails loud at module load (same convention as `assertValidEtfRotationConfig`
+ * for `holdCount`), not per-cycle: unlike `resolveEtfRotationConfigVariant`
+ * (where falling back to the validated baseline is the safe direction),
+ * falling back to *uncapped* here would be the one outcome this whole
+ * feature exists to prevent - a fat-fingered out-of-range value must never
+ * silently degrade to "no cap at all". `raw === undefined` (the env var
+ * genuinely absent) is the only input that returns `undefined` - checked
+ * before parsing, never inferred from falsiness, since `"0"` is a
+ * deliberate, legitimate "block all BUYs via ramp" setting and must not
+ * collapse into "uncapped" the way a `parsed || fallback` pattern would.
+ */
+export function resolveRampMaxPositionEquityPercent(
+  raw: string | undefined,
+): number | undefined {
+  if (raw === undefined) return undefined;
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 100) {
+    throw new Error(
+      `Invalid AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT (${JSON.stringify(raw)}): must be a number between 0 and 100, or unset for uncapped (current) behavior.`,
+    );
+  }
+  return parsed;
 }
 
 function extractErrorMessage(error: unknown): string {
@@ -397,13 +452,32 @@ export async function executeEtfRotationOrders(
       continue;
     }
 
+    // Ramp cap checked first, as its own sequential stage, so a block
+    // caused by the ramp can be attributed to the ramp specifically -
+    // folding this into a single three-way Math.min with the cash check
+    // below would lose which ceiling actually bound at zero.
+    const rampMaxShares = computeRampMaxShares(
+      price,
+      refreshedSnapshot.equity,
+      executionGates.rampMaxPositionEquityPercent,
+    );
+    const rampCappedRequest = Math.min(order.shares, rampMaxShares);
+
+    if (rampCappedRequest <= 0) {
+      blockedOrders.push({
+        ...makeOutcome(order),
+        blockReason: `Blocked by AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT=${executionGates.rampMaxPositionEquityPercent} (wanted ${order.shares} shares, ramp cap allows 0 at ~$${price.toFixed(2)}).`,
+      });
+      continue;
+    }
+
     const maxAffordableShares = Math.floor(availableCash / price);
-    const sizedQty = Math.min(order.shares, maxAffordableShares);
+    const sizedQty = Math.min(rampCappedRequest, maxAffordableShares);
 
     if (sizedQty <= 0) {
       blockedOrders.push({
         ...makeOutcome(order),
-        blockReason: `Insufficient available cash after SELL legs settled (wanted ${order.shares} shares at ~$${price.toFixed(2)}, can afford 0).`,
+        blockReason: `Insufficient available cash after SELL legs settled (wanted ${rampCappedRequest} shares at ~$${price.toFixed(2)}, can afford 0).`,
       });
       continue;
     }
