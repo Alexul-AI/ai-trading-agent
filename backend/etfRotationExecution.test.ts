@@ -683,4 +683,18 @@ describe("resolveRampMaxPositionEquityPercent", () => {
   it("throws on a non-numeric value", () => {
     expect(() => resolveRampMaxPositionEquityPercent("abc")).toThrow();
   });
+
+  it("throws on a partially-numeric value instead of silently truncating it (parseFloat footgun)", () => {
+    // Number.parseFloat("10abc") === 10 - a strict parse must reject this,
+    // not silently accept the leading numeric portion.
+    expect(() => resolveRampMaxPositionEquityPercent("10abc")).toThrow();
+  });
+
+  it("throws on a value with an embedded unit/word", () => {
+    expect(() => resolveRampMaxPositionEquityPercent("5 percent")).toThrow();
+  });
+
+  it("tolerates surrounding whitespace but still parses correctly", () => {
+    expect(resolveRampMaxPositionEquityPercent(" 10 \n")).toBe(10);
+  });
 });

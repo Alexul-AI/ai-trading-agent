@@ -200,12 +200,27 @@ export function computeRampMaxShares(
  * before parsing, never inferred from falsiness, since `"0"` is a
  * deliberate, legitimate "block all BUYs via ramp" setting and must not
  * collapse into "uncapped" the way a `parsed || fallback` pattern would.
+ *
+ * Uses a strict whole-string regex rather than `Number.parseFloat` -
+ * `parseFloat` parses only the leading numeric portion of a string and
+ * silently ignores trailing garbage (`Number.parseFloat("10abc") === 10`),
+ * which would let a fat-fingered value like `"10abc"` or `"5 percent"`
+ * quietly become a "valid" 10/5 instead of failing loud, defeating the
+ * whole point of validating at module load. Surrounding whitespace is
+ * trimmed first (a forgiving allowance for a stray newline/space in a
+ * dashboard-entered env var), but no characters may remain after that.
  */
 export function resolveRampMaxPositionEquityPercent(
   raw: string | undefined,
 ): number | undefined {
   if (raw === undefined) return undefined;
-  const parsed = Number.parseFloat(raw);
+  const trimmed = raw.trim();
+  if (!/^-?\d+(\.\d+)?$/.test(trimmed)) {
+    throw new Error(
+      `Invalid AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT (${JSON.stringify(raw)}): must be a number between 0 and 100, or unset for uncapped (current) behavior.`,
+    );
+  }
+  const parsed = Number(trimmed);
   if (!Number.isFinite(parsed) || parsed < 0 || parsed > 100) {
     throw new Error(
       `Invalid AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT (${JSON.stringify(raw)}): must be a number between 0 and 100, or unset for uncapped (current) behavior.`,
