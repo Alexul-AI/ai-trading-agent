@@ -406,11 +406,9 @@ export async function runEtfRotationCycle(
 
   if (!executionGates.executeTradesEnabled) {
     // Global off switch (PR #47b) - the adapter is never even reached,
-    // not merely told not to act. Preserves Stage 1/PR45's exact dry-run
-    // decision shape unchanged whenever execution stays disabled
-    // (today's real Render value) - this PR changes zero observable
-    // behavior unless AUTOPILOT_EXECUTE_TRADES is explicitly flipped,
-    // which it is not here or in Render.
+    // not merely told not to act. Preserves dry-run behavior whenever
+    // execution is disabled; when execution is enabled, the adapter path
+    // below handles side gates and ramp limits.
     return config.universe.map((ticker): AutopilotDecisionLog => {
       const price = currentPriceByTicker.get(ticker) ?? 0;
       const buyOrder = buyByTicker.get(ticker);
@@ -493,8 +491,9 @@ export async function runEtfRotationCycle(
   // the adapter. This is the only place "executing" is ever written in
   // this file, and only reached when the global flag genuinely allows
   // it. Still requires the relevant side gate per leg (checked inside
-  // executeEtfRotationOrders) and AUTOPILOT_STRATEGY=etf_rotation to
-  // even be in this function at all - none of which are set in Render.
+  // executeEtfRotationOrders) and AUTOPILOT_STRATEGY=etf_rotation to reach
+  // this function; those deployment values are operational choices, not
+  // assumptions baked into this module.
   await recordRebalanceExecuting(etfRotationStateFilePath);
 
   const submitOrderLeg: EtfRotationSubmitOrderLeg = async (
