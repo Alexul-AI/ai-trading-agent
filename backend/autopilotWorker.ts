@@ -56,7 +56,7 @@ import {
   type RegimeBucketConfig,
   type RegimeState,
 } from "./src/strategy/portfolioRegimeFilter.js";
-import { tryClaimWorkerLock } from "./autopilotWorkerLock.js";
+import { releaseWorkerLock, tryClaimWorkerLock } from "./autopilotWorkerLock.js";
 import {
   AUTOPILOT_MAX_SELL_FRACTION,
   clampFraction,
@@ -2344,6 +2344,41 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     timer = null;
   }
 
+  // Graceful-shutdown-only lock release (server.ts's SIGTERM/SIGINT
+  // handler) - deliberately not folded into stop() above, since stop()
+  // pausing the scheduler doesn't mean the process itself is dying (e.g. a
+  // future "fully halt the worker" admin action); releasing the lock while
+  // the process stays alive would let a different process claim it out
+  // from under this one. Uses a bounded poll rather than a single
+  // instantaneous check: with real cycles observed taking ~1.6-2s, a
+  // one-shot check-and-exit would cut an in-flight cycle off sooner than
+  // Render's own SIGKILL-after-grace-period would have - actually worse
+  // than doing nothing. Waiting out a short in-flight cycle first, then
+  // releasing, converts the common "redeploy lands mid-cycle" case into a
+  // clean release instead of a 3-hour-stale-lock wait for the next
+  // process. Falls back to leaving the lock for the staleness window
+  // (autopilotWorkerLock.ts) only if the cycle is still running once the
+  // bound elapses.
+  async function releaseLockOnShutdown(): Promise<void> {
+    if (running) {
+      const pollIntervalMs = 250;
+      const deadline = Date.now() + 8000;
+      while (running && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      }
+    }
+
+    if (running) {
+      console.warn(
+        "[AUTOPILOT] Shutdown: cycle still in flight after the wait window - leaving the lock for the staleness fallback.",
+      );
+      return;
+    }
+
+    await releaseWorkerLock(WORKER_OWNER_ID);
+    console.log("[AUTOPILOT] Shutdown: worker lock released.");
+  }
+
   function setEnabled(nextEnabled: boolean) {
     enabled = nextEnabled;
 
@@ -2400,5 +2435,6 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     setEnabled,
     getStatus,
     runOnce,
+    releaseLockOnShutdown,
   };
 }
