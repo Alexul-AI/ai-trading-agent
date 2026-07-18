@@ -16,6 +16,10 @@ import {
 
 vi.stubEnv("AUTOPILOT_STRATEGY", "etf_rotation");
 vi.stubEnv("AUTOPILOT_EXECUTE_TRADES", "false");
+// fetchAlpacaBarsUncached throws before ever calling fetch if these are
+// empty - must not depend on a real .env being present (CI has none).
+vi.stubEnv("APCA_API_KEY_ID", "test-key-id");
+vi.stubEnv("APCA_API_SECRET_KEY", "test-secret-key");
 
 const { createAutopilotWorker } = await import("./autopilotWorker.js");
 

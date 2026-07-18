@@ -13,6 +13,10 @@ import {
 
 vi.stubEnv("AUTOPILOT_STRATEGY", "baseline");
 vi.stubEnv("AUTOPILOT_EXECUTE_TRADES", "false");
+// Not exercised here (the lock check short-circuits before any bars fetch),
+// but stubbed for consistency/robustness against a real .env leaking in.
+vi.stubEnv("APCA_API_KEY_ID", "test-key-id");
+vi.stubEnv("APCA_API_SECRET_KEY", "test-secret-key");
 
 const { createAutopilotWorker } = await import("./autopilotWorker.js");
 

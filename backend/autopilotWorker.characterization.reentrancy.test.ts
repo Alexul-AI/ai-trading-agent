@@ -17,6 +17,11 @@ import type { PortfolioSnapshot } from "./src/strategy/portfolioSafety.js";
 // clarity even though these are the module's own defaults.
 vi.stubEnv("AUTOPILOT_STRATEGY", "baseline");
 vi.stubEnv("AUTOPILOT_EXECUTE_TRADES", "false");
+// The first call's eventual per-ticker analysis would otherwise throw here
+// before even reaching its own "not enough bars" check - stubbed so this
+// test doesn't depend on a real .env being present (CI has none).
+vi.stubEnv("APCA_API_KEY_ID", "test-key-id");
+vi.stubEnv("APCA_API_SECRET_KEY", "test-secret-key");
 
 const { createAutopilotWorker } = await import("./autopilotWorker.js");
 
