@@ -1,3 +1,7 @@
+// See docs/ops/AUTOPILOT_WORKER_MAP.md for a structural map of this file
+// (block/dependency/side-effect breakdown, baseline-vs-ETF-Rotation-path
+// separation) - kept there rather than as a giant comment here so it stays
+// easier to keep in sync as the file changes.
 import { randomUUID } from "crypto";
 import {
   calculateATR,
@@ -30,7 +34,6 @@ import {
   recordRebalanceTerminal,
   type RebalanceStatus,
 } from "./etfRotationWorkerState.js";
-import type { OrderErrorClassification } from "./orderIdempotency.js";
 import {
   computeRampMaxShares,
   executeEtfRotationOrders,
@@ -47,7 +50,6 @@ import {
   shouldSendDailyReminder,
   recordReminderSent,
   type CircuitBreakerState,
-  type FetchEquityHistory,
 } from "./portfolioCircuitBreaker.js";
 import { appendCircuitBreakerAuditEvent } from "./circuitBreakerAuditLog.js";
 import {
@@ -74,162 +76,42 @@ export {
 };
 export type { PortfolioPositionSnapshot, PortfolioSnapshot };
 
-interface AlpacaBar {
-  t: string;
-  o: number;
-  h: number;
-  l: number;
-  c: number;
-  v: number;
-}
+// Types live in src/types/autopilotTypes.ts (extracted, same "pure move,
+// re-exported" pattern as src/strategy/portfolioSafety.ts) - see
+// docs/ops/AUTOPILOT_WORKER_MAP.md for the full structural map.
+import type {
+  AlpacaBar,
+  AlpacaBarsResponse,
+  AutopilotDecisionLog,
+  AutopilotStatus,
+  AutopilotStrategyKind,
+  AutopilotWorkerOptions,
+  BlockReasonCategory,
+  DecisionFinalStatus,
+  ExecuteSafeTrade,
+  ExecuteSafeTradeResult,
+  ExecutionBlockReasonCategory,
+  ExecutionStatus,
+  InsiderCacheEntry,
+  SentimentCacheEntry,
+  SentimentVetoResult,
+  SignalStatus,
+} from "./src/types/autopilotTypes.js";
 
-interface AlpacaBarsResponse {
-  bars?: AlpacaBar[];
-  next_page_token?: string | null;
-}
-
-export interface ExecuteSafeTradeResult {
-  status: string;
-  reason?: string;
-  /**
-   * Only ever populated for a status: "error" result whose underlying
-   * failure was classified by orderIdempotency.ts's classifyOrderError
-   * (server.ts's ClassifiedOrderError) - distinguishes "definitely
-   * rejected" from "ambiguous, might have actually gone through" for a
-   * caller that needs that distinction (the ETF Rotation execution
-   * adapter, etfRotationExecution.ts - see mapExecuteSafeTradeResultToLegOutcome
-   * below). Absent for a "rejected" early-gate-check result (circuit
-   * breaker, risk manager) - those are always definitively rejected,
-   * there's no ambiguity to classify.
-   */
-  classification?: OrderErrorClassification;
-  [key: string]: unknown;
-}
-
-export type ExecuteSafeTrade = (
-  ticker: string,
-  action: "BUY" | "SELL",
-  requestedShares: number,
-  orderType?: string,
-  limitPrice?: number,
-  stopLoss?: number,
-  takeProfit?: number,
-  requestedNotional?: number,
-) => Promise<ExecuteSafeTradeResult>;
-
-export interface AutopilotWorkerOptions {
-  tradeMode: "paper" | "live";
-  getPortfolioSnapshot: () => Promise<PortfolioSnapshot>;
-  getEquityHistorySince: FetchEquityHistory;
-  executeSafeTrade: ExecuteSafeTrade;
-  broadcastSSE: (payload: unknown) => void;
-  sendTelegramAlert?: (message: string) => Promise<void>;
-}
-
-export type SignalStatus = "hold" | "blocked" | "ready";
-export type ExecutionStatus =
-  | "not_attempted"
-  | "dry_run"
-  | "blocked"
-  | "executed"
-  | "failed"
-  // Only reachable via the ETF Rotation execution path (PR #47b) - the
-  // baseline path's executeSafeTrade call never distinguishes this from
-  // "failed" (see analyzeTicker's own success/failure branch). An
-  // ambiguous leg's outcome genuinely isn't known - never treated as a
-  // silent success or a confident rejection (design doc §8).
-  | "ambiguous";
-
-export type DecisionFinalStatus =
-  | "hold"
-  | "blocked"
-  | "signal_ready"
-  | "executed"
-  | "execution_failed"
-  | "error";
-
-export type BlockReasonCategory =
-  | "confidence"
-  | "position_guard"
-  | "safety_cap"
-  | "quantity"
-  | "sentiment_filter"
-  | "insider_filter"
-  | "regime_filter"
-  | "error"
-  | "other";
-
-export type ExecutionBlockReasonCategory =
-  | "dry_run"
-  | "trade_mode"
-  | "permission"
-  | "broker"
-  | "other";
-
-export interface AutopilotDecisionLog {
-  ticker: string;
-  timestamp: string;
-  price: number;
-  /**
-   * Optional - single-ticker confluence-scoring indicators (strategyEngine.ts)
-   * with no equivalent for an ETF Rotation rebalance decision (see
-   * etfRotationStrategy.ts). Omitted for rotation decisions rather than
-   * populated with misleading placeholder values.
-   */
-  rsi?: number;
-  macdHistogram?: number;
-  previousMacdHistogram?: number;
-  bollingerLower?: number;
-  bollingerUpper?: number;
-  action: StrategyDecision["action"];
-  confidence: number;
-  suggestedShares: number;
-  originalSuggestedShares?: number;
-  /** Fractional-fallback dollar amount, set only when using notional sizing. */
-  suggestedNotional?: number;
-  originalSuggestedNotional?: number;
-  /** A plain string, not restricted to StrategyDecision's own reasonType union - the ETF Rotation path uses its own vocabulary (REBALANCE_BUY/REBALANCE_SELL/etc), matching decisionJournal.ts's JournalDecision.reasonType (also an unrestricted string). */
-  reasonType: string;
-  reason: string;
-  safetyNote?: string;
-  finalStatus?: DecisionFinalStatus;
-  signalStatus?: SignalStatus;
-  executionStatus?: ExecutionStatus;
-  isSignalReady?: boolean;
-  blockReasonCategory?: BlockReasonCategory;
-  blockReasonCode?: string;
-  blockReasonDetail?: string;
-  executionBlockReasonCategory?: ExecutionBlockReasonCategory;
-  executionBlockReasonCode?: string;
-  executionBlockReasonDetail?: string;
-  executed: boolean;
-  skippedReason?: string;
-  result?: ExecuteSafeTradeResult;
-}
-
-export interface AutopilotStatus {
-  enabled: boolean;
-  executeTrades: boolean;
-  allowBuy: boolean;
-  allowSell: boolean;
-  tradeMode: "paper" | "live";
-  strategyVersion: string;
-  strategyConfigHash: string;
-  strategyConfig: Record<string, unknown>;
-  running: boolean;
-  intervalMs: number;
-  tickers: string[];
-  minConfidence: number;
-  maxSellFraction: number;
-  blockSellBelowAverageEntry: boolean;
-  telegramCooldownMinutes: number;
-  lastJournalRunId: string | null;
-  lastRunAt: string | null;
-  lastError: string | null;
-  lastDecisions: AutopilotDecisionLog[];
-  circuitBreaker: CircuitBreakerState | null;
-  circuitBreakerMaxDrawdownFromPeakPercent: number;
-}
+export type {
+  AutopilotDecisionLog,
+  AutopilotStatus,
+  AutopilotStrategyKind,
+  AutopilotWorkerOptions,
+  BlockReasonCategory,
+  DecisionFinalStatus,
+  ExecuteSafeTrade,
+  ExecuteSafeTradeResult,
+  ExecutionBlockReasonCategory,
+  ExecutionStatus,
+  SentimentVetoResult,
+  SignalStatus,
+};
 
 const APCA_API_KEY_ID = process.env.APCA_API_KEY_ID ?? "";
 const APCA_API_SECRET_KEY = process.env.APCA_API_SECRET_KEY ?? "";
@@ -429,8 +311,6 @@ const STRATEGY_CONFIG_HASH = createStrategyConfigHash(DEFAULT_STRATEGY_CONFIG);
 // (server.ts's client_order_id, keyed only "TICKER:ACTION") nor position
 // tracking (ticker-keyed only, no strategy attribution) could safely
 // disambiguate two strategies trading the same ticker concurrently.
-export type AutopilotStrategyKind = "baseline" | "etf_rotation";
-
 const AUTOPILOT_STRATEGY: AutopilotStrategyKind =
   process.env.AUTOPILOT_STRATEGY === "etf_rotation"
     ? "etf_rotation"
@@ -483,18 +363,7 @@ function getErrorMessage(error: unknown): string {
   }
 }
 
-interface SentimentCacheEntry {
-  sentiment: string;
-  summary: string;
-  fetchedAt: number;
-}
-
 const sentimentCacheByTicker = new Map<string, SentimentCacheEntry>();
-
-export interface SentimentVetoResult {
-  blocked: boolean;
-  note: string;
-}
 
 // Pure decision rule, kept separate from the fetch/cache orchestration
 // below so it's testable without mocking network calls.
@@ -554,12 +423,6 @@ async function getBuySentimentVeto(
   }
 
   return evaluateSentimentVeto(ticker, entry.sentiment, entry.summary);
-}
-
-interface InsiderCacheEntry {
-  buyCount: number;
-  sellCount: number;
-  fetchedAt: number;
 }
 
 const insiderCacheByTicker = new Map<string, InsiderCacheEntry>();
@@ -1425,7 +1288,9 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     // monthKey is passed as null here - see decideEtfRotationGateAction's
     // own doc comment for why this is an explicit, tested part of its
     // contract, not an accident of internal check ordering.
-    const stateResult = await readRebalanceStateStrict();
+    const stateResult = await readRebalanceStateStrict(
+      options.testDataFilePaths?.etfRotationStateFilePath,
+    );
     const preBarsGateAction = decideEtfRotationGateAction(stateResult, null);
     const noPricesYet = new Map<string, number>();
 
@@ -1468,7 +1333,10 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       // and BUY legs, or between planning and execution starting) - never
       // resumed, per the design doc's Stage 2A resolution. Reachable for
       // real now that executeEtfRotationOrders is wired in below.
-      await recordRebalanceTerminal("failed_needs_review");
+      await recordRebalanceTerminal(
+        "failed_needs_review",
+        options.testDataFilePaths?.etfRotationStateFilePath,
+      );
 
       const alertMessage =
         'ETF Rotation found a stuck "executing" rebalance from a previous cycle/restart - marked failed_needs_review. Blocked until cleared via POST /api/autopilot/etf-rotation/clear-review.';
@@ -1650,13 +1518,16 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     );
 
     // Status "planned".
-    await recordRebalancePlanned({
-      dateKey: latestDateKey,
-      rebalanceMonthKey: monthKey,
-      configVariantKey: ETF_ROTATION_CONFIG_VARIANT_KEY,
-      targets,
-      plannedOrders: orders,
-    });
+    await recordRebalancePlanned(
+      {
+        dateKey: latestDateKey,
+        rebalanceMonthKey: monthKey,
+        configVariantKey: ETF_ROTATION_CONFIG_VARIANT_KEY,
+        targets,
+        plannedOrders: orders,
+      },
+      options.testDataFilePaths?.etfRotationStateFilePath,
+    );
 
     const targetByTicker = new Map(targets.map((target) => [target.ticker, target]));
     const sellByTicker = new Map(
@@ -1761,7 +1632,9 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     // it. Still requires the relevant side gate per leg (checked inside
     // executeEtfRotationOrders) and AUTOPILOT_STRATEGY=etf_rotation to
     // even be in this function at all - none of which are set in Render.
-    await recordRebalanceExecuting();
+    await recordRebalanceExecuting(
+      options.testDataFilePaths?.etfRotationStateFilePath,
+    );
 
     const submitOrderLeg: EtfRotationSubmitOrderLeg = async (
       ticker,
@@ -1791,6 +1664,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
 
     await recordRebalanceTerminal(
       mapEtfRotationExecutionStatusToRebalanceStatus(executionResult.status),
+      options.testDataFilePaths?.etfRotationStateFilePath,
     );
 
     // Build the final per-ticker decisions from what actually happened this
@@ -1967,6 +1841,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
     const lockClaim = await tryClaimWorkerLock(
       WORKER_OWNER_ID,
       AUTOPILOT_LOCK_STALE_AFTER_MS,
+      options.testDataFilePaths?.lockFilePath,
     );
 
     if (!lockClaim.canProceed) {
@@ -2020,6 +1895,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       const circuitBreakerUpdate = await updatePortfolioCircuitBreaker(
         portfolio.equity,
         options.getEquityHistorySince,
+        options.testDataFilePaths?.circuitBreakerStateFilePath,
       );
       lastCircuitBreakerState = circuitBreakerUpdate.state;
 
@@ -2047,14 +1923,17 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           await options.sendTelegramAlert(alertMessage);
         }
 
-        await appendCircuitBreakerAuditEvent({
-          type: "CIRCUIT_BREAKER_TRIPPED",
-          timestamp: circuitBreakerUpdate.state.trippedAt ?? new Date().toISOString(),
-          equity: portfolio.equity,
-          peakEquity: circuitBreakerUpdate.state.peakEquity,
-          drawdownPercent: circuitBreakerDrawdownPercent,
-          thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
-        });
+        await appendCircuitBreakerAuditEvent(
+          {
+            type: "CIRCUIT_BREAKER_TRIPPED",
+            timestamp: circuitBreakerUpdate.state.trippedAt ?? new Date().toISOString(),
+            equity: portfolio.equity,
+            peakEquity: circuitBreakerUpdate.state.peakEquity,
+            drawdownPercent: circuitBreakerDrawdownPercent,
+            thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
+          },
+          options.testDataFilePaths?.circuitBreakerAuditLogFilePath,
+        );
       }
 
       // Computed once per cycle, before the concurrent per-ticker loop
@@ -2226,43 +2105,52 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           await options.sendTelegramAlert(reminderMessage);
         }
 
-        await appendCircuitBreakerAuditEvent({
-          type: "CIRCUIT_BREAKER_REMINDER_SENT",
-          timestamp: lastRunAt,
-          equity: portfolio.equity,
-          peakEquity: circuitBreakerUpdate.state.peakEquity,
-          drawdownPercent: circuitBreakerDrawdownPercent,
-          thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
-        });
+        await appendCircuitBreakerAuditEvent(
+          {
+            type: "CIRCUIT_BREAKER_REMINDER_SENT",
+            timestamp: lastRunAt,
+            equity: portfolio.equity,
+            peakEquity: circuitBreakerUpdate.state.peakEquity,
+            drawdownPercent: circuitBreakerDrawdownPercent,
+            thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
+          },
+          options.testDataFilePaths?.circuitBreakerAuditLogFilePath,
+        );
 
-        await recordReminderSent(todayDateKey);
+        await recordReminderSent(
+          todayDateKey,
+          options.testDataFilePaths?.circuitBreakerStateFilePath,
+        );
       }
 
       try {
-        const journalRun = await appendAutopilotRun({
-          timestamp: lastRunAt,
-          trigger,
-          executeTrades: AUTOPILOT_EXECUTE_TRADES,
-          tradeMode: options.tradeMode,
-          enabled,
-          tickers,
-          signalReadyCount: runSignalReadyCount,
-          signalBlockedCount: runSignalBlockedCount,
-          dryRunCount: runDryRunCount,
-          executedCount: runExecutedCount,
-          strategyVersion:
-            AUTOPILOT_STRATEGY === "etf_rotation"
-              ? ETF_ROTATION_STRATEGY_VERSION
-              : STRATEGY_VERSION,
-          strategyConfigHash:
-            AUTOPILOT_STRATEGY === "etf_rotation"
-              ? ETF_ROTATION_STRATEGY_CONFIG_HASH
-              : STRATEGY_CONFIG_HASH,
-          strategyConfig: (AUTOPILOT_STRATEGY === "etf_rotation"
-            ? ETF_ROTATION_ACTIVE_CONFIG
-            : DEFAULT_STRATEGY_CONFIG) as unknown as Record<string, unknown>,
-          decisions,
-        });
+        const journalRun = await appendAutopilotRun(
+          {
+            timestamp: lastRunAt,
+            trigger,
+            executeTrades: AUTOPILOT_EXECUTE_TRADES,
+            tradeMode: options.tradeMode,
+            enabled,
+            tickers,
+            signalReadyCount: runSignalReadyCount,
+            signalBlockedCount: runSignalBlockedCount,
+            dryRunCount: runDryRunCount,
+            executedCount: runExecutedCount,
+            strategyVersion:
+              AUTOPILOT_STRATEGY === "etf_rotation"
+                ? ETF_ROTATION_STRATEGY_VERSION
+                : STRATEGY_VERSION,
+            strategyConfigHash:
+              AUTOPILOT_STRATEGY === "etf_rotation"
+                ? ETF_ROTATION_STRATEGY_CONFIG_HASH
+                : STRATEGY_CONFIG_HASH,
+            strategyConfig: (AUTOPILOT_STRATEGY === "etf_rotation"
+              ? ETF_ROTATION_ACTIVE_CONFIG
+              : DEFAULT_STRATEGY_CONFIG) as unknown as Record<string, unknown>,
+            decisions,
+          },
+          options.testDataFilePaths?.journalFilePath,
+        );
 
         lastJournalRunId = journalRun.id;
       } catch (error) {
@@ -2375,7 +2263,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       return;
     }
 
-    await releaseWorkerLock(WORKER_OWNER_ID);
+    await releaseWorkerLock(WORKER_OWNER_ID, options.testDataFilePaths?.lockFilePath);
     console.log("[AUTOPILOT] Shutdown: worker lock released.");
   }
 
