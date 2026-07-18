@@ -75,6 +75,7 @@ export interface AutopilotWorkerOptions {
   testDataFilePaths?: {
     lockFilePath?: string;
     etfRotationStateFilePath?: string;
+    etfRotationOrderAuditLogFilePath?: string;
     circuitBreakerStateFilePath?: string;
     circuitBreakerAuditLogFilePath?: string;
     journalFilePath?: string;
