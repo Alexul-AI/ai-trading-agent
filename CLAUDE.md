@@ -16,7 +16,7 @@ Not a financial/trading expert — explain things in plain terms, not jargon. Wa
 
 - **Never execute a trade** (paper or live) on the user's behalf, even if explicitly asked — this is a standing rule, not a one-time refusal. Direct the user to do it themselves (Alpaca dashboard or the app's manual-order UI, currently disabled by the user on purpose).
 - **Never give personalized investment advice** ("should I buy X", "is now a good time"). Give math, backtested facts, and mechanics; the decision is always the user's.
-- Currently `TRADE_MODE=paper` and `AUTOPILOT_EXECUTE_TRADES=false` (dry-run only) — do not change either without the user explicitly asking, and treat flipping `AUTOPILOT_EXECUTE_TRADES` to `true` as a meaningful step worth confirming even though it's still paper money.
+- Currently production is paper-only, but ETF Rotation paper execution has been deliberately enabled behind gates (verified against local `.env` 2026-07-18): `TRADE_MODE=paper`, `AUTOPILOT_STRATEGY=etf_rotation`, `AUTOPILOT_EXECUTE_TRADES=true`, `AUTOPILOT_ALLOW_BUY=true`, `AUTOPILOT_ALLOW_SELL=false`, `AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT=2`, `AUTOPILOT_LOCK_STALE_AFTER_MS=600000`. Do not change trade mode, strategy, either execution gate, the ramp percent, or SELL permission without explicit user approval — and treat re-verifying against the actual current `.env`/Render values (not this snapshot) as necessary before relying on this for anything safety-relevant, since these are exactly the kind of values that drift.
 
 ## Workflow rule (starting 2026-07-10)
 
