@@ -20,7 +20,7 @@ gaps. It does not change any code, threshold, or execution behavior.
 | 4 | Restart with pending/ambiguous order | ✅ Code-fixed + restart-regression tested (PR #34); live-fire verification deferred to first real paper execution |
 | 5 | Audit/journal survives deploy | ✅ Empirically confirmed |
 | 6 | Alerts work after restart | 🟡 Accepted as deferred risk for paper (2026-07-15) - must be revisited before micro-live |
-| 7 | No duplicate worker cycles | ✅ Materially addressed 2026-07-15 (bounded by topology); genuinely strengthened 2026-07-18 (graceful-shutdown lock release, see item 7 below) |
+| 7 | No duplicate worker cycles | ✅ Materially addressed 2026-07-15 (bounded by topology); practical mitigation revised 2026-07-18 (shortened staleness window, not the graceful-shutdown code path - see item 7 below) |
 | 8 | Emergency stop documented | ✅ See `EMERGENCY_STOP.md` |
 
 ## Current overall status (2026-07-15)
@@ -30,12 +30,14 @@ materially addressed, 1 (item 6) consciously accepted as a deferred risk
 scoped to paper only.** Deliberately not "8 of 8 closed" - item 6's deferral
 is a decision with a scope and an expiry (revisit before micro-live), not a
 resolution. Item 7 was originally (2026-07-15) bounded by the current
-Render topology rather than a fix to the lock's own architecture, but a
-real production incident on 2026-07-18 (a routine redeploy orphaning the
-lock for ~2 hours) led to an actual strengthening of the lock's own code
-(graceful-shutdown release) - see item 7 below for what changed and what
-still hasn't (it remains best-effort/single-host-only by design, not a real
-distributed lock).
+Render topology rather than a fix to the lock's own architecture. A real
+production incident on 2026-07-18 (a routine redeploy orphaning the lock
+for ~2 hours) prompted a graceful-shutdown release path (PR #50) - but
+real-world SIGTERM delivery was never confirmed on this host (see item 7
+below), so the operative fix that actually shipped is a shortened
+staleness window (`AUTOPILOT_LOCK_STALE_AFTER_MS=600000`), not the
+graceful-shutdown code itself. It remains best-effort/single-host-only by
+design, not a real distributed lock.
 
 Materially addressed:
 1. Single Render instance — verified through the Scaling UI's "not
@@ -271,27 +273,58 @@ during a deploy transition. It provides **no** protection against genuinely
 separate instances with separate memory - that hasn't changed and isn't
 being claimed to have changed.
 
-**Materially addressed 2026-07-15 (bounded by topology), then genuinely
-strengthened 2026-07-18** after a real production incident: a routine
-`AUTOPILOT_ALLOW_BUY`/ramp env-var redeploy left the old process's lock
-file behind with a stale-looking heartbeat, and the new process correctly
-refused to double-claim it - but that meant every scheduled autopilot cycle
-was blocked for ~2 hours (the full default staleness window) even though
-the old process was genuinely dead, not slow. This empirically confirmed
+**Materially addressed 2026-07-15 (bounded by topology). A real production
+incident on 2026-07-18 prompted a code fix that turned out not to be the
+thing that actually helped - worth recording precisely so the next person
+doesn't rely on the wrong mechanism.**
+
+**The incident**: a routine `AUTOPILOT_ALLOW_BUY`/ramp env-var redeploy left
+the old process's lock file behind with a stale-looking heartbeat, and the
+new process correctly refused to double-claim it - blocking every
+scheduled autopilot cycle for ~2 hours (the full default staleness window)
+even though the old process was genuinely dead. This empirically confirmed
 Render's persistent disk **is** shared across the old/new process pair
-during a redeploy on this service (the open question mentioned in
-`CLAUDE.md` prior to this). Fixed the same day: a normal graceful shutdown
-(`SIGTERM`, sent before Render kills a container during a redeploy) now
-releases the lock immediately via the new `releaseWorkerLock`/
-`releaseLockOnShutdown` (`server.ts`'s new `SIGTERM`/`SIGINT` handler),
-narrowing the exposure window from "every routine redeploy" to "only a
-genuine unclean crash" - the 3-hour staleness window remains exactly as
-that fallback, unchanged. This *is* a real strengthening of the lock's own
-code (not just a topology-bounded non-issue like 2026-07-15's finding) -
-still best-effort and single-host-only by design, not a real distributed
+during a redeploy on this service (the open question `CLAUDE.md` had prior
+to this).
+
+**PR #50 (same day)** added a graceful-shutdown release path: a normal
+`SIGTERM` (which Render is documented to send before killing a container
+during a redeploy) should release the lock immediately via
+`releaseWorkerLock`/`releaseLockOnShutdown` (`server.ts`'s new `SIGTERM`/
+`SIGINT` handler, with a bounded 250ms/8s poll so an in-flight cycle isn't
+cut off sooner than Render's own grace period would). The logic is correct
+and verified locally via direct function-level tests (idle/fast-cycle/
+slow-cycle cases, all pass).
+
+**But real-world signal delivery was never confirmed, and the evidence now
+points the other way.** Across ~2 hours of production logs spanning
+multiple real redeploys - including deliberately changing the Start
+Command from `npm start` to `node dist/server.js` directly, specifically to
+rule out npm's own signal-forwarding as the cause - the string
+`[SERVER] Received SIGTERM` never appears once. Two separate manual
+`run-once` checks after real redeploys both showed the lock still held by
+a different, unreleased `ownerId`. The most likely explanation: Render, on
+this service's plan/tier, does not deliver a catchable `SIGTERM` to this
+process before terminating it - a platform-level constraint this
+codebase cannot control, not a defect in the shipped code.
+
+**The mitigation that actually shipped (2026-07-18, same day)**:
+`AUTOPILOT_LOCK_STALE_AFTER_MS=600000` (10 minutes), set directly in
+Render - no code dependency, no reliance on signal delivery. Real cycles
+take ~1.6-2s, so 10 minutes retains a huge safety margin against two
+instances genuinely overlapping, while bounding "stuck after a routine
+redeploy" to ~10 minutes instead of ~3 hours, unconditionally. This is the
+mechanism actually protecting cycle scheduling today - not PR #50's
+SIGTERM handler, which should be treated as dormant-but-harmless on this
+host rather than load-bearing. (Confirming the 10-minute window itself
+behaves as expected still needs a real future stuck-lock occurrence to
+observe - not yet directly demonstrated at time of writing, only inferred
+from the staleness-check code path, which is unconditional and doesn't
+depend on any of the same unresolved signal-delivery questions.)
+
+Still best-effort and single-host-only by design, not a real distributed
 lock, and still reopens if this service is ever scaled (item 1's own
-caveat) - but the specific failure mode observed here (a routine redeploy
-orphaning the lock) is now closed.
+caveat).
 
 ## 8. Emergency stop documented
 
