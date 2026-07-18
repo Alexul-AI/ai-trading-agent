@@ -1503,6 +1503,39 @@ app.post("/api/autopilot", requireAdminToken, (req, res) => {
 
 autopilotWorker.start();
 
+// Render sends SIGTERM before killing the old container during a
+// redeploy - releasing the autopilot worker lock here (if idle) closes
+// the gap that otherwise blocks every scheduled cycle on the new process
+// for up to the full staleness window (see autopilotWorkerLock.ts).
+// Deliberately narrow in scope: no HTTP-connection draining, just the
+// autopilot lock. process.exit(0) must run regardless of what
+// releaseLockOnShutdown does - registering any signal handler here also
+// disables Node's default immediate-terminate behavior for that signal,
+// so skipping the unconditional exit would leave the process hanging
+// until Render's own SIGKILL-after-grace-period instead of shutting down
+// cleanly.
+async function gracefulShutdown(signal: string): Promise<void> {
+  console.log(`[SERVER] Received ${signal}, shutting down...`);
+  try {
+    autopilotWorker.stop();
+    await autopilotWorker.releaseLockOnShutdown();
+  } catch (error) {
+    console.error(
+      "[SERVER] Error during graceful shutdown:",
+      error instanceof Error ? error.message : error,
+    );
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.on("SIGTERM", () => {
+  void gracefulShutdown("SIGTERM");
+});
+process.on("SIGINT", () => {
+  void gracefulShutdown("SIGINT");
+});
+
 app.listen(ENV.PORT, () => {
   console.log("");
   console.log("[SERVER] AI Trading Agent backend is running");

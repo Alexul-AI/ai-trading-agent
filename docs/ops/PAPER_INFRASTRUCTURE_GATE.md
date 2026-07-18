@@ -20,17 +20,22 @@ gaps. It does not change any code, threshold, or execution behavior.
 | 4 | Restart with pending/ambiguous order | ✅ Code-fixed + restart-regression tested (PR #34); live-fire verification deferred to first real paper execution |
 | 5 | Audit/journal survives deploy | ✅ Empirically confirmed |
 | 6 | Alerts work after restart | 🟡 Accepted as deferred risk for paper (2026-07-15) - must be revisited before micro-live |
-| 7 | No duplicate worker cycles | ✅ Materially addressed 2026-07-15 — bounded by the current no-scaling Render topology, not a strengthened lock |
+| 7 | No duplicate worker cycles | ✅ Materially addressed 2026-07-15 (bounded by topology); genuinely strengthened 2026-07-18 (graceful-shutdown lock release, see item 7 below) |
 | 8 | Emergency stop documented | ✅ See `EMERGENCY_STOP.md` |
 
 ## Current overall status (2026-07-15)
 
 **All 8 items now have an explicit disposition for paper readiness: 7
 materially addressed, 1 (item 6) consciously accepted as a deferred risk
-scoped to paper only.** Deliberately not "8 of 8 closed" - item 7 is bounded
-by the current Render topology rather than a fix to the lock's own
-architecture (see item 7 below), and item 6's deferral is a decision with a
-scope and an expiry (revisit before micro-live), not a resolution.
+scoped to paper only.** Deliberately not "8 of 8 closed" - item 6's deferral
+is a decision with a scope and an expiry (revisit before micro-live), not a
+resolution. Item 7 was originally (2026-07-15) bounded by the current
+Render topology rather than a fix to the lock's own architecture, but a
+real production incident on 2026-07-18 (a routine redeploy orphaning the
+lock for ~2 hours) led to an actual strengthening of the lock's own code
+(graceful-shutdown release) - see item 7 below for what changed and what
+still hasn't (it remains best-effort/single-host-only by design, not a real
+distributed lock).
 
 Materially addressed:
 1. Single Render instance — verified through the Scaling UI's "not
@@ -247,31 +252,46 @@ exists to prevent.
 
 ## 7. No duplicate worker cycles
 
-`autopilotWorkerLock.ts` claim logic (`evaluateLockClaim`, `:27-55`): no
+`autopilotWorkerLock.ts` claim logic (`evaluateLockClaim`): no
 existing lock claims it; the same `ownerId` (a `randomUUID()` generated once
-per process, `autopilotWorker.ts:206`) renews it; a foreign lock older than
-`staleAfterMs` (default `AUTOPILOT_INTERVAL_MS * 3`, `autopilotWorker.ts:200-204`)
-is reclaimed as presumed-crashed; anything else is refused. Checked once per
-cycle (`tryClaimWorkerLock`, called from `autopilotWorker.ts:1228`), not on a
-separate heartbeat timer. Unit-tested (`autopilotWorkerLock.test.ts`, 5
-cases: no lock / same-owner renew / foreign-fresh refused / foreign-stale
-claimed / exact-boundary-not-yet-stale refused).
+per process, `autopilotWorker.ts`'s `WORKER_OWNER_ID`) renews it; a foreign lock older than
+`staleAfterMs` (default `AUTOPILOT_INTERVAL_MS * 3`) is reclaimed as presumed-crashed; anything else is refused. Checked once per
+cycle (`tryClaimWorkerLock`, called from inside `runOnce()`), not on a
+separate heartbeat timer. Unit-tested (`autopilotWorkerLock.test.ts` - both
+the pure `evaluateLockClaim` cases, and, added 2026-07-18, real I/O-level
+tests for `tryClaimWorkerLock`/`releaseWorkerLock` against a temp lock
+file). (Note: this item's earlier `autopilotWorker.ts:206`/`:1228`-style
+line references have drifted from actual current line numbers due to
+unrelated ETF Rotation work landing since - referring to function/constant
+names above instead of line numbers to avoid the same staleness recurring.)
 
-The code's own comment (`autopilotWorkerLock.ts:7-13`) is explicit: this
+The code's own comment (top of `autopilotWorkerLock.ts`) is explicit: this
 protects against an old+new process briefly overlapping on the **same host**
 during a deploy transition. It provides **no** protection against genuinely
 separate instances with separate memory - that hasn't changed and isn't
 being claimed to have changed.
 
-**Materially addressed 2026-07-15, precisely stated**: the lock itself is
-still best-effort, not a real distributed lock - nothing was strengthened
-in the code. What changed is that item 1 confirmed a genuinely separate
-host isn't reachable *for this service, on its current Render topology*
-(scaling structurally disabled while the disk is attached) - so the lock's
-known weak spot is currently a non-issue by construction, not because the
-mechanism itself became more robust. If this service is ever scaled
-(item 1's own caveat), this item reopens along with it - worth remembering
-as "bounded by topology," not "solved."
+**Materially addressed 2026-07-15 (bounded by topology), then genuinely
+strengthened 2026-07-18** after a real production incident: a routine
+`AUTOPILOT_ALLOW_BUY`/ramp env-var redeploy left the old process's lock
+file behind with a stale-looking heartbeat, and the new process correctly
+refused to double-claim it - but that meant every scheduled autopilot cycle
+was blocked for ~2 hours (the full default staleness window) even though
+the old process was genuinely dead, not slow. This empirically confirmed
+Render's persistent disk **is** shared across the old/new process pair
+during a redeploy on this service (the open question mentioned in
+`CLAUDE.md` prior to this). Fixed the same day: a normal graceful shutdown
+(`SIGTERM`, sent before Render kills a container during a redeploy) now
+releases the lock immediately via the new `releaseWorkerLock`/
+`releaseLockOnShutdown` (`server.ts`'s new `SIGTERM`/`SIGINT` handler),
+narrowing the exposure window from "every routine redeploy" to "only a
+genuine unclean crash" - the 3-hour staleness window remains exactly as
+that fallback, unchanged. This *is* a real strengthening of the lock's own
+code (not just a topology-bounded non-issue like 2026-07-15's finding) -
+still best-effort and single-host-only by design, not a real distributed
+lock, and still reopens if this service is ever scaled (item 1's own
+caveat) - but the specific failure mode observed here (a routine redeploy
+orphaning the lock) is now closed.
 
 ## 8. Emergency stop documented
 
