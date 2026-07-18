@@ -82,15 +82,20 @@ separate instance per characterization test safe.
 - **`sendTelegramForNewSignalReadyDecisions`** / **`sendTelegramForFilterBlocks`** -
   cooldown-deduped Telegram sends, shared by both paths, mutate
   `lastTelegramSentAtBySignal`.
-- **`runEtfRotationCycle`** (ETF Rotation path) - the second-largest
-  function. Restart-hazard gate check → bars fetch → warmup check →
-  target/order computation → plan-record → dry-run stub or live execution
-  via `executeEtfRotationOrders` → terminal-status record → per-ticker
-  decision-log construction. **Confirmed to touch no baseline-only helper
-  and no closure `let` variable** - it only needs the `portfolio` param, a
-  subset of `options`, the shared `fetchAlpacaBars`, and ETF-rotation
-  constants. This is why PR #53 (extracting it into its own module) is
-  expected to be low-risk.
+- **`runEtfRotationCycle`** - **extracted into `backend/etfRotationCycle.ts`
+  in PR #53** (confirmed to have touched no baseline-only helper and no
+  closure `let` variable, which is exactly what made the extraction
+  low-risk). `autopilotWorker.ts` now only holds the `runOnce` call site
+  that builds its params object (`config`, `configVariantKey`, `barsDays`,
+  `warmupTradingDays`, `executionGates`, `fetchBars`, and the DI functions)
+  from its own module-level constants/`options` and calls the imported
+  function. The two mapping helpers
+  (`mapExecuteSafeTradeResultToLegOutcome`/
+  `mapEtfRotationExecutionStatusToRebalanceStatus`) moved with it (they're
+  used only by it, and moving either into `etfRotationExecution.ts`/
+  `etfRotationWorkerState.ts` instead would have created a coupling between
+  those two sibling files that doesn't exist today) - `autopilotWorker.ts`
+  re-exports both so `autopilotFilters.test.ts` needed zero changes.
 - **`runOnce`** - the single public orchestrator: lock claim → portfolio
   snapshot → circuit-breaker update → strategy dispatch (`runEtfRotationCycle`
   vs. the per-ticker `analyzeTicker` loop) → daily-reminder check → journal
@@ -113,8 +118,11 @@ maps, the regime-bucket prefetch block inside `runOnce` (gated on
 
 **ETF-Rotation-only**: `runEtfRotationCycle`,
 `mapExecuteSafeTradeResultToLegOutcome`,
-`mapEtfRotationExecutionStatusToRebalanceStatus`, the
-`ETF_ROTATION_*`-prefixed constants.
+`mapEtfRotationExecutionStatusToRebalanceStatus` (all three now live in
+`backend/etfRotationCycle.ts`, re-exported by `autopilotWorker.ts`), the
+`ETF_ROTATION_*`-prefixed constants (still module-level in
+`autopilotWorker.ts` - shared with `runOnce`/`getStatus`, threaded into
+`runEtfRotationCycle` as explicit parameters).
 
 **Shared by both**: `fetchAlpacaBars`/`fetchAlpacaBarsUncached` (different
 `days` per path, same cache), `getErrorMessage`, `toIsoDate`,
@@ -132,18 +140,23 @@ filePath-overridable" convention), but until this PR, `autopilotWorker.ts`'s
 call sites never passed one, so a test calling the real `runOnce()` would
 have corrupted or depended on live paper-trading state:
 
-| Real file | Touched via | Seam added in PR #52 |
+| Real file | Touched via | Seam added |
 |---|---|---|
-| `autopilot-worker.lock` | `tryClaimWorkerLock` (`runOnce`), `releaseWorkerLock` (`releaseLockOnShutdown`) | `options.testDataFilePaths.lockFilePath` |
-| `circuit-breaker-state.json` | `updatePortfolioCircuitBreaker`, `recordReminderSent` | `options.testDataFilePaths.circuitBreakerStateFilePath` |
-| `circuit-breaker-audit.jsonl` | `appendCircuitBreakerAuditEvent` (2 call sites: trip, daily reminder) | `options.testDataFilePaths.circuitBreakerAuditLogFilePath` |
-| `etf-rotation-worker-state.json` | `readRebalanceStateStrict`, `recordRebalancePlanned`, `recordRebalanceExecuting`, `recordRebalanceTerminal` (2 call sites) | `options.testDataFilePaths.etfRotationStateFilePath` |
-| `autopilot-decisions.jsonl` | `appendAutopilotRun` | `options.testDataFilePaths.journalFilePath` (required adding a `filePath` param to `decisionJournal.ts`'s `appendAutopilotRun` too - it was the one sibling module missing this convention) |
+| `autopilot-worker.lock` | `tryClaimWorkerLock` (`runOnce`), `releaseWorkerLock` (`releaseLockOnShutdown`) | `options.testDataFilePaths.lockFilePath` (PR #52) |
+| `circuit-breaker-state.json` | `updatePortfolioCircuitBreaker`, `recordReminderSent` | `options.testDataFilePaths.circuitBreakerStateFilePath` (PR #52) |
+| `circuit-breaker-audit.jsonl` | `appendCircuitBreakerAuditEvent` (2 call sites: trip, daily reminder) | `options.testDataFilePaths.circuitBreakerAuditLogFilePath` (PR #52) |
+| `etf-rotation-worker-state.json` | `readRebalanceStateStrict`, `recordRebalancePlanned`, `recordRebalanceExecuting`, `recordRebalanceTerminal` (2 call sites) | `options.testDataFilePaths.etfRotationStateFilePath` (PR #52) |
+| `etf-rotation-order-audit.jsonl` | `appendEtfRotationOrderAuditEvent` (called once per submitted leg, inside `executeEtfRotationOrders`) | `options.testDataFilePaths.etfRotationOrderAuditLogFilePath` (PR #53 - **a real gap PR #52 missed**: none of its 3 characterization tests ever reached a real submitted leg, so this file kept writing to the live path until PR #53's own new tests - the first to exercise a real accepted execution - actually polluted the real file locally and got caught before merge) |
+| `autopilot-decisions.jsonl` | `appendAutopilotRun` | `options.testDataFilePaths.journalFilePath` (PR #52, required adding a `filePath` param to `decisionJournal.ts`'s `appendAutopilotRun` too - it was the one sibling module missing this convention) |
 
 `fetchAlpacaBars`/`fetchAlpacaBarsUncached` call the ambient global `fetch(...)`
 directly (not an imported reference) - characterization tests intercept this
 with `vi.stubGlobal("fetch", ...)` rather than a new DI seam, since no
-`autopilotWorker.ts` source change is needed for that one.
+`autopilotWorker.ts` source change is needed for that one. `runEtfRotationCycle`
+itself now receives `fetchBars` as an explicit parameter (rather than reading
+the module-level `fetchAlpacaBars` via closure), so its own direct tests
+(`etfRotationCycle.test.ts`) inject canned bars straight through that
+parameter and need no fetch stub at all.
 
 All `testDataFilePaths` fields default to `undefined`, which every
 underlying function already treats as "use the real file" - `server.ts`'s
@@ -151,11 +164,16 @@ real `createAutopilotWorker(...)` call site needs zero changes.
 
 ## Staged refactor roadmap
 
-- **PR #52 (this PR)**: characterization tests around `runOnce()`'s
+- **PR #52 (merged)**: characterization tests around `runOnce()`'s
   observable behavior + this map doc + the types extraction above. No
   module splitting yet.
-- **PR #53**: extract `runEtfRotationCycle` into its own module (confirmed
-  cleanly separable, see above).
+- **PR #53 (this PR)**: extract `runEtfRotationCycle` into
+  `backend/etfRotationCycle.ts` (confirmed cleanly separable, see above).
+  Along the way, found and fixed a real gap PR #52 missed - `appendEtfRotationOrderAuditEvent`
+  had no `testDataFilePaths` seam, so real submitted-leg tests (which
+  PR #52's own 3 characterization tests never exercised) would have
+  written to the live `etf-rotation-order-audit.jsonl` - caught locally
+  before merge when this PR's own new tests did exactly that.
 - **PR #54**: extract the baseline `analyzeTicker` path into its own module.
   Bigger - touches closure state directly. SELL-path logic must not be
   *changed* until the next live monthly ETF-rotation rebalance is observed;
