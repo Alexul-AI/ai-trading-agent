@@ -169,8 +169,8 @@ export function createStrategyConfigHash(config: unknown): string {
     .slice(0, 12);
 }
 
-async function ensureDataDir() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
+async function ensureDataDir(filePath: string) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
 }
 
 function createRunId(timestamp: string): string {
@@ -254,8 +254,9 @@ function calculateRunSignalCounts(decisions: JournalDecision[]) {
 
 export async function appendAutopilotRun(
   run: Omit<JournalRun, "id">,
+  filePath: string = JOURNAL_FILE,
 ): Promise<JournalRun> {
-  await ensureDataDir();
+  await ensureDataDir(filePath);
 
   const strategyConfigHash =
     run.strategyConfigHash ??
@@ -281,7 +282,7 @@ export async function appendAutopilotRun(
     executedCount,
   };
 
-  await fs.appendFile(JOURNAL_FILE, `${JSON.stringify(runWithId)}\n`, "utf-8");
+  await fs.appendFile(filePath, `${JSON.stringify(runWithId)}\n`, "utf-8");
 
   return runWithId;
 }
