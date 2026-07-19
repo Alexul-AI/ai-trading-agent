@@ -41,17 +41,19 @@ function/section, not exact line numbers, to stay useful longer.
    warm-up windows can't collide). These are **process-lifetime singletons**,
    independent of any one `createAutopilotWorker()` instance - a
    consideration for a future extraction that wants to test in isolation.
-4. **Standalone module-level functions** (declared before
-   `createAutopilotWorker`, closure-free): `toIsoDate`, `getErrorMessage`,
-   the sentiment veto pair (`evaluateSentimentVeto` pure /
-   `getBuySentimentVeto` impure wrapper), the insider veto pair
-   (`evaluateInsiderVeto` pure / `getBuyInsiderVeto` impure wrapper),
-   `shouldBlockNormalSellBelowAverageEntry` (pure, baseline-only),
-   `appendSafetyNote` (pure), `isSignalReadyDecision` (pure, shared),
-   `mapExecuteSafeTradeResultToLegOutcome`/`mapEtfRotationExecutionStatusToRebalanceStatus`
-   (pure, ETF-rotation-only bridging functions), `fetchAlpacaBarsUncached`/
-   `fetchAlpacaBars` (impure, shared by both paths), `calculateBarsSinceLastBuy`
-   (pure, baseline-only), `buildSignalKey` (pure, shared).
+4. **Standalone module-level functions remaining in `autopilotWorker.ts`**
+   (declared before `createAutopilotWorker`, closure-free): `toIsoDate`,
+   `getErrorMessage` (also duplicated in `analyzeTicker.ts` - a small,
+   stateless utility, not worth sharing via a new module), `isSignalReadyDecision`
+   (pure, shared), `mapExecuteSafeTradeResultToLegOutcome`/`mapEtfRotationExecutionStatusToRebalanceStatus`
+   (now in `etfRotationCycle.ts`, re-exported), `fetchAlpacaBarsUncached`/
+   `fetchAlpacaBars` (impure, shared by both paths - still here, injected into
+   both extracted modules as `fetchBars`), `buildSignalKey` (pure, shared).
+   Everything exclusively used by the baseline path (the sentiment/insider
+   veto pairs, `shouldBlockNormalSellBelowAverageEntry`, `appendSafetyNote`,
+   `calculateBarsSinceLastBuy`, plus the `sentimentCacheByTicker`/
+   `insiderCacheByTicker` caches) moved into `backend/analyzeTicker.ts` in
+   PR #54 - see below.
 5. **`createAutopilotWorker(options)`** - a closure factory. Everything
    below lives inside it.
 
@@ -65,7 +67,7 @@ function/section, not exact line numbers, to stay useful longer.
 | `running` | `runOnce` only | `runOnce` (re-entrancy check), `releaseLockOnShutdown` (poll), `getStatus` |
 | `timer` | `start`, `stop` | `start`, `stop` |
 | `lastRunAt`, `lastJournalRunId`, `lastError`, `lastDecisions`, `lastCircuitBreakerState` | `runOnce` only | `runOnce` (internally), `getStatus` |
-| `lastBuyAtByTicker`, `entryAtrPercentByTicker` | `analyzeTicker` only | `analyzeTicker` only - **baseline-path-only, untouched by ETF Rotation** |
+| `lastBuyAtByTicker`, `entryAtrPercentByTicker` | `analyzeTicker` (`backend/analyzeTicker.ts` since PR #54) only, via a passed-by-reference `Map` parameter | same - **baseline-path-only, untouched by ETF Rotation**. These two Maps stay declared in this closure (they must persist across cycles at worker-instance lifetime, not call-lifetime) even though the function that mutates them moved out - passing a `Map` by reference into an extracted function is identical to mutating it via closure capture, same object identity either way. |
 | `lastTelegramSentAtBySignal` | both Telegram-sending helpers | both - **shared across both strategy paths** |
 
 Each `createAutopilotWorker(options)` call gets its own fresh closure state -
@@ -74,11 +76,36 @@ separate instance per characterization test safe.
 
 ### Functions inside the closure
 
-- **`analyzeTicker`** (baseline path) - per-ticker pipeline: indicators →
-  `decideTradeSignal` → safety caps → gates (guard/breaker/regime/sentiment/
-  insider/confidence/quantity) → dry-run or live execution. The largest
-  single function in the file. Mutates `lastBuyAtByTicker`/
-  `entryAtrPercentByTicker`.
+- **`analyzeTicker`** - **extracted into `backend/analyzeTicker.ts` in
+  PR #54**. Per-ticker pipeline: indicators → `decideTradeSignal` → safety
+  caps → gates (guard/breaker/regime/sentiment/insider/confidence/quantity)
+  → dry-run or live execution. Was the largest single function in the file.
+  Bigger/riskier extraction than PR #53's, for two real reasons: it touches
+  cross-cycle closure state (see the table above) and contains genuine
+  SELL-path logic, which the user's standing rule says must not *change* -
+  only relocate, proven unchanged. Verified via a golden-snapshot comparison
+  (3 real fixtures - BUY_SIGNAL, SELL_SIGNAL, STOP_LOSS - run through the
+  pre-extraction code first, then asserted byte-for-byte against the new
+  standalone function) in `analyzeTicker.test.ts`, plus a direct unit test
+  of `shouldBlockNormalSellBelowAverageEntry`'s pure predicate. **Real
+  finding along the way**: that guard's own blocking branch is currently
+  unreachable through the real `decideTradeSignal` pipeline -
+  `strategyEngine.ts`'s own `downgradeNormalSellBelowAverageEntry` config
+  (hardcoded `true`, never overridden anywhere in the repo) already
+  downgrades any losing `SELL_SIGNAL` to `HOLD` one layer up, before this
+  guard's inputs could ever match its trigger condition. Moved byte-for-byte
+  regardless (dead code moved untouched is still zero behavior change, and
+  it could become reachable later if that default changes) - not "fixed" as
+  drive-by cleanup, since that would itself be a SELL-logic change. Also
+  found: `options.tradeMode` (the actual paper/live execution safety switch)
+  was nearly left out of the extracted function's params during initial
+  drafting - caught by review before implementation, now an explicit,
+  required `tradeMode` parameter. As with `runEtfRotationCycle`, every
+  module-level constant `analyzeTicker` reads (including several used only
+  by it, like `TICKER_TO_BUCKET`/`AUTOPILOT_SENTIMENT_FILTER_ENABLED`) stays
+  in `autopilotWorker.ts` and is passed as an explicit parameter, matching
+  PR #53's precedent exactly - this is what lets `analyzeTicker.test.ts` be
+  a plain top-level import with no `vi.stubEnv`/dynamic-import setup.
 - **`sendTelegramForNewSignalReadyDecisions`** / **`sendTelegramForFilterBlocks`** -
   cooldown-deduped Telegram sends, shared by both paths, mutate
   `lastTelegramSentAtBySignal`.
@@ -112,9 +139,10 @@ separate instance per characterization test safe.
 
 **Baseline-only**: `analyzeTicker`, `shouldBlockNormalSellBelowAverageEntry`,
 the sentiment/insider veto pair, `calculateBarsSinceLastBuy`,
-`appendSafetyNote`, the `lastBuyAtByTicker`/`entryAtrPercentByTicker` closure
-maps, the regime-bucket prefetch block inside `runOnce` (gated on
-`AUTOPILOT_STRATEGY === "baseline"`).
+`appendSafetyNote` (all five now live in `backend/analyzeTicker.ts` since
+PR #54), the `lastBuyAtByTicker`/`entryAtrPercentByTicker` closure maps
+(still in `autopilotWorker.ts`, passed by reference), the regime-bucket
+prefetch block inside `runOnce` (gated on `AUTOPILOT_STRATEGY === "baseline"`).
 
 **ETF-Rotation-only**: `runEtfRotationCycle`,
 `mapExecuteSafeTradeResultToLegOutcome`,
@@ -167,17 +195,26 @@ real `createAutopilotWorker(...)` call site needs zero changes.
 - **PR #52 (merged)**: characterization tests around `runOnce()`'s
   observable behavior + this map doc + the types extraction above. No
   module splitting yet.
-- **PR #53 (this PR)**: extract `runEtfRotationCycle` into
+- **PR #53 (merged)**: extract `runEtfRotationCycle` into
   `backend/etfRotationCycle.ts` (confirmed cleanly separable, see above).
   Along the way, found and fixed a real gap PR #52 missed - `appendEtfRotationOrderAuditEvent`
   had no `testDataFilePaths` seam, so real submitted-leg tests (which
   PR #52's own 3 characterization tests never exercised) would have
   written to the live `etf-rotation-order-audit.jsonl` - caught locally
   before merge when this PR's own new tests did exactly that.
-- **PR #54**: extract the baseline `analyzeTicker` path into its own module.
-  Bigger - touches closure state directly. SELL-path logic must not be
-  *changed* until the next live monthly ETF-rotation rebalance is observed;
-  pure extraction is fine once proven behavior-preserving.
+- **PR #54 (this PR)**: extract the baseline `analyzeTicker` path into
+  `backend/analyzeTicker.ts` - see the `analyzeTicker` bullet above for the
+  `tradeMode`-omission and dead-code-SELL-guard findings from this PR.
+  SELL-path logic itself was not changed, only relocated and verified
+  unchanged via golden-snapshot comparison. Review follow-up (addressed in
+  the same PR, not deferred): the golden-snapshot tests originally only
+  compared decision-log output, not the exact arguments handed to the
+  broker call - `analyzeTicker.test.ts`'s three golden tests now also
+  assert `executeSafeTrade`'s exact `(ticker, action, qty, orderType,
+  limitPrice, stopLoss, takeProfit, notional)` call, including the
+  `DEFAULT_STRATEGY_CONFIG`-derived flat-percent stop/take-profit values
+  for the BUY case (64.92/81.14 off a 70.56 price) and confirming SELL/
+  STOP_LOSS never send a bracket or notional.
 - **PR #55**: unify the confirmed real duplication between this file's own
   `fetchAlpacaBarsUncached` and `backend/src/market/alpacaMarketData.ts`'s
   `fetchDailyBarsForChart` (same Alpaca bars endpoint/params/pagination/sort
