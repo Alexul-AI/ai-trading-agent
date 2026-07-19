@@ -215,11 +215,16 @@ real `createAutopilotWorker(...)` call site needs zero changes.
   `DEFAULT_STRATEGY_CONFIG`-derived flat-percent stop/take-profit values
   for the BUY case (64.92/81.14 off a 70.56 price) and confirming SELL/
   STOP_LOSS never send a bracket or notional.
-- **PR #55**: unify the confirmed real duplication between this file's own
-  `fetchAlpacaBarsUncached` and `backend/src/market/alpacaMarketData.ts`'s
-  `fetchDailyBarsForChart` (same Alpaca bars endpoint/params/pagination/sort
-  pattern, different consumers/warmup windows) - deferred since merging is a
-  behavior-consolidation change, not a pure move.
+- **PR #55 (done)**: rather than unify the two functions wholesale (each has
+  a different warmup/date-range policy and auth resolution - a real
+  behavior-consolidation risk, not a pure move), extracted only the
+  actually-identical core (HTTP request + pagination + sort + error
+  handling) into `backend/src/market/alpacaBarsFetch.ts`'s
+  `fetchAlpacaDailyBarsPaginated`. Both `fetchAlpacaBarsUncached` (this
+  file) and `fetchDailyBarsForChart` (`alpacaMarketData.ts`) now call it,
+  each keeping its own date-range/warmup/auth logic unchanged - zero
+  behavior change for either caller. New direct unit tests cover pagination
+  and the error path (`alpacaMarketData.ts` had no test coverage before this).
 - **PR #56**: shrink `server.ts` further if still warranted.
 
 Also noted, deliberately not acted on: `AutopilotDecisionLog` (this file) is

@@ -54,6 +54,7 @@ import {
   type PortfolioPositionSnapshot,
   type PortfolioSnapshot,
 } from "./src/strategy/portfolioSafety.js";
+import { fetchAlpacaDailyBarsPaginated } from "./src/market/alpacaBarsFetch.js";
 
 export {
   getSafeBuyNotionalForBucketCap,
@@ -67,7 +68,6 @@ export type { PortfolioPositionSnapshot, PortfolioSnapshot };
 // docs/ops/AUTOPILOT_WORKER_MAP.md for the full structural map.
 import type {
   AlpacaBar,
-  AlpacaBarsResponse,
   AutopilotDecisionLog,
   AutopilotStatus,
   AutopilotStrategyKind,
@@ -334,9 +334,6 @@ const AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT =
     process.env.AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT,
   );
 
-function toIsoDate(date: Date): string {
-  return date.toISOString().split("T")[0] ?? date.toISOString();
-}
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -374,49 +371,15 @@ async function fetchAlpacaBarsUncached(
   const startDate = new Date();
   startDate.setDate(endDate.getDate() - days);
 
-  const allBars: AlpacaBar[] = [];
-  let pageToken: string | undefined;
-
-  do {
-    const url = new URL(`https://data.alpaca.markets/v2/stocks/${ticker}/bars`);
-
-    url.searchParams.set("timeframe", "1Day");
-    url.searchParams.set("start", toIsoDate(startDate));
-    url.searchParams.set("end", toIsoDate(endDate));
-    url.searchParams.set("adjustment", "raw");
-    url.searchParams.set("feed", ALPACA_DATA_FEED);
-    url.searchParams.set("limit", "1000");
-
-    if (pageToken) {
-      url.searchParams.set("page_token", pageToken);
-    }
-
-    const response = await fetch(url.toString(), {
-      headers: {
-        "APCA-API-KEY-ID": APCA_API_KEY_ID,
-        "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
-      },
-    });
-
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(
-        `Alpaca bars request failed for ${ticker}: HTTP ${response.status} ${body}`,
-      );
-    }
-
-    const data = (await response.json()) as AlpacaBarsResponse;
-
-    if (data.bars) {
-      allBars.push(...data.bars);
-    }
-
-    pageToken = data.next_page_token || undefined;
-  } while (pageToken);
-
-  return allBars.sort(
-    (a, b) => new Date(a.t).getTime() - new Date(b.t).getTime(),
-  );
+  return fetchAlpacaDailyBarsPaginated({
+    ticker,
+    startDate,
+    endDate,
+    feed: ALPACA_DATA_FEED,
+    keyId: APCA_API_KEY_ID,
+    secretKey: APCA_API_SECRET_KEY,
+    errorLabel: "Alpaca bars",
+  });
 }
 
 // Daily bars cannot change more than once a day, so re-fetching the full
