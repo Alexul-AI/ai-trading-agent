@@ -158,19 +158,36 @@ describe("analyzeTicker: golden-snapshot comparison against the pre-extraction c
   it("BUY_SIGNAL matches the captured golden values", async () => {
     const today = todayDateKey();
     const bars = buildTrendReversalBars(today, -1);
+    const params = baseParams({
+      ticker: "BUYTEST",
+      portfolio: makePortfolioSnapshot(),
+      fetchBars: async () => bars,
+    });
 
-    const result = await analyzeTicker(
-      baseParams({
-        ticker: "BUYTEST",
-        portfolio: makePortfolioSnapshot(),
-        fetchBars: async () => bars,
-      }),
-    );
+    const result = await analyzeTicker(params);
 
     for (const [key, value] of Object.entries(GOLDEN_BUY)) {
       expect(result[key as keyof typeof result]).toEqual(value);
     }
     expect(typeof result.timestamp).toBe("string");
+
+    // executeSafeTrade argument check (QA follow-up): DEFAULT_STRATEGY_CONFIG
+    // is stopLossPercent=0.08/takeProfitPercent=0.15/useAtrStops=false, so a
+    // non-fractional BUY at price=70.56 gets a flat-percent bracket:
+    // stopLoss = 70.56*0.92 = 64.9152 -> 64.92, takeProfit = 70.56*1.15 =
+    // 81.144 -> 81.14. Not fractional (allowFractionalShares=false), so
+    // notional stays undefined.
+    expect(params.executeSafeTrade).toHaveBeenCalledTimes(1);
+    expect(params.executeSafeTrade).toHaveBeenCalledWith(
+      "BUYTEST",
+      "BUY",
+      28,
+      "market",
+      undefined,
+      64.92,
+      81.14,
+      undefined,
+    );
   });
 
   it("SELL_SIGNAL (non-losing) matches the captured golden values", async () => {
@@ -190,18 +207,33 @@ describe("analyzeTicker: golden-snapshot comparison against the pre-extraction c
       },
     });
 
-    const result = await analyzeTicker(
-      baseParams({
-        ticker: "SELLTEST",
-        portfolio,
-        fetchBars: async () => bars,
-      }),
-    );
+    const params = baseParams({
+      ticker: "SELLTEST",
+      portfolio,
+      fetchBars: async () => bars,
+    });
+
+    const result = await analyzeTicker(params);
 
     for (const [key, value] of Object.entries(GOLDEN_SELL)) {
       expect(result[key as keyof typeof result]).toEqual(value);
     }
     expect(typeof result.timestamp).toBe("string");
+
+    // SELL orders never get a stopLoss/takeProfit bracket or notional -
+    // those are BUY-only (see analyzeTicker.ts). Quantity is the
+    // safety-capped 2 shares (golden's suggestedShares), not the original 10.
+    expect(params.executeSafeTrade).toHaveBeenCalledTimes(1);
+    expect(params.executeSafeTrade).toHaveBeenCalledWith(
+      "SELLTEST",
+      "SELL",
+      2,
+      "market",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    );
   });
 
   it("STOP_LOSS matches the captured golden values", async () => {
@@ -214,18 +246,33 @@ describe("analyzeTicker: golden-snapshot comparison against the pre-extraction c
       },
     });
 
-    const result = await analyzeTicker(
-      baseParams({
-        ticker: "STOPTEST",
-        portfolio,
-        fetchBars: async () => bars,
-      }),
-    );
+    const params = baseParams({
+      ticker: "STOPTEST",
+      portfolio,
+      fetchBars: async () => bars,
+    });
+
+    const result = await analyzeTicker(params);
 
     for (const [key, value] of Object.entries(GOLDEN_STOP)) {
       expect(result[key as keyof typeof result]).toEqual(value);
     }
     expect(typeof result.timestamp).toBe("string");
+
+    // STOP_LOSS sells the full 10-share position (no safety-cap reduction,
+    // matching "STOP_LOSS can sell the full position" in the golden's
+    // safetyNote) with no bracket/notional, same as the plain SELL case.
+    expect(params.executeSafeTrade).toHaveBeenCalledTimes(1);
+    expect(params.executeSafeTrade).toHaveBeenCalledWith(
+      "STOPTEST",
+      "SELL",
+      10,
+      "market",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    );
   });
 });
 
