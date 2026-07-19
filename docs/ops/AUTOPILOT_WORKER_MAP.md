@@ -206,7 +206,15 @@ real `createAutopilotWorker(...)` call site needs zero changes.
   `backend/analyzeTicker.ts` - see the `analyzeTicker` bullet above for the
   `tradeMode`-omission and dead-code-SELL-guard findings from this PR.
   SELL-path logic itself was not changed, only relocated and verified
-  unchanged via golden-snapshot comparison.
+  unchanged via golden-snapshot comparison. Review follow-up (addressed in
+  the same PR, not deferred): the golden-snapshot tests originally only
+  compared decision-log output, not the exact arguments handed to the
+  broker call - `analyzeTicker.test.ts`'s three golden tests now also
+  assert `executeSafeTrade`'s exact `(ticker, action, qty, orderType,
+  limitPrice, stopLoss, takeProfit, notional)` call, including the
+  `DEFAULT_STRATEGY_CONFIG`-derived flat-percent stop/take-profit values
+  for the BUY case (64.92/81.14 off a 70.56 price) and confirming SELL/
+  STOP_LOSS never send a bracket or notional.
 - **PR #55**: unify the confirmed real duplication between this file's own
   `fetchAlpacaBarsUncached` and `backend/src/market/alpacaMarketData.ts`'s
   `fetchDailyBarsForChart` (same Alpaca bars endpoint/params/pagination/sort
