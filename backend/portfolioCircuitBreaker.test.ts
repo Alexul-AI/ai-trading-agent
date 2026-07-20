@@ -257,4 +257,25 @@ describe("circuit breaker restart persistence", () => {
       expect(state).toBeNull();
     });
   });
+
+  it("a corrupted (unparseable) state file is treated as absent instead of crashing the cycle", async () => {
+    await withTempStateFile(async (filePath) => {
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, "{not valid json", "utf-8");
+
+      const state = await getPortfolioCircuitBreakerState(filePath);
+
+      expect(state).toBeNull();
+    });
+  });
+
+  it("writeState leaves no leftover temp file after a normal write", async () => {
+    await withTempStateFile(async (filePath) => {
+      await resetPortfolioCircuitBreaker(100000, filePath);
+
+      const entries = await fs.readdir(path.dirname(filePath));
+
+      expect(entries).toEqual([path.basename(filePath)]);
+    });
+  });
 });

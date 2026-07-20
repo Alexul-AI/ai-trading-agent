@@ -137,14 +137,30 @@ export function findPeakSinceTracking(
 async function readState(
   filePath: string = STATE_FILE,
 ): Promise<CircuitBreakerState | null> {
+  let raw: string;
+
   try {
-    const raw = await fs.readFile(filePath, "utf-8");
-    return JSON.parse(raw) as CircuitBreakerState;
+    raw = await fs.readFile(filePath, "utf-8");
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") {
       return null;
     }
     throw error;
+  }
+
+  try {
+    return JSON.parse(raw) as CircuitBreakerState;
+  } catch (error) {
+    // A corrupted/partially-written file (e.g. the process died mid-write
+    // before the atomic-rename fix below existed) is treated the same as a
+    // missing one - see the comment above CircuitBreakerState: tracking
+    // just restarts from now, rather than this throwing and crashing every
+    // future autopilot cycle that tries to re-parse it.
+    console.warn(
+      `[CIRCUIT BREAKER] State file at ${filePath} is corrupted and could not be parsed - treating as absent:`,
+      error instanceof Error ? error.message : error,
+    );
+    return null;
   }
 }
 
@@ -153,7 +169,16 @@ async function writeState(
   filePath: string = STATE_FILE,
 ): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(state, null, 2), "utf-8");
+
+  // Atomic write: write to a temp file first, then rename over the real
+  // path. fs.rename is atomic at the OS level, so a process killed mid-write
+  // (e.g. SIGTERM during a Render redeploy - confirmed to actually happen,
+  // see CLAUDE.md) can never leave a half-written/corrupted state file at
+  // the real path - the old file stays intact until the new one is fully
+  // written.
+  const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  await fs.writeFile(tmpPath, JSON.stringify(state, null, 2), "utf-8");
+  await fs.rename(tmpPath, filePath);
 }
 
 export interface CircuitBreakerUpdateResult {
