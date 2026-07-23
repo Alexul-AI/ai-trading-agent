@@ -1,0 +1,63 @@
+name: ETF Rotation Forward Validation
+
+# Runs backtest-etf-rotation-forward-validation.ts on a schedule so the
+# baseline-2 vs candidate-hold3 comparison log accumulates data points
+# without depending on someone remembering to run the script by hand (see
+# CLAUDE.md's "ETF Rotation forward validation" section for the read
+# criteria this feeds). Weekly rather than the daily cadence first
+# discussed: the script's own read criteria are keyed off rebalance count
+# (monthly), not calendar days, so daily runs would mostly append
+# low-information rows (same holdings, different unrealized P&L noise)
+# while also creating far more automated commits to main. Weekly still
+# comfortably reaches "3+ months of data" by October without that noise.
+#
+# Read-only against Alpaca's historical/current bars - never touches
+# execution, orders, or the live autopilot worker. Does not run inside
+# Render; this is a separate GitHub-hosted job, so it does not add a new
+# live worker to the deployed app (the constraint noted in CLAUDE.md).
+on:
+  schedule:
+    - cron: "0 23 * * 1" # Every Monday at 23:00 UTC
+  workflow_dispatch: {} # Allows a manual on-demand run from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  forward-validation:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - name: Run forward-validation script
+        run: npm run test:backtest-etf-rotation-forward-validation
+        env:
+          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+      # data/ is gitignored repo-wide (research reports are normally
+      # local-only, see CLAUDE.md) - these two files are a deliberate,
+      # narrow exception via `add -f`, since the entire point of this
+      # automation is a log the user can actually read in the repo, not
+      # just something a CI job quietly reads for itself.
+      - name: Commit the updated report/log if anything changed
+        working-directory: .
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f \
+            backend/data/backtest-reports/etf-rotation/etf-rotation-forward-validation-report.md \
+            backend/data/backtest-reports/etf-rotation/etf-rotation-forward-validation-log.csv
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: append ETF rotation forward-validation data point [skip ci]"
+            git push
+          fi
