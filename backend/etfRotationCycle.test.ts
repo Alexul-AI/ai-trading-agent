@@ -38,8 +38,8 @@ function makeFetchBars(barsByTicker: Record<string, ReturnType<typeof makeDailyB
   return async (ticker: string) => barsByTicker[ticker] ?? [];
 }
 
-describe("runEtfRotationCycle: asymmetric allowBuy/allowSell gates", () => {
-  it("allowBuy=true, allowSell=false: BUY legs reach the broker and get accepted, SELL legs are blocked before submission", async () => {
+describe("runEtfRotationCycle: asymmetric allowBuy/allowRebalanceSells gates", () => {
+  it("allowBuy=true, allowRebalanceSells=false: BUY legs reach the broker and get accepted, SELL legs are blocked before submission", async () => {
     const tempDir = await makeTempDataDir("etf-rotation-cycle-asym-buy-");
     const today = todayDateKey();
     const barsByTicker = makeBarsByTicker(today);
@@ -73,7 +73,8 @@ describe("runEtfRotationCycle: asymmetric allowBuy/allowSell gates", () => {
       executionGates: {
         executeTradesEnabled: true,
         allowBuy: true,
-        allowSell: false,
+        allowRebalanceSells: false,
+        maxAllowedPositions: Number.POSITIVE_INFINITY,
       },
       fetchBars: makeFetchBars(barsByTicker),
       broadcastSSE: () => {},
@@ -93,25 +94,25 @@ describe("runEtfRotationCycle: asymmetric allowBuy/allowSell gates", () => {
       expect(decision?.executed).toBe(true);
     }
 
-    // SELL leg (GLD) was blocked by the allowSell=false gate, never reaching
-    // executeSafeTrade.
+    // SELL leg (GLD) was blocked by the allowRebalanceSells=false gate,
+    // never reaching executeSafeTrade.
     const gldDecision = byTicker.get("GLD");
     expect(gldDecision?.action).toBe("SELL");
     expect(gldDecision?.executionStatus).toBe("blocked");
     expect(gldDecision?.executed).toBe(false);
-    expect(gldDecision?.executionBlockReasonDetail).toContain("AUTOPILOT_ALLOW_SELL");
+    expect(gldDecision?.executionBlockReasonDetail).toContain("AUTOPILOT_ALLOW_REBALANCE_SELLS");
 
     // The critical field-swap regression guard: executeSafeTrade was called
     // for the BUY tickers, never for the blocked SELL ticker. If allowBuy/
-    // allowSell were transposed at the autopilotWorker.ts call site, this
-    // assertion would fail (either GLD would get called, or SPY/QQQ
-    // wouldn't).
+    // allowRebalanceSells were transposed at the autopilotWorker.ts call
+    // site, this assertion would fail (either GLD would get called, or
+    // SPY/QQQ wouldn't).
     const calledTickers = executeSafeTrade.mock.calls.map((call) => call[0]);
     expect(calledTickers).toEqual(expect.arrayContaining(["SPY", "QQQ"]));
     expect(calledTickers).not.toContain("GLD");
   });
 
-  it("allowBuy=false, allowSell=true: SELL legs reach the broker, BUY legs are blocked before submission", async () => {
+  it("allowBuy=false, allowRebalanceSells=true: SELL legs reach the broker, BUY legs are blocked before submission", async () => {
     const tempDir = await makeTempDataDir("etf-rotation-cycle-asym-sell-");
     const today = todayDateKey();
     const barsByTicker = makeBarsByTicker(today);
@@ -140,7 +141,8 @@ describe("runEtfRotationCycle: asymmetric allowBuy/allowSell gates", () => {
       executionGates: {
         executeTradesEnabled: true,
         allowBuy: false,
-        allowSell: true,
+        allowRebalanceSells: true,
+        maxAllowedPositions: Number.POSITIVE_INFINITY,
       },
       fetchBars: makeFetchBars(barsByTicker),
       broadcastSSE: () => {},
@@ -196,7 +198,8 @@ describe("runEtfRotationCycle: real accepted-outcome bookkeeping", () => {
       executionGates: {
         executeTradesEnabled: true,
         allowBuy: true,
-        allowSell: true,
+        allowRebalanceSells: true,
+        maxAllowedPositions: Number.POSITIVE_INFINITY,
       },
       fetchBars: makeFetchBars(barsByTicker),
       broadcastSSE: () => {},

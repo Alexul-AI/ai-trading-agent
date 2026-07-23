@@ -18,22 +18,26 @@ import type { ExecuteSafeTradeResult } from "./src/types/autopilotTypes.js";
 // runEtfRotationCycle's own tests (etfRotationCycle.test.ts) call it
 // directly with hand-written params, which never exercises the *new* code
 // in autopilotWorker.ts's runOnce() call site that builds those params from
-// AUTOPILOT_ALLOW_BUY/AUTOPILOT_ALLOW_SELL - a same-typed field swap there
-// (e.g. allowBuy: AUTOPILOT_ALLOW_SELL, allowSell: AUTOPILOT_ALLOW_BUY) would
-// compile cleanly and pass every *symmetric* existing test (allowBuyDisabled
-// sets both to false). This test goes through the real runOnce() with
-// asymmetric gates and a real accepted execution, specifically to catch that
-// class of wiring bug.
+// AUTOPILOT_ALLOW_BUY/AUTOPILOT_ALLOW_REBALANCE_SELLS - a same-typed field
+// swap there would compile cleanly and pass every *symmetric* existing test
+// (allowBuyDisabled sets both to false). This test goes through the real
+// runOnce() with asymmetric gates and a real accepted execution,
+// specifically to catch that class of wiring bug.
+//
+// AUTOPILOT_ALLOW_REBALANCE_SELLS (not AUTOPILOT_ALLOW_SELL) is the real
+// gate for this path as of 2026-07-19 - AUTOPILOT_ALLOW_SELL only gates the
+// baseline strategy's SELL/STOP_LOSS, never reached from this test since
+// AUTOPILOT_STRATEGY is forced to etf_rotation below.
 vi.stubEnv("AUTOPILOT_STRATEGY", "etf_rotation");
 vi.stubEnv("AUTOPILOT_EXECUTE_TRADES", "true");
 vi.stubEnv("AUTOPILOT_ALLOW_BUY", "true");
-vi.stubEnv("AUTOPILOT_ALLOW_SELL", "false");
+vi.stubEnv("AUTOPILOT_ALLOW_REBALANCE_SELLS", "false");
 vi.stubEnv("APCA_API_KEY_ID", "test-key-id");
 vi.stubEnv("APCA_API_SECRET_KEY", "test-secret-key");
 
 const { createAutopilotWorker } = await import("./autopilotWorker.js");
 
-describe("autopilotWorker characterization: asymmetric ALLOW_BUY/ALLOW_SELL through the real runOnce() call site", () => {
+describe("autopilotWorker characterization: asymmetric ALLOW_BUY/ALLOW_REBALANCE_SELLS through the real runOnce() call site", () => {
   let dataFilesBefore: RealDataFileSnapshot[];
 
   beforeAll(async () => {
@@ -45,7 +49,7 @@ describe("autopilotWorker characterization: asymmetric ALLOW_BUY/ALLOW_SELL thro
     await assertRealDataFilesUnchanged(dataFilesBefore);
   });
 
-  it("AUTOPILOT_ALLOW_BUY=true/ALLOW_SELL=false: BUY legs reach the broker and are accepted, the SELL leg is blocked", async () => {
+  it("AUTOPILOT_ALLOW_BUY=true/ALLOW_REBALANCE_SELLS=false: BUY legs reach the broker and are accepted, the SELL leg is blocked", async () => {
     const tempDir = await makeTempDataDir("autopilot-etf-asym-gates-");
     const today = todayDateKey();
 
@@ -61,7 +65,7 @@ describe("autopilotWorker characterization: asymmetric ALLOW_BUY/ALLOW_SELL thro
 
     // GLD holds an existing position that will be liquidated (full
     // liquidate-then-rebuy) since it's not a top-2 pick this cycle - this is
-    // the SELL leg the allowSell=false gate should block.
+    // the SELL leg the allowRebalanceSells=false gate should block.
     const portfolio = makePortfolioSnapshot({
       equity: 10_000,
       balance: 10_000,
@@ -111,9 +115,9 @@ describe("autopilotWorker characterization: asymmetric ALLOW_BUY/ALLOW_SELL thro
     expect(gldDecision?.executed).toBe(false);
 
     // The actual field-swap regression guard for autopilotWorker.ts's
-    // runOnce() call site: if allowBuy/allowSell were transposed when
-    // building executionGates there, this would flip (GLD would execute,
-    // SPY/QQQ would be blocked) and these assertions would fail.
+    // runOnce() call site: if allowBuy/allowRebalanceSells were transposed
+    // when building executionGates there, this would flip (GLD would
+    // execute, SPY/QQQ would be blocked) and these assertions would fail.
     const calledTickers = executeSafeTrade.mock.calls.map((call) => call[0]);
     expect(calledTickers).toEqual(expect.arrayContaining(["SPY", "QQQ"]));
     expect(calledTickers).not.toContain("GLD");

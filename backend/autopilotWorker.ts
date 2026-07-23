@@ -13,7 +13,10 @@ import {
   resolveEtfRotationConfigVariant,
   type EtfRotationConfig,
 } from "./etfRotationStrategy.js";
-import { resolveRampMaxPositionEquityPercent } from "./etfRotationExecution.js";
+import {
+  resolveMaxAllowedPositions,
+  resolveRampMaxPositionEquityPercent,
+} from "./etfRotationExecution.js";
 import {
   runEtfRotationCycle,
   mapExecuteSafeTradeResultToLegOutcome,
@@ -334,6 +337,23 @@ const AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT =
     process.env.AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT,
   );
 
+// Independent of the baseline strategy's AUTOPILOT_ALLOW_SELL, which stays
+// untouched - this only unblocks the rotation cycle's own liquidate-and-
+// rebuy SELL legs (see EtfRotationExecutionGates.allowRebalanceSells's own
+// doc comment). Off by default, matching every other new gate in this
+// project's history (sentiment/insider filters, regime filter, fractional
+// shares, the ramp cap itself) - explicit user approval required in Render
+// before ever setting this true (2026-07-19 decision, see CLAUDE.md).
+const AUTOPILOT_ALLOW_REBALANCE_SELLS =
+  process.env.AUTOPILOT_ALLOW_REBALANCE_SELLS === "true";
+
+// Always-on guardrail (not opt-in like the ramp cap) - see
+// resolveMaxAllowedPositions's own doc comment for why this exists
+// alongside allowRebalanceSells rather than instead of it.
+const AUTOPILOT_ETF_ROTATION_MAX_POSITIONS = resolveMaxAllowedPositions(
+  process.env.AUTOPILOT_ETF_ROTATION_MAX_POSITIONS,
+  ETF_ROTATION_ACTIVE_CONFIG.holdCount,
+);
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -688,8 +708,9 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           executionGates: {
             executeTradesEnabled: AUTOPILOT_EXECUTE_TRADES,
             allowBuy: AUTOPILOT_ALLOW_BUY,
-            allowSell: AUTOPILOT_ALLOW_SELL,
+            allowRebalanceSells: AUTOPILOT_ALLOW_REBALANCE_SELLS,
             rampMaxPositionEquityPercent: AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT,
+            maxAllowedPositions: AUTOPILOT_ETF_ROTATION_MAX_POSITIONS,
           },
           fetchBars: fetchAlpacaBars,
           broadcastSSE: options.broadcastSSE,
@@ -1036,6 +1057,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       executeTrades: AUTOPILOT_EXECUTE_TRADES,
       allowBuy: AUTOPILOT_ALLOW_BUY,
       allowSell: AUTOPILOT_ALLOW_SELL,
+      allowRebalanceSells: AUTOPILOT_ALLOW_REBALANCE_SELLS,
       tradeMode: options.tradeMode,
       strategyVersion:
         AUTOPILOT_STRATEGY === "etf_rotation"
