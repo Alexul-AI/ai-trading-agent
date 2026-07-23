@@ -4,6 +4,7 @@ import {
   computeOverallExecutionStatus,
   computeRampMaxShares,
   executeEtfRotationOrders,
+  resolveMaxAllowedPositions,
   resolveRampMaxPositionEquityPercent,
   type EtfRotationExecutionGates,
   type EtfRotationSubmitOrderLeg,
@@ -17,7 +18,8 @@ import type { PortfolioSnapshot } from "./src/strategy/portfolioSafety.js";
 const ALLOW_ALL: EtfRotationExecutionGates = {
   executeTradesEnabled: true,
   allowBuy: true,
-  allowSell: true,
+  allowRebalanceSells: true,
+  maxAllowedPositions: Number.POSITIVE_INFINITY,
 };
 
 function makeSnapshot(balance: number): PortfolioSnapshot {
@@ -91,7 +93,7 @@ describe("executeEtfRotationOrders - global execute-trades gate", () => {
 });
 
 describe("executeEtfRotationOrders - per-leg side gates", () => {
-  it("blocks a SELL leg when AUTOPILOT_ALLOW_SELL is false, without calling submitOrderLeg for it", async () => {
+  it("blocks a SELL leg when AUTOPILOT_ALLOW_REBALANCE_SELLS is false, without calling submitOrderLeg for it", async () => {
     const orders: RebalanceOrder[] = [
       { ticker: "GLD", action: "SELL", shares: 5 },
     ];
@@ -100,7 +102,7 @@ describe("executeEtfRotationOrders - per-leg side gates", () => {
     const result = await executeEtfRotationOrders({
       ...baseParams,
       orders,
-      executionGates: { ...ALLOW_ALL, allowSell: false },
+      executionGates: { ...ALLOW_ALL, allowRebalanceSells: false },
       submitOrderLeg,
       appendAuditEvent: async () => {},
       refreshPortfolioSnapshot: async () => makeSnapshot(100000),
@@ -108,7 +110,7 @@ describe("executeEtfRotationOrders - per-leg side gates", () => {
 
     expect(submitOrderLeg).not.toHaveBeenCalled();
     expect(result.blockedOrders).toHaveLength(1);
-    expect(result.blockedOrders[0]!.blockReason).toContain("AUTOPILOT_ALLOW_SELL");
+    expect(result.blockedOrders[0]!.blockReason).toContain("AUTOPILOT_ALLOW_REBALANCE_SELLS");
   });
 
   it("blocks a BUY leg when AUTOPILOT_ALLOW_BUY is false, without calling submitOrderLeg for it", async () => {
@@ -140,7 +142,7 @@ describe("executeEtfRotationOrders - per-leg side gates", () => {
     const result = await executeEtfRotationOrders({
       ...baseParams,
       orders,
-      executionGates: { ...ALLOW_ALL, allowSell: false },
+      executionGates: { ...ALLOW_ALL, allowRebalanceSells: false },
       submitOrderLeg: acceptingSubmitOrderLeg(),
       appendAuditEvent: async () => {},
       refreshPortfolioSnapshot: async () => makeSnapshot(100000),
@@ -645,6 +647,97 @@ describe("executeEtfRotationOrders - ramp cap", () => {
   });
 });
 
+describe("executeEtfRotationOrders - max-allowed-positions guardrail", () => {
+  it("blocks a BUY that would open a brand-new position once the cap is already reached", async () => {
+    const submitOrderLeg = acceptingSubmitOrderLeg();
+    const orders: RebalanceOrder[] = [
+      { ticker: "GLD", action: "BUY", shares: 5, targetWeightPercent: 50 },
+    ];
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: { ...ALLOW_ALL, maxAllowedPositions: 2 },
+      submitOrderLeg,
+      appendAuditEvent: async () => {},
+      // Already holding 2 positions within the universe - GLD would be a
+      // 3rd, brand-new one.
+      refreshPortfolioSnapshot: async () => ({
+        balance: 100000,
+        equity: 100000,
+        currency: "USD",
+        positions: {
+          SPY: { shares: 10, avgPrice: 400, currentPrice: 500, pnl: 1000, pnlPercent: 25 },
+          QQQ: { shares: 10, avgPrice: 300, currentPrice: 400, pnl: 1000, pnlPercent: 33 },
+        },
+      }),
+    });
+
+    expect(result.blockedOrders).toHaveLength(1);
+    expect(result.blockedOrders[0]!.blockReason).toContain(
+      "AUTOPILOT_ETF_ROTATION_MAX_POSITIONS",
+    );
+  });
+
+  it("does not block a BUY that resizes an already-open position, even at the cap", async () => {
+    const submitOrderLeg = acceptingSubmitOrderLeg();
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 5, targetWeightPercent: 50 },
+    ];
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: { ...ALLOW_ALL, maxAllowedPositions: 1 },
+      submitOrderLeg,
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => ({
+        balance: 100000,
+        equity: 100000,
+        currency: "USD",
+        positions: {
+          SPY: { shares: 10, avgPrice: 400, currentPrice: 500, pnl: 1000, pnlPercent: 25 },
+        },
+      }),
+    });
+
+    expect(result.acceptedOrders.map((o) => o.ticker)).toEqual(["SPY"]);
+    expect(result.blockedOrders).toHaveLength(0);
+  });
+
+  it("counts a position opened earlier in the same cycle against a later BUY in that cycle", async () => {
+    const submitOrderLeg = acceptingSubmitOrderLeg();
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 5, targetWeightPercent: 50 },
+      { ticker: "QQQ", action: "BUY", shares: 5, targetWeightPercent: 50 },
+    ];
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      // Already at 1 open position (GLD); cap of 2 allows exactly one more
+      // brand-new position this cycle, not two.
+      executionGates: { ...ALLOW_ALL, maxAllowedPositions: 2 },
+      submitOrderLeg,
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => ({
+        balance: 100000,
+        equity: 100000,
+        currency: "USD",
+        positions: {
+          GLD: { shares: 5, avgPrice: 150, currentPrice: 200, pnl: 250, pnlPercent: 33 },
+        },
+      }),
+    });
+
+    expect(result.acceptedOrders.map((o) => o.ticker)).toEqual(["SPY"]);
+    expect(result.blockedOrders.map((o) => o.ticker)).toEqual(["QQQ"]);
+    expect(result.blockedOrders[0]!.blockReason).toContain(
+      "AUTOPILOT_ETF_ROTATION_MAX_POSITIONS",
+    );
+  });
+});
+
 describe("computeRampMaxShares", () => {
   it("is Infinity when the ramp percent is undefined (uncapped)", () => {
     expect(computeRampMaxShares(500, 100000, undefined)).toBe(Infinity);
@@ -696,5 +789,32 @@ describe("resolveRampMaxPositionEquityPercent", () => {
 
   it("tolerates surrounding whitespace but still parses correctly", () => {
     expect(resolveRampMaxPositionEquityPercent(" 10 \n")).toBe(10);
+  });
+});
+
+describe("resolveMaxAllowedPositions", () => {
+  it("defaults to holdCount+1 when the env var is genuinely absent", () => {
+    expect(resolveMaxAllowedPositions(undefined, 2)).toBe(3);
+    expect(resolveMaxAllowedPositions(undefined, 3)).toBe(4);
+  });
+
+  it("uses the explicit value when set", () => {
+    expect(resolveMaxAllowedPositions("5", 2)).toBe(5);
+  });
+
+  it("allows 0 (block all new-position BUYs)", () => {
+    expect(resolveMaxAllowedPositions("0", 2)).toBe(0);
+  });
+
+  it("throws on a negative value", () => {
+    expect(() => resolveMaxAllowedPositions("-1", 2)).toThrow();
+  });
+
+  it("throws on a non-integer value", () => {
+    expect(() => resolveMaxAllowedPositions("2.5", 2)).toThrow();
+  });
+
+  it("throws on a non-numeric value", () => {
+    expect(() => resolveMaxAllowedPositions("abc", 2)).toThrow();
   });
 });

@@ -168,6 +168,8 @@ export interface AutopilotStatus {
   executeTrades: boolean;
   allowBuy: boolean;
   allowSell: boolean;
+  /** Only meaningful when strategyVersion is an etf-rotation variant - see EtfRotationExecutionGates.allowRebalanceSells. */
+  allowRebalanceSells: boolean;
   tradeMode: "paper" | "live";
   strategyVersion: string;
   strategyConfigHash: string;

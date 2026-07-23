@@ -73,10 +73,17 @@ export type EtfRotationSubmitOrderLeg = (
 export interface EtfRotationExecutionGates {
   /** AUTOPILOT_EXECUTE_TRADES - global off switch. False blocks every leg, uniformly. */
   executeTradesEnabled: boolean;
-  /** AUTOPILOT_ALLOW_BUY - checked per BUY leg, independent of allowSell. */
+  /** AUTOPILOT_ALLOW_BUY - checked per BUY leg, independent of allowRebalanceSells. */
   allowBuy: boolean;
-  /** AUTOPILOT_ALLOW_SELL - checked per SELL leg, independent of allowBuy. */
-  allowSell: boolean;
+  /**
+   * AUTOPILOT_ALLOW_REBALANCE_SELLS - gates this rotation cycle's own
+   * SELL legs (freeing capital to open/replace positions each rebalance).
+   * Deliberately a separate gate from the baseline strategy's
+   * AUTOPILOT_ALLOW_SELL, which stays independently off - unblocking the
+   * rotation's own liquidate-and-rebuy mechanism does not touch the
+   * baseline path's SELL/STOP_LOSS gate at all.
+   */
+  allowRebalanceSells: boolean;
   /**
    * AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT - caps any single BUY
    * leg's dollar size to this percent of refreshed equity, independent of
@@ -87,6 +94,19 @@ export interface EtfRotationExecutionGates {
    * qualify). undefined = uncapped (current, unchanged behavior).
    */
   rampMaxPositionEquityPercent?: number;
+  /**
+   * AUTOPILOT_ETF_ROTATION_MAX_POSITIONS - always-on guardrail (not an
+   * opt-in like the ramp cap): blocks a BUY that would open a brand-new
+   * rotation-universe position once the number of currently-open positions
+   * already reaches this count. Exists specifically for the case
+   * allowRebalanceSells is meant to prevent but can't guarantee (a SELL
+   * leg that fails/is rejected/is ambiguous at the broker) - without this,
+   * a ticker stuck unsold could accumulate alongside new picks indefinitely,
+   * since nothing else in this file bounds total open-position count.
+   * Resolved by the caller via resolveMaxAllowedPositions (default
+   * holdCount+1), never left undefined.
+   */
+  maxAllowedPositions: number;
 }
 
 export interface EtfRotationLegOutcome {
@@ -227,6 +247,31 @@ export function resolveRampMaxPositionEquityPercent(
     );
   }
   return parsed;
+}
+
+/**
+ * Resolves AUTOPILOT_ETF_ROTATION_MAX_POSITIONS. Unlike the ramp cap, this
+ * guardrail is always active - there is no "unset = uncapped" escape
+ * hatch, since it exists specifically to bound a failure mode (a stuck
+ * unsold position) rather than to gate an opt-in capability. Unset
+ * defaults to holdCount+1 - normal operation holds exactly holdCount
+ * positions, so the +1 buffer tolerates a single stuck position before
+ * halting new BUYs, without silently allowing unbounded accumulation.
+ * Fails loud at module load on a fat-fingered value, same convention as
+ * resolveRampMaxPositionEquityPercent.
+ */
+export function resolveMaxAllowedPositions(
+  raw: string | undefined,
+  holdCount: number,
+): number {
+  if (raw === undefined) return holdCount + 1;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(
+      `Invalid AUTOPILOT_ETF_ROTATION_MAX_POSITIONS (${JSON.stringify(raw)}): must be a non-negative integer, or unset to default to holdCount+1 (${holdCount + 1}).`,
+    );
+  }
+  return Number(trimmed);
 }
 
 function extractErrorMessage(error: unknown): string {
@@ -419,10 +464,10 @@ export async function executeEtfRotationOrders(
 
   // SELL legs first - frees cash/positions before BUY sizing below.
   for (const order of sellOrders) {
-    if (!executionGates.allowSell) {
+    if (!executionGates.allowRebalanceSells) {
       blockedOrders.push({
         ...makeOutcome(order),
-        blockReason: "AUTOPILOT_ALLOW_SELL is false.",
+        blockReason: "AUTOPILOT_ALLOW_REBALANCE_SELLS is false.",
       });
       // A SELL that's deliberately gated off is treated the same as one
       // that failed to clear - the paired BUY should not rebuild a
@@ -440,6 +485,16 @@ export async function executeEtfRotationOrders(
   const refreshedSnapshot = await refreshPortfolioSnapshot();
   let availableCash = refreshedSnapshot.balance;
 
+  // Starting point for the max-allowed-positions guardrail below - open
+  // positions within the tracked universe (currentPriceByTicker's keys),
+  // as of right after SELLs settled. Grown as new-ticker BUYs succeed in
+  // the loop below, same running-tally pattern as availableCash.
+  const openPositionTickers = new Set(
+    Object.entries(refreshedSnapshot.positions)
+      .filter(([ticker, position]) => position.shares > 0 && currentPriceByTicker.has(ticker))
+      .map(([ticker]) => ticker),
+  );
+
   for (const order of buyOrders) {
     if (sellFailedTickers.has(order.ticker)) {
       blockedOrders.push({
@@ -454,6 +509,19 @@ export async function executeEtfRotationOrders(
       blockedOrders.push({
         ...makeOutcome(order),
         blockReason: "AUTOPILOT_ALLOW_BUY is false.",
+      });
+      continue;
+    }
+
+    // Position-count guardrail checked as its own stage, before sizing -
+    // a ticker not already held that would push the open-position count
+    // past the cap is blocked outright, regardless of cash/ramp room.
+    // Resizing an already-open position never counts against the cap.
+    const opensNewPosition = !openPositionTickers.has(order.ticker);
+    if (opensNewPosition && openPositionTickers.size >= executionGates.maxAllowedPositions) {
+      blockedOrders.push({
+        ...makeOutcome(order),
+        blockReason: `Blocked by AUTOPILOT_ETF_ROTATION_MAX_POSITIONS=${executionGates.maxAllowedPositions}: already holding ${openPositionTickers.size} position(s) within the universe and this would open a new one.`,
       });
       continue;
     }
@@ -511,6 +579,13 @@ export async function executeEtfRotationOrders(
       ambiguousOrders.length > ambiguousCountBefore
     ) {
       availableCash -= sizedQty * price;
+      // Same conservative "assume it happened" treatment as the cash
+      // decrement above - an ambiguous BUY may genuinely have opened the
+      // position, so count it against the cap now rather than risk a
+      // later leg in this same cycle overshooting the guardrail.
+      if (opensNewPosition) {
+        openPositionTickers.add(order.ticker);
+      }
     }
   }
 
