@@ -1,12 +1,10 @@
-// ETF Rotation Stage 2D, PR #46 - an isolated execution adapter, built and
-// tested standalone. Per the approved plan, this file is NOT imported or
-// called from autopilotWorker.ts - it exists so the riskiest remaining
-// logic (side-aware gates, SELL-before-BUY sequencing, cash-aware BUY
-// resizing, per-leg audit trail) can be built and fully unit-tested before
-// a later PR ever makes it reachable from the live worker cycle. This file
+// ETF Rotation Stage 2D, PR #46 - an isolated execution adapter, originally
+// built and tested standalone before PR #47b wired it into the live
+// runEtfRotationCycle (etfRotationCycle.ts) - it now IS reachable from the
+// live worker cycle. Kept the isolation on purpose: this file still
 // deliberately does not import anything from autopilotWorker.ts or
-// server.ts - order submission is received as an injected dependency, so
-// tests never need real Alpaca calls or a live worker.
+// server.ts directly - order submission is received as an injected
+// dependency, so tests never need real Alpaca calls or a live worker.
 //
 // This module never touches the rebalance state machine
 // (etfRotationWorkerState.ts) - no import from that file exists here. The
