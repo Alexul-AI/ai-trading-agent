@@ -8,6 +8,7 @@ export interface AlpacaLike {
   getOrders(params?: unknown): Promise<unknown>;
   getLatestTrade(symbol: string): Promise<unknown>;
   createOrder(payload: unknown): Promise<unknown>;
+  getOrder(orderId: string): Promise<unknown>;
   getOrderByClientId(clientOrderId: string): Promise<unknown>;
   getPortfolioHistory(params: {
     date_start?: string;

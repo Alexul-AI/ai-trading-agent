@@ -19,7 +19,11 @@ export interface AlpacaErrorLike {
   };
 }
 
-function extractMessage(data: AlpacaErrorResponseData): string {
+// Exported so server.ts's ClassifiedOrderError can build a richer message
+// than the generic Axios "Request failed with status code NNN" - the same
+// extraction this file already uses to classify the error in the first
+// place, not a second implementation of the same parsing.
+export function extractMessage(data: AlpacaErrorResponseData): string {
   if (typeof data === "string") return data;
   if (data && typeof data.message === "string") return data.message;
   return "";

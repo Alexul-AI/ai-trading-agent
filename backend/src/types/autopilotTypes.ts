@@ -60,6 +60,8 @@ export interface AutopilotWorkerOptions {
   getPortfolioSnapshot: () => Promise<PortfolioSnapshot>;
   getEquityHistorySince: FetchEquityHistory;
   executeSafeTrade: ExecuteSafeTrade;
+  /** Used by the ETF Rotation execution path to poll a just-accepted SELL leg for its actual fill status before submitting a paired rebuild BUY - see etfRotationExecution.ts's waitForSellFill. */
+  getOrderStatus: (orderId: string) => Promise<string>;
   broadcastSSE: (payload: unknown) => void;
   sendTelegramAlert?: (message: string) => Promise<void>;
   /**

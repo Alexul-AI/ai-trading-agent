@@ -99,6 +99,13 @@ export function makeThrowingExecuteSafeTrade() {
   });
 }
 
+/** Same "prove it's genuinely unreached" convention as makeThrowingExecuteSafeTrade - waitForSellFill only calls this for an accepted liquidate_existing SELL leg, which none of the non-rebuild characterization scenarios reach. */
+export function makeThrowingGetOrderStatus() {
+  return vi.fn(async (): Promise<string> => {
+    throw new Error("getOrderStatus should never be called in this scenario.");
+  });
+}
+
 const REAL_DATA_FILES = [
   "autopilot-decisions.jsonl",
   "autopilot-worker.lock",
