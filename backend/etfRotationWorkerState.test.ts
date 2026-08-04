@@ -67,6 +67,15 @@ describe("etfRotationWorkerState", () => {
     });
   });
 
+  it("leaves no leftover temp file after a write (atomic write via temp+rename)", async () => {
+    await withTempStateFile(async (filePath) => {
+      await recordRebalanceDateKey("2026-07-01", filePath);
+
+      const entries = await fs.readdir(path.dirname(filePath));
+      expect(entries).toEqual([path.basename(filePath)]);
+    });
+  });
+
   it("reads an old Stage-1-shaped file (lastRebalanceDateKey only) without the newer fields throwing or being required", async () => {
     await withTempStateFile(async (filePath) => {
       await fs.mkdir(path.dirname(filePath), { recursive: true });

@@ -105,6 +105,30 @@ describe("tryClaimWorkerLock (I/O)", () => {
     });
   });
 
+  it("leaves no leftover temp file after a claim (atomic write via temp+rename)", async () => {
+    await withTempLockFile(async (filePath) => {
+      await tryClaimWorkerLock("owner-a", staleAfterMs, filePath);
+
+      const entries = await fs.readdir(path.dirname(filePath));
+      expect(entries).toEqual([path.basename(filePath)]);
+    });
+  });
+
+  it("does not throw and reclaims the lock (treated as absent) when the lock file is corrupted, instead of wedging every future cycle", async () => {
+    await withTempLockFile(async (filePath) => {
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, "{ not valid json", "utf-8");
+
+      const result = await tryClaimWorkerLock("owner-a", staleAfterMs, filePath);
+
+      expect(result.canProceed).toBe(true);
+      // The corrupted file is genuinely overwritten with a valid claim -
+      // not just "didn't throw" but actually recovered to a healthy state.
+      const written = await readLockFixture(filePath);
+      expect(written.ownerId).toBe("owner-a");
+    });
+  });
+
   it("renews its own lock, preserving startedAt and refreshing heartbeatAt", async () => {
     await withTempLockFile(async (filePath) => {
       const first = await tryClaimWorkerLock("owner-a", staleAfterMs, filePath);

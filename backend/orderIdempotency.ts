@@ -2,6 +2,8 @@ import { randomUUID } from "crypto";
 import { promises as fs } from "fs";
 import path from "path";
 
+import { writeJsonFileAtomic } from "./src/utils/atomicFile.js";
+
 export type OrderErrorClassification =
   | "duplicate_client_order_id"
   | "definitive_rejection"
@@ -126,8 +128,7 @@ async function writePersistedState(
   state: Record<string, string>,
   filePath: string = STATE_FILE,
 ): Promise<void> {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(state, null, 2), "utf-8");
+  await writeJsonFileAtomic(filePath, state);
 }
 
 export interface AsyncClientOrderIdTracker {

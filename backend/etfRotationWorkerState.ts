@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 
+import { writeJsonFileAtomic } from "./src/utils/atomicFile.js";
 import type { RebalanceOrder, RotationTarget } from "./etfRotationStrategy.js";
 
 // Same fail-soft, filePath-overridable pattern as portfolioCircuitBreaker.ts/
@@ -80,8 +81,7 @@ async function writeState(
   state: EtfRotationWorkerState,
   filePath: string = STATE_FILE,
 ): Promise<void> {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(state, null, 2), "utf-8");
+  await writeJsonFileAtomic(filePath, state);
 }
 
 export interface RebalanceStateReadResult {

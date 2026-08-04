@@ -203,6 +203,16 @@ describe("createPersistedClientOrderIdTracker", () => {
     });
   });
 
+  it("leaves no leftover temp file after a write (atomic write via temp+rename)", async () => {
+    await withTempStateFile(async (filePath) => {
+      const tracker = await createPersistedClientOrderIdTracker(filePath);
+      await tracker.getOrCreate("MSFT", "SELL");
+
+      const entries = await fs.readdir(path.dirname(filePath));
+      expect(entries).toEqual([path.basename(filePath)]);
+    });
+  });
+
   it("clear removes the entry from disk, so a subsequent restart starts clean for that key", async () => {
     await withTempStateFile(async (filePath) => {
       const tracker = await createPersistedClientOrderIdTracker(filePath);
