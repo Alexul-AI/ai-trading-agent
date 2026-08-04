@@ -1,6 +1,8 @@
 import { promises as fs } from "fs";
 import path from "path";
 
+import { writeJsonFileAtomic } from "./src/utils/atomicFile.js";
+
 const DATA_DIR = path.resolve(process.cwd(), "data");
 const LOCK_FILE = path.join(DATA_DIR, "autopilot-worker.lock");
 
@@ -65,14 +67,32 @@ export function evaluateLockClaim(
 }
 
 async function readLock(filePath: string = LOCK_FILE): Promise<WorkerLockState | null> {
+  let raw: string;
+
   try {
-    const raw = await fs.readFile(filePath, "utf-8");
-    return JSON.parse(raw) as WorkerLockState;
+    raw = await fs.readFile(filePath, "utf-8");
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") {
       return null;
     }
     throw error;
+  }
+
+  try {
+    return JSON.parse(raw) as WorkerLockState;
+  } catch (error) {
+    // A corrupted/partially-written lock file is treated the same as a
+    // missing one (found in review, 2026-08-04: tryClaimWorkerLock had no
+    // guard against this and would throw, wedging every future cycle
+    // until someone manually deleted the file) - evaluateLockClaim's
+    // existing "no existing lock" branch then reclaims it cleanly. Logged
+    // distinctly from the silent ENOENT case so a human can tell "never
+    // existed" apart from "existed but broken" if this recurs.
+    console.warn(
+      `[AUTOPILOT LOCK] Lock file at ${filePath} is corrupted and could not be parsed - treating as absent:`,
+      error instanceof Error ? error.message : error,
+    );
+    return null;
   }
 }
 
@@ -80,8 +100,7 @@ async function writeLock(
   state: WorkerLockState,
   filePath: string = LOCK_FILE,
 ): Promise<void> {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(state, null, 2), "utf-8");
+  await writeJsonFileAtomic(filePath, state);
 }
 
 export async function tryClaimWorkerLock(
