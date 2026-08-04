@@ -7,6 +7,7 @@ import {
   makePortfolioSnapshot,
   makeTempDataDir,
   makeThrowingExecuteSafeTrade,
+  makeThrowingGetOrderStatus,
   snapshotRealDataFiles,
   stubFetchForBarsByTicker,
   type RealDataFileSnapshot,
@@ -74,6 +75,7 @@ describe("autopilotWorker characterization: in-process re-entrancy guard", () =>
       },
       getEquityHistorySince: async () => [],
       executeSafeTrade,
+      getOrderStatus: makeThrowingGetOrderStatus(),
       broadcastSSE: () => {},
       testDataFilePaths: {
         lockFilePath: path.join(tempDir, "autopilot-worker.lock"),

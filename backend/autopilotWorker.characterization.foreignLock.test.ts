@@ -7,6 +7,7 @@ import {
   assertRealDataFilesUnchanged,
   makeTempDataDir,
   makeThrowingExecuteSafeTrade,
+  makeThrowingGetOrderStatus,
   snapshotRealDataFiles,
   type RealDataFileSnapshot,
 } from "./autopilotWorker.characterization.helpers.js";
@@ -59,6 +60,7 @@ describe("autopilotWorker characterization: cross-process (foreign lock) skip pa
       getPortfolioSnapshot,
       getEquityHistorySince: async () => [],
       executeSafeTrade,
+      getOrderStatus: makeThrowingGetOrderStatus(),
       broadcastSSE: () => {},
       testDataFilePaths: {
         lockFilePath,

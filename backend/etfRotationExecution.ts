@@ -33,12 +33,23 @@
 //
 // Also note: "accepted" here means the broker accepted the order request
 // (`executeSafeTrade` returns right after `alpaca.createOrder(...)`
-// resolves, with no fill-confirmation poll) - it is not a claim that the
-// order has actually filled. Deliberately not called "filled"/"executed"
-// at this layer for that reason; a future PR mapping this adapter's
-// result into the rebalance state machine's own "executed" terminal
-// status is a separate, visible decision to make explicitly, not implied
-// by matching vocabulary here.
+// resolves) - it is not by itself a claim that the order has actually
+// filled. Deliberately not called "filled"/"executed" at this layer for
+// that reason; a future PR mapping this adapter's result into the
+// rebalance state machine's own "executed" terminal status is a separate,
+// visible decision to make explicitly, not implied by matching vocabulary
+// here.
+//
+// UPDATE (2026-08-04, real production incident): a liquidate_existing SELL
+// being merely "accepted" (not yet filled) turned out not to be safe
+// enough for its paired rebuild_target BUY specifically - Alpaca rejected
+// a same-ticker BUY submitted before its SELL had filled (a same-symbol
+// order-crossing/wash-trade check, confirmed via order timestamps: QQQ's
+// rebuild BUY was submitted at 13:52:26.043, before its SELL filled at
+// 13:52:27.009, and was rejected HTTP 403; SPY's succeeded only because
+// its SELL happened to fill before the BUY was submitted). See
+// waitForSellFill below - this is now a genuine fill-confirmation wait,
+// scoped narrowly to exactly the leg pairing that needs it.
 
 import {
   deriveLegType,
@@ -69,6 +80,119 @@ export type EtfRotationSubmitOrderLeg = (
   action: "BUY" | "SELL",
   requestedShares: number,
 ) => Promise<EtfRotationSubmitOrderLegResult>;
+
+// "filled": safe to submit the paired rebuild BUY. "definitively_not_filled":
+// the SELL, despite being accepted, later resolved to rejected/canceled/
+// expired - treated the same as an outright-rejected SELL (the paired BUY
+// must not rebuild a position whose liquidation never actually happened).
+// "unconfirmed": still not filled (or its status couldn't be read) when the
+// timeout elapsed - genuinely unknown, not safe to assume either way, so
+// this must escalate the cycle to ambiguous/failed_needs_review rather than
+// silently proceeding or silently blocking as if it were a normal failure.
+export type SellFillWaitOutcome =
+  | "filled"
+  | "definitively_not_filled"
+  | "unconfirmed";
+
+// Deliberately just the status string, not the full order object - keeps
+// the real implementation (server.ts, wrapping alpaca.getOrder) trivial and
+// keeps tests for the polling logic below from needing to fabricate a full
+// order shape.
+export type GetOrderStatus = (brokerOrderId: string) => Promise<string>;
+
+export type WaitForSellFill = (
+  brokerOrderId: string,
+  ticker: string,
+) => Promise<SellFillWaitOutcome>;
+
+const FILLED_ORDER_STATUSES = new Set(["filled"]);
+// Alpaca terminal statuses that definitively mean "did not end up filled" -
+// anything else (new, accepted, pending_new, partially_filled, held, etc.)
+// is treated as still-in-progress and worth another poll.
+const TERMINAL_NOT_FILLED_ORDER_STATUSES = new Set([
+  "rejected",
+  "canceled",
+  "expired",
+  "stopped",
+  "suspended",
+  "done_for_day",
+]);
+
+/**
+ * Builds the real waitForSellFill implementation from a raw single-order
+ * status getter - the Alpaca-status-semantics mapping (what counts as
+ * filled vs. terminally-not-filled vs. still-pending) lives here, once,
+ * directly unit-tested; server.ts/autopilotWorker.ts only need to supply a
+ * thin `getOrderStatus`. A getOrderStatus failure is treated as "still
+ * unknown" and just retried on the next poll rather than surfaced - if it
+ * keeps failing until the timeout, that correctly resolves to "unconfirmed"
+ * on its own, no separate error handling needed.
+ */
+export function createWaitForSellFill(
+  getOrderStatus: GetOrderStatus,
+  pollIntervalMs: number,
+  timeoutMs: number,
+): WaitForSellFill {
+  return async (brokerOrderId: string): Promise<SellFillWaitOutcome> => {
+    const deadline = Date.now() + timeoutMs;
+
+    while (true) {
+      let status = "";
+      try {
+        status = await getOrderStatus(brokerOrderId);
+      } catch {
+        // Treated as still-unknown - see the function doc comment above.
+      }
+
+      if (FILLED_ORDER_STATUSES.has(status)) return "filled";
+      if (TERMINAL_NOT_FILLED_ORDER_STATUSES.has(status)) {
+        return "definitively_not_filled";
+      }
+      if (Date.now() >= deadline) return "unconfirmed";
+
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+  };
+}
+
+/**
+ * Resolves AUTOPILOT_ETF_ROTATION_SELL_FILL_TIMEOUT_MS /
+ * AUTOPILOT_ETF_ROTATION_SELL_FILL_POLL_MS. Same strict-whole-string-integer,
+ * fail-loud-at-module-load convention as resolveRampMaxPositionEquityPercent
+ * - a fat-fingered value ("10abc") must never silently become a truncated
+ * number.
+ */
+export function resolveEtfRotationSellFillTimingMs(
+  rawTimeoutMs: string | undefined,
+  rawPollIntervalMs: string | undefined,
+): { timeoutMs: number; pollIntervalMs: number } {
+  const timeoutMs = parseStrictPositiveIntEnv(
+    "AUTOPILOT_ETF_ROTATION_SELL_FILL_TIMEOUT_MS",
+    rawTimeoutMs,
+    10000,
+  );
+  const pollIntervalMs = parseStrictPositiveIntEnv(
+    "AUTOPILOT_ETF_ROTATION_SELL_FILL_POLL_MS",
+    rawPollIntervalMs,
+    500,
+  );
+  return { timeoutMs, pollIntervalMs };
+}
+
+function parseStrictPositiveIntEnv(
+  name: string,
+  raw: string | undefined,
+  defaultValue: number,
+): number {
+  if (raw === undefined) return defaultValue;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(
+      `Invalid ${name} (${JSON.stringify(raw)}): must be a non-negative integer, or unset to default to ${defaultValue}.`,
+    );
+  }
+  return Number(trimmed);
+}
 
 export interface EtfRotationExecutionGates {
   /** AUTOPILOT_EXECUTE_TRADES - global off switch. False blocks every leg, uniformly. */
@@ -157,6 +281,14 @@ export interface ExecuteEtfRotationOrdersParams {
   currentPriceByTicker: Map<string, number>;
   /** Injected clock for deterministic audit-event timestamps in tests. */
   now: () => string;
+  /**
+   * Called after an accepted liquidate_existing SELL (one with a paired
+   * rebuild_target BUY this cycle) to confirm it actually filled before the
+   * paired BUY is attempted - see the file-level 2026-08-04 update comment
+   * above for why. Never called for exit_removed SELLs (no paired BUY to
+   * gate) or for BUY legs.
+   */
+  waitForSellFill: WaitForSellFill;
 }
 
 /**
@@ -303,6 +435,7 @@ export async function executeEtfRotationOrders(
     refreshPortfolioSnapshot,
     currentPriceByTicker,
     now,
+    waitForSellFill,
   } = params;
 
   const acceptedOrders: EtfRotationLegOutcome[] = [];
@@ -367,6 +500,12 @@ export async function executeEtfRotationOrders(
   }
 
   const sellFailedTickers = new Set<string>();
+  // Tickers whose paired BUY outcome was already recorded directly (pushed
+  // into ambiguousOrders) by the fill-confirmation wait below - the BUY
+  // loop must skip these entirely rather than also pushing a blockedOrders
+  // entry for the same order, which would double-count it against
+  // computeOverallExecutionStatus's totals.
+  const pairedBuyAlreadyRecordedTickers = new Set<string>();
 
   async function attemptLeg(
     order: RebalanceOrder,
@@ -476,7 +615,56 @@ export async function executeEtfRotationOrders(
       continue;
     }
 
+    const acceptedCountBefore = acceptedOrders.length;
     await attemptLeg(order, order.shares);
+
+    // Only a liquidate_existing SELL (paired with a rebuild BUY this cycle)
+    // needs a fill-confirmation wait - see the file-level 2026-08-04 update
+    // comment. An exit_removed SELL (no paired BUY) proceeds exactly as
+    // before, no wait.
+    const hasPairedBuy = buyTickers.has(order.ticker);
+    const wasAccepted = acceptedOrders.length > acceptedCountBefore;
+
+    if (wasAccepted && hasPairedBuy) {
+      const acceptedOutcome = acceptedOrders[acceptedOrders.length - 1]!;
+      const waitOutcome = acceptedOutcome.brokerOrderId
+        ? await waitForSellFill(acceptedOutcome.brokerOrderId, order.ticker)
+        : "unconfirmed"; // no broker order id to poll against - can't confirm
+
+      if (waitOutcome === "definitively_not_filled") {
+        // The SELL was accepted but later resolved to rejected/canceled/
+        // expired - same treatment as an outright-rejected SELL: the
+        // paired BUY must not rebuild a position whose liquidation never
+        // actually happened. Existing blockedOrders logic in the BUY loop
+        // below already covers the audit trail for this via sellFailedTickers.
+        sellFailedTickers.add(order.ticker);
+      } else if (waitOutcome === "unconfirmed") {
+        sellFailedTickers.add(order.ticker);
+
+        const pairedBuyOrder = buyOrders.find((buy) => buy.ticker === order.ticker);
+        if (pairedBuyOrder) {
+          pairedBuyAlreadyRecordedTickers.add(order.ticker);
+
+          const buyOutcome = makeOutcome(pairedBuyOrder);
+          buyOutcome.error = `Paired SELL (broker order ${acceptedOutcome.brokerOrderId ?? "unknown"}) fill could not be confirmed before the configured timeout - not safe to submit the rebuild BUY.`;
+          ambiguousOrders.push(buyOutcome);
+
+          await appendAuditEvent({
+            type: "PAIRED_SELL_FILL_UNCONFIRMED",
+            timestamp: now(),
+            rebalanceMonthKey,
+            configVariantKey,
+            ticker: order.ticker,
+            side: "BUY",
+            legType: buyOutcome.legType,
+            requestedQty: pairedBuyOrder.shares,
+            brokerOrderId: acceptedOutcome.brokerOrderId,
+            error: buyOutcome.error,
+          });
+        }
+      }
+      // "filled" - no action needed, the paired BUY proceeds normally below.
+    }
   }
 
   // Refresh cash after SELLs settle (design doc §5) - sizing BUYs off a
@@ -496,6 +684,13 @@ export async function executeEtfRotationOrders(
   );
 
   for (const order of buyOrders) {
+    // Already recorded directly (as an ambiguousOrders entry) by the
+    // fill-confirmation wait above - do not also push a blockedOrders
+    // entry for the same order, which would double-count it.
+    if (pairedBuyAlreadyRecordedTickers.has(order.ticker)) {
+      continue;
+    }
+
     if (sellFailedTickers.has(order.ticker)) {
       blockedOrders.push({
         ...makeOutcome(order),

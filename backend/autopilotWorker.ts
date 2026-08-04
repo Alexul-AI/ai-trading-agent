@@ -14,6 +14,8 @@ import {
   type EtfRotationConfig,
 } from "./etfRotationStrategy.js";
 import {
+  createWaitForSellFill,
+  resolveEtfRotationSellFillTimingMs,
   resolveMaxAllowedPositions,
   resolveRampMaxPositionEquityPercent,
 } from "./etfRotationExecution.js";
@@ -355,6 +357,18 @@ const AUTOPILOT_ETF_ROTATION_MAX_POSITIONS = resolveMaxAllowedPositions(
   ETF_ROTATION_ACTIVE_CONFIG.holdCount,
 );
 
+// See EtfRotationExecutionGates.maxAllowedPositions's sibling comment on
+// waitForSellFill / etfRotationExecution.ts's file-level 2026-08-04 update
+// for why this exists: a liquidate_existing SELL being merely "accepted"
+// wasn't safe enough for its paired rebuild BUY (a real production 403).
+const {
+  timeoutMs: AUTOPILOT_ETF_ROTATION_SELL_FILL_TIMEOUT_MS,
+  pollIntervalMs: AUTOPILOT_ETF_ROTATION_SELL_FILL_POLL_MS,
+} = resolveEtfRotationSellFillTimingMs(
+  process.env.AUTOPILOT_ETF_ROTATION_SELL_FILL_TIMEOUT_MS,
+  process.env.AUTOPILOT_ETF_ROTATION_SELL_FILL_POLL_MS,
+);
+
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
@@ -463,6 +477,11 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
   // when a ticker has no recorded entry here.
   const entryAtrPercentByTicker = new Map<string, number>();
   const lastTelegramSentAtBySignal = new Map<string, number>();
+  const waitForSellFill = createWaitForSellFill(
+    options.getOrderStatus,
+    AUTOPILOT_ETF_ROTATION_SELL_FILL_POLL_MS,
+    AUTOPILOT_ETF_ROTATION_SELL_FILL_TIMEOUT_MS,
+  );
 
   async function sendTelegramForNewSignalReadyDecisions(
     actionable: AutopilotDecisionLog[],
@@ -717,6 +736,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           sendTelegramAlert: options.sendTelegramAlert,
           executeSafeTrade: options.executeSafeTrade,
           getPortfolioSnapshot: options.getPortfolioSnapshot,
+          waitForSellFill,
           etfRotationStateFilePath: options.testDataFilePaths?.etfRotationStateFilePath,
           etfRotationOrderAuditLogFilePath:
             options.testDataFilePaths?.etfRotationOrderAuditLogFilePath,

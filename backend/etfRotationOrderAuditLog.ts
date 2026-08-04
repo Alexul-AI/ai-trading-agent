@@ -29,7 +29,15 @@ export type EtfRotationOrderAuditEventType =
   | "ORDER_ACCEPTED"
   | "ORDER_REJECTED"
   | "ORDER_AMBIGUOUS"
-  | "REBALANCE_MANUALLY_CLEARED";
+  | "REBALANCE_MANUALLY_CLEARED"
+  // Emitted when a liquidate_existing SELL was accepted but its fill could
+  // not be confirmed within the configured timeout before the paired
+  // rebuild_target BUY needed to decide whether to proceed (see
+  // etfRotationExecution.ts's waitForSellFill) - a dedicated type rather
+  // than reusing ORDER_AMBIGUOUS's generic text, since this specific
+  // "paired-SELL-fill-unconfirmed" case is exactly what future incident
+  // review needs to find quickly (2026-08-04, the QQQ 403 race condition).
+  | "PAIRED_SELL_FILL_UNCONFIRMED";
 
 // Audit-only classification of why a leg exists - never drives any
 // execution decision (design doc §11's Stage 2A resolution). Derived at

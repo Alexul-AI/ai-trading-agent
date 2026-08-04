@@ -8,6 +8,7 @@ import {
   makePortfolioSnapshot,
   makeTempDataDir,
   makeThrowingExecuteSafeTrade,
+  makeThrowingGetOrderStatus,
   snapshotRealDataFiles,
   stubFetchForBarsByTicker,
   todayDateKey,
@@ -59,6 +60,7 @@ describe("autopilotWorker characterization: AUTOPILOT_EXECUTE_TRADES=false never
       getPortfolioSnapshot: async () => makePortfolioSnapshot({ balance: 10_000, equity: 10_000 }),
       getEquityHistorySince: async () => [],
       executeSafeTrade,
+      getOrderStatus: makeThrowingGetOrderStatus(),
       broadcastSSE: () => {},
       testDataFilePaths: {
         lockFilePath: path.join(tempDir, "autopilot-worker.lock"),

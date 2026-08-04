@@ -3,11 +3,14 @@ import { describe, expect, it, vi } from "vitest";
 import {
   computeOverallExecutionStatus,
   computeRampMaxShares,
+  createWaitForSellFill,
   executeEtfRotationOrders,
+  resolveEtfRotationSellFillTimingMs,
   resolveMaxAllowedPositions,
   resolveRampMaxPositionEquityPercent,
   type EtfRotationExecutionGates,
   type EtfRotationSubmitOrderLeg,
+  type GetOrderStatus,
 } from "./etfRotationExecution.js";
 import type {
   EtfRotationOrderAuditEvent,
@@ -66,6 +69,9 @@ const baseParams = {
     ["GLD", 200],
   ]),
   now: fixedClock(),
+  // Matches pre-fill-confirmation-wait behavior for every test that doesn't
+  // care about this specifically - a rebuild BUY proceeds immediately.
+  waitForSellFill: async () => "filled" as const,
 };
 
 describe("executeEtfRotationOrders - global execute-trades gate", () => {
@@ -735,6 +741,214 @@ describe("executeEtfRotationOrders - max-allowed-positions guardrail", () => {
     expect(result.blockedOrders[0]!.blockReason).toContain(
       "AUTOPILOT_ETF_ROTATION_MAX_POSITIONS",
     );
+  });
+});
+
+describe("executeEtfRotationOrders - paired SELL fill-confirmation wait (2026-08-04 race-condition fix)", () => {
+  function buildPairedOrders(): RebalanceOrder[] {
+    return [
+      { ticker: "SPY", action: "SELL", shares: 20 },
+      { ticker: "SPY", action: "BUY", shares: 25, targetWeightPercent: 50 },
+    ];
+  }
+
+  it("proceeds with the rebuild BUY when the wait confirms filled", async () => {
+    const attempted: string[] = [];
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (ticker, action) => {
+      attempted.push(`${ticker}:${action}`);
+      return { outcome: "accepted", brokerOrderId: `broker-${ticker}-${action}` };
+    };
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders: buildPairedOrders(),
+      executionGates: ALLOW_ALL,
+      submitOrderLeg,
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+      waitForSellFill: async () => "filled",
+    });
+
+    expect(attempted).toEqual(["SPY:SELL", "SPY:BUY"]);
+    expect(result.acceptedOrders.map((o) => `${o.ticker}:${o.action}`)).toEqual([
+      "SPY:SELL",
+      "SPY:BUY",
+    ]);
+    expect(result.status).toBe("accepted");
+  });
+
+  it("blocks the rebuild BUY (same as a rejected SELL) when the wait finds the SELL definitively did not fill", async () => {
+    const attempted: string[] = [];
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (ticker, action) => {
+      attempted.push(`${ticker}:${action}`);
+      return { outcome: "accepted", brokerOrderId: `broker-${ticker}-${action}` };
+    };
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders: buildPairedOrders(),
+      executionGates: ALLOW_ALL,
+      submitOrderLeg,
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+      waitForSellFill: async () => "definitively_not_filled",
+    });
+
+    // The BUY leg is never even attempted (submitOrderLeg not called for it).
+    expect(attempted).toEqual(["SPY:SELL"]);
+    expect(result.acceptedOrders.map((o) => `${o.ticker}:${o.action}`)).toEqual([
+      "SPY:SELL",
+    ]);
+    expect(result.blockedOrders.map((o) => `${o.ticker}:${o.action}`)).toEqual([
+      "SPY:BUY",
+    ]);
+    expect(result.ambiguousOrders).toHaveLength(0);
+  });
+
+  it("escalates to ambiguous (not a plain block) when the SELL fill cannot be confirmed within the timeout", async () => {
+    const attempted: string[] = [];
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (ticker, action) => {
+      attempted.push(`${ticker}:${action}`);
+      return { outcome: "accepted", brokerOrderId: `broker-${ticker}-${action}` };
+    };
+    const audit = collectingAuditRecorder();
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders: buildPairedOrders(),
+      executionGates: ALLOW_ALL,
+      submitOrderLeg,
+      appendAuditEvent: audit.appendAuditEvent,
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+      waitForSellFill: async () => "unconfirmed",
+    });
+
+    // The BUY leg is never attempted, and appears exactly once (in
+    // ambiguousOrders) - never also duplicated into blockedOrders.
+    expect(attempted).toEqual(["SPY:SELL"]);
+    expect(result.blockedOrders).toHaveLength(0);
+    expect(result.ambiguousOrders.map((o) => `${o.ticker}:${o.action}`)).toEqual([
+      "SPY:BUY",
+    ]);
+    expect(result.status).toBe("ambiguous");
+    expect(audit.events.map((e) => e.type)).toContain("PAIRED_SELL_FILL_UNCONFIRMED");
+  });
+
+  it("never calls waitForSellFill for an exit_removed SELL (no paired BUY this cycle)", async () => {
+    const orders: RebalanceOrder[] = [{ ticker: "GLD", action: "SELL", shares: 10 }];
+    const waitForSellFill = vi.fn(async (): Promise<"filled"> => {
+      throw new Error("waitForSellFill should never be called for an unpaired SELL.");
+    });
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: ALLOW_ALL,
+      submitOrderLeg: acceptingSubmitOrderLeg(),
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+      waitForSellFill,
+    });
+
+    expect(waitForSellFill).not.toHaveBeenCalled();
+    expect(result.acceptedOrders.map((o) => o.ticker)).toEqual(["GLD"]);
+  });
+
+  it("never calls waitForSellFill when the SELL leg itself is gated off before ever reaching the broker", async () => {
+    const waitForSellFill = vi.fn(async (): Promise<"filled"> => {
+      throw new Error("waitForSellFill should never be called when the SELL is gated off.");
+    });
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders: buildPairedOrders(),
+      executionGates: { ...ALLOW_ALL, allowRebalanceSells: false },
+      submitOrderLeg: throwingSubmitOrderLeg(),
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+      waitForSellFill,
+    });
+
+    expect(waitForSellFill).not.toHaveBeenCalled();
+    expect(result.blockedOrders.map((o) => `${o.ticker}:${o.action}`)).toEqual(
+      expect.arrayContaining(["SPY:SELL", "SPY:BUY"]),
+    );
+  });
+});
+
+describe("createWaitForSellFill", () => {
+  it("returns filled immediately when the first poll already shows filled", async () => {
+    const getOrderStatus: GetOrderStatus = async () => "filled";
+    const waitForSellFill = createWaitForSellFill(getOrderStatus, 5, 50);
+
+    await expect(waitForSellFill("order-1", "SPY")).resolves.toBe("filled");
+  });
+
+  it("polls multiple times before returning filled", async () => {
+    const statuses = ["accepted", "accepted", "filled"];
+    let callCount = 0;
+    const getOrderStatus: GetOrderStatus = async () => statuses[callCount++] ?? "filled";
+    const waitForSellFill = createWaitForSellFill(getOrderStatus, 5, 200);
+
+    await expect(waitForSellFill("order-1", "SPY")).resolves.toBe("filled");
+    expect(callCount).toBe(3);
+  });
+
+  it("returns definitively_not_filled on a terminal negative status", async () => {
+    const getOrderStatus: GetOrderStatus = async () => "rejected";
+    const waitForSellFill = createWaitForSellFill(getOrderStatus, 5, 50);
+
+    await expect(waitForSellFill("order-1", "SPY")).resolves.toBe(
+      "definitively_not_filled",
+    );
+  });
+
+  it("returns unconfirmed when still pending once the timeout elapses", async () => {
+    const getOrderStatus: GetOrderStatus = async () => "accepted";
+    const waitForSellFill = createWaitForSellFill(getOrderStatus, 5, 20);
+
+    await expect(waitForSellFill("order-1", "SPY")).resolves.toBe("unconfirmed");
+  });
+
+  it("treats a getOrderStatus failure as still-pending and keeps polling instead of throwing", async () => {
+    let callCount = 0;
+    const getOrderStatus: GetOrderStatus = async () => {
+      callCount++;
+      if (callCount < 3) throw new Error("transient network error");
+      return "filled";
+    };
+    const waitForSellFill = createWaitForSellFill(getOrderStatus, 5, 200);
+
+    await expect(waitForSellFill("order-1", "SPY")).resolves.toBe("filled");
+    expect(callCount).toBe(3);
+  });
+});
+
+describe("resolveEtfRotationSellFillTimingMs", () => {
+  it("defaults to 10000ms timeout / 500ms poll when both env vars are absent", () => {
+    expect(resolveEtfRotationSellFillTimingMs(undefined, undefined)).toEqual({
+      timeoutMs: 10000,
+      pollIntervalMs: 500,
+    });
+  });
+
+  it("uses explicit values when set", () => {
+    expect(resolveEtfRotationSellFillTimingMs("15000", "250")).toEqual({
+      timeoutMs: 15000,
+      pollIntervalMs: 250,
+    });
+  });
+
+  it("throws on a non-numeric timeout value instead of silently truncating it", () => {
+    expect(() => resolveEtfRotationSellFillTimingMs("10abc", undefined)).toThrow();
+  });
+
+  it("throws on a non-numeric poll interval value", () => {
+    expect(() => resolveEtfRotationSellFillTimingMs(undefined, "5 ms")).toThrow();
+  });
+
+  it("throws on a negative value", () => {
+    expect(() => resolveEtfRotationSellFillTimingMs("-1000", undefined)).toThrow();
   });
 });
 

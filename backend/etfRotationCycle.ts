@@ -26,6 +26,7 @@ import {
   type EtfRotationExecutionStatus,
   type EtfRotationSubmitOrderLeg,
   type EtfRotationSubmitOrderLegResult,
+  type WaitForSellFill,
 } from "./etfRotationExecution.js";
 import { appendEtfRotationOrderAuditEvent } from "./etfRotationOrderAuditLog.js";
 import type {
@@ -120,6 +121,8 @@ export interface RunEtfRotationCycleParams {
   sendTelegramAlert?: (message: string) => Promise<void>;
   executeSafeTrade: ExecuteSafeTrade;
   getPortfolioSnapshot: () => Promise<PortfolioSnapshot>;
+  /** See ExecuteEtfRotationOrdersParams.waitForSellFill's own doc comment. */
+  waitForSellFill: WaitForSellFill;
   etfRotationStateFilePath?: string;
   etfRotationOrderAuditLogFilePath?: string;
 }
@@ -139,6 +142,7 @@ export async function runEtfRotationCycle(
     sendTelegramAlert,
     executeSafeTrade,
     getPortfolioSnapshot,
+    waitForSellFill,
     etfRotationStateFilePath,
     etfRotationOrderAuditLogFilePath,
   } = params;
@@ -516,6 +520,7 @@ export async function runEtfRotationCycle(
     refreshPortfolioSnapshot: getPortfolioSnapshot,
     currentPriceByTicker,
     now: () => new Date().toISOString(),
+    waitForSellFill,
   });
 
   await recordRebalanceTerminal(
