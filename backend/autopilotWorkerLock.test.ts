@@ -212,7 +212,12 @@ describe("releaseWorkerLock", () => {
 
       await expect(releaseWorkerLock("owner-a", filePath)).resolves.toBeUndefined();
       // Corrupted file is left in place, not silently "fixed" by deletion -
-      // matches this file's existing fail-closed convention elsewhere.
+      // releaseWorkerLock only ever deletes a lock it can confirm is its
+      // own; treating a corrupted file as absent (readLock, since PR #60)
+      // means there's nothing here to confirm ownership of, so it's left
+      // untouched rather than removed. Distinct from tryClaimWorkerLock,
+      // which deliberately does reclaim/overwrite a corrupted lock file -
+      // see autopilotWorkerLock.ts's own readLock doc comment.
       const raw = await fs.readFile(filePath, "utf-8");
       expect(raw).toBe("{ not valid json");
     });
