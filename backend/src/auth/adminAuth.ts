@@ -128,9 +128,15 @@ export function createAdminAuth(config: AdminAuthConfig) {
     }
 
     if (!config.adminApiToken) {
-      if (config.tradeMode === "live") {
+      // Fail closed whenever this looks like a real deployment, not just
+      // live trading - a paper-mode production deploy with ADMIN_API_TOKEN
+      // accidentally unset previously fell through to wide-open admin
+      // endpoints with no warning (found in review, 2026-08-04). Local dev
+      // (nodeEnv unset/"development") keeps the original fail-open
+      // convenience.
+      if (config.tradeMode === "live" || config.nodeEnv === "production") {
         res.status(503).json({
-          error: "Admin token is required in live mode.",
+          error: "Admin token is required in production/live mode.",
         });
         return;
       }
@@ -144,7 +150,11 @@ export function createAdminAuth(config: AdminAuthConfig) {
         ? req.headers["x-admin-token"]
         : "";
 
-    if (providedToken !== config.adminApiToken) {
+    // timingSafeEqualString, not `!==` - this secret gates ~9 admin-only
+    // routes (found in review, 2026-08-04: this comparison was the one
+    // place in the file that didn't use the constant-time helper already
+    // defined above and already used for the session signature check).
+    if (!timingSafeEqualString(providedToken, config.adminApiToken)) {
       res.status(401).json({
         error: "Unauthorized",
       });
