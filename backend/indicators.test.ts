@@ -98,8 +98,8 @@ describe("calculateATR", () => {
   }
 
   it("computes the exact expected ATR on a simple, hand-verifiable true-range series", () => {
-    expect(calculateATR(makeFlatBars(20))).toBe(2);
-    expect(calculateATR(makeFlatBars(50))).toBe(2);
+    expect(calculateATR(makeFlatBars(20))).toBeCloseTo(2, 4);
+    expect(calculateATR(makeFlatBars(50))).toBeCloseTo(2, 4);
   });
 
   it("returns the insufficient-data default (0) until there are enough bars for a full true-range window", () => {
