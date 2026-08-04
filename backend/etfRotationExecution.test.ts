@@ -777,32 +777,53 @@ describe("executeEtfRotationOrders - paired SELL fill-confirmation wait (2026-08
     expect(result.status).toBe("accepted");
   });
 
-  it("blocks the rebuild BUY (same as a rejected SELL) when the wait finds the SELL definitively did not fill", async () => {
+  it("demotes the SELL out of acceptedOrders (not left as a phantom success) and blocks the rebuild BUY when the wait finds the SELL definitively did not fill", async () => {
     const attempted: string[] = [];
     const submitOrderLeg: EtfRotationSubmitOrderLeg = async (ticker, action) => {
       attempted.push(`${ticker}:${action}`);
       return { outcome: "accepted", brokerOrderId: `broker-${ticker}-${action}` };
     };
+    const audit = collectingAuditRecorder();
 
     const result = await executeEtfRotationOrders({
       ...baseParams,
       orders: buildPairedOrders(),
       executionGates: ALLOW_ALL,
       submitOrderLeg,
-      appendAuditEvent: async () => {},
+      appendAuditEvent: audit.appendAuditEvent,
       refreshPortfolioSnapshot: async () => makeSnapshot(100000),
       waitForSellFill: async () => "definitively_not_filled",
     });
 
     // The BUY leg is never even attempted (submitOrderLeg not called for it).
     expect(attempted).toEqual(["SPY:SELL"]);
-    expect(result.acceptedOrders.map((o) => `${o.ticker}:${o.action}`)).toEqual([
+
+    // The SELL must NOT remain in acceptedOrders - the initial "accepted"
+    // signal is superseded by the later, confirmed "did not fill" fact.
+    // A leftover acceptedOrders entry here would report "partial" (a
+    // TERMINAL_SUCCESS_STATUSES value that closes the monthly gate) for a
+    // SELL that definitively never happened, and would show as "executed"
+    // in the journal - the exact bug caught in review before merge.
+    expect(result.acceptedOrders).toHaveLength(0);
+    expect(result.failedOrders.map((o) => `${o.ticker}:${o.action}`)).toEqual([
       "SPY:SELL",
     ]);
     expect(result.blockedOrders.map((o) => `${o.ticker}:${o.action}`)).toEqual([
       "SPY:BUY",
     ]);
     expect(result.ambiguousOrders).toHaveLength(0);
+
+    // Nothing accepted, one failed, one blocked - "failed", not "partial".
+    expect(result.status).toBe("failed");
+
+    // The audit trail records the demotion explicitly, not just silently
+    // leaving the original ORDER_ACCEPTED entry as the last word on it.
+    const sellEvents = audit.events.filter((e) => e.ticker === "SPY" && e.side === "SELL");
+    expect(sellEvents.map((e) => e.type)).toEqual([
+      "ORDER_SUBMITTED",
+      "ORDER_ACCEPTED",
+      "ORDER_REJECTED",
+    ]);
   });
 
   it("escalates to ambiguous (not a plain block) when the SELL fill cannot be confirmed within the timeout", async () => {

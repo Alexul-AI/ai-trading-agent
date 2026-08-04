@@ -633,11 +633,33 @@ export async function executeEtfRotationOrders(
 
       if (waitOutcome === "definitively_not_filled") {
         // The SELL was accepted but later resolved to rejected/canceled/
-        // expired - same treatment as an outright-rejected SELL: the
-        // paired BUY must not rebuild a position whose liquidation never
-        // actually happened. Existing blockedOrders logic in the BUY loop
-        // below already covers the audit trail for this via sellFailedTickers.
+        // expired - the initial "accepted" push into acceptedOrders is now
+        // known-stale and must be demoted, not left as-is. Leaving it there
+        // would let the cycle report "partial" (a TERMINAL_SUCCESS_STATUSES
+        // value that closes the monthly gate) for a SELL that definitively
+        // did not happen, and would show it as "executed" in the journal -
+        // actively misleading, not just imprecise (caught in review before
+        // merge, not self-caught). Demoted into failedOrders, the same
+        // bucket an immediately-rejected SELL already lands in via
+        // attemptLeg, so both paths converge on one outcome shape.
         sellFailedTickers.add(order.ticker);
+        acceptedOrders.pop();
+        acceptedOutcome.error = `SELL was initially accepted but did not end up filling (broker order ${acceptedOutcome.brokerOrderId ?? "unknown"} ultimately resolved to rejected/canceled/expired).`;
+        failedOrders.push(acceptedOutcome);
+
+        await appendAuditEvent({
+          type: "ORDER_REJECTED",
+          timestamp: now(),
+          rebalanceMonthKey,
+          configVariantKey,
+          ticker: order.ticker,
+          side: "SELL",
+          legType: acceptedOutcome.legType,
+          requestedQty: acceptedOutcome.requestedQty,
+          submittedQty: acceptedOutcome.submittedQty,
+          brokerOrderId: acceptedOutcome.brokerOrderId,
+          error: acceptedOutcome.error,
+        });
       } else if (waitOutcome === "unconfirmed") {
         sellFailedTickers.add(order.ticker);
 
