@@ -30,6 +30,7 @@ import {
 import {
   classifyOrderError,
   createPersistedClientOrderIdTracker,
+  extractMessage,
   type AlpacaErrorLike,
   type OrderErrorClassification,
 } from "./orderIdempotency.js";
@@ -419,11 +420,31 @@ async function getDashboardSnapshot() {
 // executeSafeTrade (all of them only ever read status/reason), but a
 // caller that wants the classification (the ETF Rotation execution
 // adapter, etfRotationExecution.ts) can now recover it.
+// Was previously just `cause.message` - for an Axios error that's the
+// generic "Request failed with status code NNN", with Alpaca's actual
+// reason (in `cause.response.data`) silently discarded. Found the hard way
+// (2026-08-04): a rejected order leg's audit-log entry had nothing more
+// specific to go on than the status code, so diagnosing a real production
+// rejection required re-deriving the cause from order timestamps instead
+// of just reading the error. Reuses orderIdempotency.ts's own extraction
+// (the same logic classifyOrderError already applies to this same error),
+// not a second parser.
+function buildOrderErrorMessage(cause: unknown): string {
+  if (!(cause instanceof Error)) return "Unknown trade error";
+
+  const alpacaError = cause as AlpacaErrorLike;
+  const status = alpacaError.response?.status;
+  const bodyMessage =
+    status !== undefined ? extractMessage(alpacaError.response?.data) : "";
+
+  return bodyMessage ? `${cause.message} (HTTP ${status}: ${bodyMessage})` : cause.message;
+}
+
 class ClassifiedOrderError extends Error {
   readonly classification: OrderErrorClassification;
 
   constructor(classification: OrderErrorClassification, cause: unknown) {
-    super(cause instanceof Error ? cause.message : "Unknown trade error");
+    super(buildOrderErrorMessage(cause));
     this.name = "ClassifiedOrderError";
     this.classification = classification;
   }
@@ -702,11 +723,24 @@ async function executeSafeTrade(
   }
 }
 
+// Used by the ETF Rotation execution path's waitForSellFill (etfRotationExecution.ts)
+// to poll a just-accepted SELL leg for an actual fill before submitting its
+// paired rebuild BUY - see CLAUDE.md's 2026-08-04 finding (a same-ticker BUY
+// submitted before its SELL had filled was rejected by Alpaca). Deliberately
+// returns just the status string, not the full order - the polling logic
+// only needs to know filled/terminal-not-filled/still-pending, and keeping
+// this thin makes it trivial to stub in tests.
+async function getOrderStatus(orderId: string): Promise<string> {
+  const order = asRecord(await alpaca.getOrder(orderId));
+  return toStringValue(order.status);
+}
+
 const autopilotWorker = createAutopilotWorker({
   tradeMode: ENV.TRADE_MODE,
   getPortfolioSnapshot,
   getEquityHistorySince,
   executeSafeTrade,
+  getOrderStatus,
   broadcastSSE,
   sendTelegramAlert,
 });
