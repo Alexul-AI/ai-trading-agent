@@ -110,7 +110,9 @@ const REAL_DATA_FILES = [
   "autopilot-decisions.jsonl",
   "autopilot-worker.lock",
   "circuit-breaker-state.json",
+  "circuit-breaker-audit.jsonl",
   "etf-rotation-worker-state.json",
+  "etf-rotation-order-audit.jsonl",
 ].map((name) => path.resolve(process.cwd(), "data", name));
 
 export interface RealDataFileSnapshot {
