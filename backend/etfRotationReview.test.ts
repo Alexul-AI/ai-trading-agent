@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { deriveEtfRotationOffTargetState } from "./etfRotationReview.js";
+import {
+  deriveEtfRotationOffTargetState,
+  shouldSendEtfRotationOffTargetReminder,
+} from "./etfRotationReview.js";
 import type { EtfRotationOrderAuditEvent } from "./etfRotationOrderAuditLog.js";
 import type { RebalanceOrder, RotationTarget } from "./etfRotationStrategy.js";
 
@@ -193,5 +196,24 @@ describe("deriveEtfRotationOffTargetState", () => {
     expect(result.missingLegs[0]!.reason).toBe(
       "PAIRED_SELL_FILL_UNCONFIRMED with no recorded detail",
     );
+  });
+});
+
+describe("shouldSendEtfRotationOffTargetReminder", () => {
+  it("is true when off-target and no reminder has ever been sent", () => {
+    expect(shouldSendEtfRotationOffTargetReminder(true, null, "2026-08-06")).toBe(true);
+  });
+
+  it("is true when off-target and the last reminder was sent on an earlier day", () => {
+    expect(shouldSendEtfRotationOffTargetReminder(true, "2026-08-05", "2026-08-06")).toBe(true);
+  });
+
+  it("is false when off-target but a reminder was already sent today", () => {
+    expect(shouldSendEtfRotationOffTargetReminder(true, "2026-08-06", "2026-08-06")).toBe(false);
+  });
+
+  it("is false when not off-target, regardless of when the last reminder was sent", () => {
+    expect(shouldSendEtfRotationOffTargetReminder(false, null, "2026-08-06")).toBe(false);
+    expect(shouldSendEtfRotationOffTargetReminder(false, "2026-08-01", "2026-08-06")).toBe(false);
   });
 });
