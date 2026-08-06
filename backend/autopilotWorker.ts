@@ -25,6 +25,18 @@ import {
   mapEtfRotationExecutionStatusToRebalanceStatus,
 } from "./etfRotationCycle.js";
 import {
+  readRebalanceStateStrict,
+  recordOffTargetReminderSent,
+} from "./etfRotationWorkerState.js";
+import {
+  readEtfRotationOrderAuditLog,
+  appendEtfRotationOrderAuditEvent,
+} from "./etfRotationOrderAuditLog.js";
+import {
+  deriveEtfRotationOffTargetState,
+  shouldSendEtfRotationOffTargetReminder,
+} from "./etfRotationReview.js";
+import {
   analyzeTicker,
   evaluateSentimentVeto,
   evaluateInsiderVeto,
@@ -912,6 +924,90 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           todayDateKey,
           options.testDataFilePaths?.circuitBreakerStateFilePath,
         );
+      }
+
+      // Off-target visibility (PR #63) + reminder (PR #64) - direct response
+      // to the 2026-08-03 QQQ incident, where a rebuild BUY was rejected
+      // mid-rebalance and nothing surfaced it until a human happened to
+      // check the review endpoint. Re-reads state/portfolio/audit-log fresh
+      // (same three reads GET /api/autopilot/etf-rotation/review makes)
+      // rather than reusing this cycle's own pre-cycle `portfolio` variable,
+      // so a rebalance that just executed this same cycle is judged against
+      // its actual post-trade positions, not stale pre-cycle ones.
+      // Notification-only, same as the circuit breaker reminder above - no
+      // repair, no orders, wrapped in its own try/catch so a transient
+      // failure here (e.g. a portfolio snapshot fetch hiccup) can never
+      // abort the rest of the cycle.
+      if (AUTOPILOT_STRATEGY === "etf_rotation") {
+        try {
+          const [offTargetStateResult, offTargetPortfolio, offTargetAuditEvents] =
+            await Promise.all([
+              readRebalanceStateStrict(options.testDataFilePaths?.etfRotationStateFilePath),
+              options.getPortfolioSnapshot(),
+              readEtfRotationOrderAuditLog(
+                20,
+                options.testDataFilePaths?.etfRotationOrderAuditLogFilePath,
+              ),
+            ]);
+
+          // A corrupt/unreadable state file falls back to { targets: undefined
+          // }, which deriveEtfRotationOffTargetState already treats as
+          // offTarget: false (see its own null-guard) - no separate
+          // fail-closed branch needed here, and nothing gets written to a
+          // state file we don't trust.
+          const offTargetReview = deriveEtfRotationOffTargetState({
+            targets: offTargetStateResult.state.targets ?? null,
+            plannedOrders: offTargetStateResult.state.plannedOrders ?? null,
+            positions: offTargetPortfolio.positions,
+            recentOrderAuditEvents: offTargetAuditEvents,
+            rebalanceMonthKey: offTargetStateResult.state.rebalanceMonthKey ?? null,
+          });
+
+          if (
+            shouldSendEtfRotationOffTargetReminder(
+              offTargetReview.offTarget,
+              offTargetStateResult.state.lastOffTargetReminderSentDate ?? null,
+              todayDateKey,
+            )
+          ) {
+            const legsSummary = offTargetReview.missingLegs
+              .map((leg) => `${leg.ticker}: ${leg.reason}`)
+              .join("; ");
+            const reminderMessage = `ETF Rotation is off-target (rebalance month ${
+              offTargetStateResult.state.rebalanceMonthKey ?? "unknown"
+            }): ${legsSummary}. No auto-repair - review at GET /api/autopilot/etf-rotation/review.`;
+
+            options.broadcastSSE({
+              type: "notification",
+              level: "error",
+              message: reminderMessage,
+            });
+
+            if (options.sendTelegramAlert) {
+              await options.sendTelegramAlert(reminderMessage);
+            }
+
+            await appendEtfRotationOrderAuditEvent(
+              {
+                type: "OFF_TARGET_REMINDER_SENT",
+                timestamp: lastRunAt,
+                rebalanceMonthKey: offTargetStateResult.state.rebalanceMonthKey ?? "unknown",
+                configVariantKey: offTargetStateResult.state.configVariantKey ?? "unknown",
+                reason: legsSummary,
+              },
+              options.testDataFilePaths?.etfRotationOrderAuditLogFilePath,
+            );
+
+            await recordOffTargetReminderSent(
+              todayDateKey,
+              options.testDataFilePaths?.etfRotationStateFilePath,
+            );
+          }
+        } catch (error) {
+          console.warn(
+            `[ETF_ROTATION] Off-target reminder check failed: ${getErrorMessage(error)}`,
+          );
+        }
       }
 
       try {
