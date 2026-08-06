@@ -10,6 +10,7 @@ import {
   getRebalanceState,
   isRebalanceMonthDone,
   readRebalanceStateStrict,
+  recordOffTargetReminderSent,
   recordRebalanceDateKey,
   recordRebalanceExecuting,
   recordRebalancePlanned,
@@ -119,6 +120,44 @@ describe("etfRotationWorkerState", () => {
       expect(state.status).toBe("planned");
       expect(state.targets).toEqual(targets);
       expect(state.plannedOrders).toEqual(plannedOrders);
+    });
+  });
+
+  it("recordOffTargetReminderSent persists the date and merges onto existing state without clobbering richer fields", async () => {
+    await withTempStateFile(async (filePath) => {
+      const targets: RotationTarget[] = [{ ticker: "QQQ", weightPercent: 50 }];
+      const plannedOrders: RebalanceOrder[] = [
+        { ticker: "QQQ", action: "BUY", shares: 63, targetWeightPercent: 50 },
+      ];
+
+      await recordRebalancePlanned(
+        {
+          dateKey: "2026-08-03",
+          rebalanceMonthKey: "2026-08",
+          configVariantKey: "baseline-2",
+          targets,
+          plannedOrders,
+        },
+        filePath,
+      );
+
+      await recordOffTargetReminderSent("2026-08-06", filePath);
+
+      const state = await getRebalanceState(filePath);
+      expect(state.lastOffTargetReminderSentDate).toBe("2026-08-06");
+      expect(state.status).toBe("planned");
+      expect(state.targets).toEqual(targets);
+      expect(state.plannedOrders).toEqual(plannedOrders);
+    });
+  });
+
+  it("recordOffTargetReminderSent overwrites the previous reminder date on a later call", async () => {
+    await withTempStateFile(async (filePath) => {
+      await recordOffTargetReminderSent("2026-08-05", filePath);
+      await recordOffTargetReminderSent("2026-08-06", filePath);
+
+      const state = await getRebalanceState(filePath);
+      expect(state.lastOffTargetReminderSentDate).toBe("2026-08-06");
     });
   });
 

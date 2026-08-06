@@ -56,6 +56,16 @@ export interface EtfRotationWorkerState {
   plannedOrders?: RebalanceOrder[];
   /** The RotationTarget[] computed for the in-progress/most recent cycle. */
   targets?: RotationTarget[];
+  /**
+   * Calendar date ("YYYY-MM-DD") the last off-target reminder (see
+   * etfRotationReview.ts's shouldSendEtfRotationOffTargetReminder) was sent,
+   * or null/undefined if none has been sent yet. Unlike the circuit
+   * breaker's lastReminderSentDate, this is never explicitly reset - "off
+   * target" itself isn't sticky (recomputed fresh from live state each
+   * cycle), so the calendar-day comparison alone is enough to get a fresh
+   * reminder the next time it's genuinely still true on a new day.
+   */
+  lastOffTargetReminderSentDate?: string | null;
 }
 
 async function readState(
@@ -158,6 +168,19 @@ export async function getRebalanceState(
   filePath: string = STATE_FILE,
 ): Promise<EtfRotationWorkerState> {
   return readState(filePath);
+}
+
+// Called at most once per calendar day while off-target, right after
+// shouldSendEtfRotationOffTargetReminder (etfRotationReview.ts) confirms a
+// reminder should go out - same merge-onto-existing-state convention as
+// recordRebalanceDateKey, so this can never clobber targets/plannedOrders/
+// status from the same cycle's own writes.
+export async function recordOffTargetReminderSent(
+  dateKey: string,
+  filePath: string = STATE_FILE,
+): Promise<void> {
+  const current = await readState(filePath);
+  await writeState({ ...current, lastOffTargetReminderSentDate: dateKey }, filePath);
 }
 
 export async function recordRebalancePlanned(

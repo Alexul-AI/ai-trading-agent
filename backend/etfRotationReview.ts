@@ -106,3 +106,18 @@ export function deriveEtfRotationOffTargetState(
 
   return { offTarget: missingLegs.length > 0, missingLegs };
 }
+
+// Same reasoning and shape as portfolioCircuitBreaker.ts's
+// shouldSendDailyReminder - pure, calendar-day-scoped, testable without I/O.
+// Unlike that one, there's no "tripped"-style stickiness to reason about
+// here: deriveEtfRotationOffTargetState above is recomputed fresh from live
+// state every cycle, so "offTarget" going false then true again on the same
+// day is simply "false" then "true" as far as this function is concerned -
+// no separate reset step is needed.
+export function shouldSendEtfRotationOffTargetReminder(
+  offTarget: boolean,
+  lastReminderSentDate: string | null,
+  todayDateKey: string,
+): boolean {
+  return offTarget && lastReminderSentDate !== todayDateKey;
+}
