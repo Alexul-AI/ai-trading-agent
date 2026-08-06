@@ -27,6 +27,7 @@ import {
   appendEtfRotationOrderAuditEvent,
   readEtfRotationOrderAuditLog,
 } from "./etfRotationOrderAuditLog.js";
+import { deriveEtfRotationOffTargetState } from "./etfRotationReview.js";
 import {
   classifyOrderError,
   createPersistedClientOrderIdTracker,
@@ -1261,6 +1262,14 @@ app.get("/api/autopilot/etf-rotation/review", async (_req, res) => {
       getPortfolioSnapshot(),
     ]);
 
+    const offTargetReview = deriveEtfRotationOffTargetState({
+      targets: stateResult.state.targets ?? null,
+      plannedOrders: stateResult.state.plannedOrders ?? null,
+      positions: portfolio.positions,
+      recentOrderAuditEvents: recentOrderEvents,
+      rebalanceMonthKey: stateResult.state.rebalanceMonthKey ?? null,
+    });
+
     res.json({
       stateReadError: stateResult.corrupt,
       status: stateResult.state.status ?? null,
@@ -1275,6 +1284,7 @@ app.get("/api/autopilot/etf-rotation/review", async (_req, res) => {
       positions: portfolio.positions,
       cash: portfolio.balance,
       currentEquity: portfolio.equity,
+      offTargetReview,
     });
   } catch (error) {
     console.error("[API] /api/autopilot/etf-rotation/review failed:", error);
