@@ -184,7 +184,6 @@ const AUTOPILOT_ALLOW_SELL = process.env.AUTOPILOT_ALLOW_SELL === "true";
 // unvalidated opt-in rather than a proven improvement.
 const AUTOPILOT_SENTIMENT_FILTER_ENABLED =
   process.env.AUTOPILOT_SENTIMENT_FILTER === "true";
-const SENTIMENT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 // Same rationale as the sentiment filter: unbacktestable, off by default.
 // Threshold is intentionally conservative - a single insider sale is a
@@ -192,8 +191,6 @@ const SENTIMENT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 // cluster of open-market sells with zero offsetting buys.
 const AUTOPILOT_INSIDER_FILTER_ENABLED =
   process.env.AUTOPILOT_INSIDER_FILTER === "true";
-const INSIDER_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const INSIDER_SELL_CLUSTER_THRESHOLD = 2;
 
 // Off by default: backtest-validated (see backtest-sweep.ts's
 // regime-filter-* variants), but "roughly matches baseline" isn't strong
