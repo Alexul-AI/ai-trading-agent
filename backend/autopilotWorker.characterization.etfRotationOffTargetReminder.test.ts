@@ -170,6 +170,111 @@ describe("autopilotWorker characterization: ETF Rotation off-target reminder", (
     expect(reminderEventsAfterSecondRun.length).toBe(1);
   });
 
+  it("records the audit event + reminder date even when sendTelegramAlert throws, and the cycle still completes without a top-level error", async () => {
+    const tempDir = await makeTempDataDir("autopilot-etf-off-target-reminder-tg-fail-");
+    const today = todayDateKey();
+    const month = currentMonthKey();
+
+    const stateFilePath = path.join(tempDir, "etf-rotation-worker-state.json");
+    const auditLogFilePath = path.join(tempDir, "etf-rotation-order-audit.jsonl");
+    const journalFilePath = path.join(tempDir, "autopilot-decisions.jsonl");
+
+    await fs.writeFile(
+      stateFilePath,
+      JSON.stringify({
+        lastRebalanceDateKey: today,
+        rebalanceMonthKey: month,
+        configVariantKey: "baseline-2",
+        status: "partial",
+        targets: [
+          { ticker: "QQQ", weightPercent: 50 },
+          { ticker: "SPY", weightPercent: 50 },
+        ],
+        plannedOrders: [
+          { ticker: "QQQ", action: "BUY", shares: 63, targetWeightPercent: 50 },
+          { ticker: "SPY", action: "BUY", shares: 58, targetWeightPercent: 50 },
+        ],
+      }),
+      "utf-8",
+    );
+
+    await fs.writeFile(
+      auditLogFilePath,
+      `${JSON.stringify({
+        type: "ORDER_REJECTED",
+        timestamp: `${today}T13:52:26.373Z`,
+        rebalanceMonthKey: month,
+        configVariantKey: "baseline-2",
+        ticker: "QQQ",
+        side: "BUY",
+        legType: "rebuild_target",
+        requestedQty: 63,
+        submittedQty: 2,
+        error: "Request failed with status code 403",
+      })}\n`,
+      "utf-8",
+    );
+
+    const bars = makeDailyBarsSeries(5, today);
+    stubFetchForBarsByTicker({ SPY: bars, QQQ: bars, EFA: bars, TLT: bars, GLD: bars });
+
+    const portfolio = makePortfolioSnapshot({
+      positions: {
+        SPY: { shares: 2, avgPrice: 752.53, currentPrice: 769.8, pnl: 34.54, pnlPercent: 2.3 },
+      },
+    });
+
+    // Real ETF rotation module import - only sendTelegramAlert is made to
+    // fail, proving the audit/state write (which now happens first) is
+    // durable independent of whether the notification itself goes out.
+    const sendTelegramAlert = vi.fn(async () => {
+      throw new Error("simulated Telegram network failure");
+    });
+
+    const worker = createAutopilotWorker({
+      tradeMode: "paper",
+      getPortfolioSnapshot: async () => portfolio,
+      getEquityHistorySince: async () => [],
+      executeSafeTrade: makeThrowingExecuteSafeTrade(),
+      getOrderStatus: makeThrowingGetOrderStatus(),
+      broadcastSSE: () => {},
+      sendTelegramAlert,
+      testDataFilePaths: {
+        lockFilePath: path.join(tempDir, "autopilot-worker.lock"),
+        etfRotationStateFilePath: stateFilePath,
+        etfRotationOrderAuditLogFilePath: auditLogFilePath,
+        circuitBreakerStateFilePath: path.join(tempDir, "circuit-breaker-state.json"),
+        circuitBreakerAuditLogFilePath: path.join(tempDir, "circuit-breaker-audit.jsonl"),
+        journalFilePath,
+      },
+    });
+
+    const result = await worker.runOnce("manual");
+
+    // The throw is swallowed by the block's own try/catch (already present
+    // since PR #64) - the cycle as a whole must not report an error.
+    expect(result.error).toBeUndefined();
+    expect(sendTelegramAlert).toHaveBeenCalledTimes(1);
+
+    const stateAfterRun = JSON.parse(await fs.readFile(stateFilePath, "utf-8"));
+    expect(stateAfterRun.lastOffTargetReminderSentDate).toBe(today);
+
+    const auditLines = (await fs.readFile(auditLogFilePath, "utf-8"))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    expect(auditLines.some((event) => event.type === "OFF_TARGET_REMINDER_SENT")).toBe(true);
+
+    // The journal write happens after this block - proves a Telegram
+    // failure here doesn't cascade into skipping the rest of the cycle.
+    const journalExists = await fs
+      .access(journalFilePath)
+      .then(() => true)
+      .catch(() => false);
+    expect(journalExists).toBe(true);
+  });
+
   it("does not send a reminder when the rebuild BUY actually succeeded, even at a far-below-target ramp-capped size", async () => {
     const tempDir = await makeTempDataDir("autopilot-etf-off-target-reminder-ok-");
     const today = todayDateKey();

@@ -868,6 +868,22 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       // trip alert above only fires once, ever, on the transition; this is
       // what stops a long halt (see CLAUDE.md's next-open finding: 315 of
       // 406 simulated days) from going unnoticed in between.
+      //
+      // Idempotency ordering (2026-08-07): the audit event + lastReminderSentDate
+      // are recorded BEFORE the SSE/Telegram send, not after. If the send
+      // throws (e.g. a Telegram network error), the reminder is already
+      // durably marked "sent" for today - the alternative order risks
+      // re-sending every cycle for the rest of the day until a write finally
+      // succeeds. The tradeoff this accepts: a send failure right after a
+      // successful state write means today's reminder is silently not
+      // delivered rather than retried - judged better than duplicate spam,
+      // since the review endpoint remains the durable source of truth
+      // regardless. Wrapped in its own try/catch (previously part of the
+      // outer cycle try/catch) so a Telegram failure here can never abort
+      // the rest of the cycle (journal write, autopilot_worker_finished,
+      // the other end-of-cycle Telegram sends below) - this block used to
+      // share fate with the whole runOnce() call, unlike the ETF off-target
+      // block below, which already had its own isolation since PR #64.
       const todayDateKey = lastRunAt.slice(0, 10);
       if (
         shouldSendDailyReminder(
@@ -876,54 +892,60 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           todayDateKey,
         )
       ) {
-        const daysHalted = circuitBreakerUpdate.state.trippedAt
-          ? Math.max(
-              1,
-              Math.round(
-                (Date.parse(lastRunAt) -
-                  Date.parse(circuitBreakerUpdate.state.trippedAt)) /
-                  (24 * 60 * 60 * 1000),
-              ),
-            )
-          : null;
-        const blockedBuyCountToday = decisions.filter(
-          (decision) => decision.blockReasonCode === "PORTFOLIO_CIRCUIT_BREAKER",
-        ).length;
+        try {
+          const daysHalted = circuitBreakerUpdate.state.trippedAt
+            ? Math.max(
+                1,
+                Math.round(
+                  (Date.parse(lastRunAt) -
+                    Date.parse(circuitBreakerUpdate.state.trippedAt)) /
+                    (24 * 60 * 60 * 1000),
+                ),
+              )
+            : null;
+          const blockedBuyCountToday = decisions.filter(
+            (decision) => decision.blockReasonCode === "PORTFOLIO_CIRCUIT_BREAKER",
+          ).length;
 
-        const reminderMessage = `Trading still halted by circuit breaker.\nHalted since: ${
-          circuitBreakerUpdate.state.trippedAt ?? "unknown"
-        }\nHalt days: ${daysHalted ?? "unknown"}\nCurrent equity: ${portfolio.equity.toFixed(
-          2,
-        )}\nCurrent drawdown: ${circuitBreakerDrawdownPercent.toFixed(
-          1,
-        )}%\nBUY blocked today: ${blockedBuyCountToday}\nSELL still allowed.`;
+          const reminderMessage = `Trading still halted by circuit breaker.\nHalted since: ${
+            circuitBreakerUpdate.state.trippedAt ?? "unknown"
+          }\nHalt days: ${daysHalted ?? "unknown"}\nCurrent equity: ${portfolio.equity.toFixed(
+            2,
+          )}\nCurrent drawdown: ${circuitBreakerDrawdownPercent.toFixed(
+            1,
+          )}%\nBUY blocked today: ${blockedBuyCountToday}\nSELL still allowed.`;
 
-        options.broadcastSSE({
-          type: "notification",
-          level: "error",
-          message: reminderMessage,
-        });
+          await appendCircuitBreakerAuditEvent(
+            {
+              type: "CIRCUIT_BREAKER_REMINDER_SENT",
+              timestamp: lastRunAt,
+              equity: portfolio.equity,
+              peakEquity: circuitBreakerUpdate.state.peakEquity,
+              drawdownPercent: circuitBreakerDrawdownPercent,
+              thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
+            },
+            options.testDataFilePaths?.circuitBreakerAuditLogFilePath,
+          );
 
-        if (options.sendTelegramAlert) {
-          await options.sendTelegramAlert(reminderMessage);
+          await recordReminderSent(
+            todayDateKey,
+            options.testDataFilePaths?.circuitBreakerStateFilePath,
+          );
+
+          options.broadcastSSE({
+            type: "notification",
+            level: "error",
+            message: reminderMessage,
+          });
+
+          if (options.sendTelegramAlert) {
+            await options.sendTelegramAlert(reminderMessage);
+          }
+        } catch (error) {
+          console.warn(
+            `[CIRCUIT_BREAKER] Daily reminder check failed: ${getErrorMessage(error)}`,
+          );
         }
-
-        await appendCircuitBreakerAuditEvent(
-          {
-            type: "CIRCUIT_BREAKER_REMINDER_SENT",
-            timestamp: lastRunAt,
-            equity: portfolio.equity,
-            peakEquity: circuitBreakerUpdate.state.peakEquity,
-            drawdownPercent: circuitBreakerDrawdownPercent,
-            thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
-          },
-          options.testDataFilePaths?.circuitBreakerAuditLogFilePath,
-        );
-
-        await recordReminderSent(
-          todayDateKey,
-          options.testDataFilePaths?.circuitBreakerStateFilePath,
-        );
       }
 
       // Off-target visibility (PR #63) + reminder (PR #64) - direct response
@@ -977,16 +999,13 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
               offTargetStateResult.state.rebalanceMonthKey ?? "unknown"
             }): ${legsSummary}. No auto-repair - review at GET /api/autopilot/etf-rotation/review.`;
 
-            options.broadcastSSE({
-              type: "notification",
-              level: "error",
-              message: reminderMessage,
-            });
-
-            if (options.sendTelegramAlert) {
-              await options.sendTelegramAlert(reminderMessage);
-            }
-
+            // Idempotency ordering (2026-08-07) - same reasoning as the
+            // circuit breaker reminder above: record the audit event +
+            // lastOffTargetReminderSentDate BEFORE sending, so a Telegram
+            // failure right after a successful write is a silently missed
+            // notification today (acceptable - the review endpoint stays
+            // the durable source of truth) rather than a duplicate resend
+            // next cycle.
             await appendEtfRotationOrderAuditEvent(
               {
                 type: "OFF_TARGET_REMINDER_SENT",
@@ -1002,6 +1021,16 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
               todayDateKey,
               options.testDataFilePaths?.etfRotationStateFilePath,
             );
+
+            options.broadcastSSE({
+              type: "notification",
+              level: "error",
+              message: reminderMessage,
+            });
+
+            if (options.sendTelegramAlert) {
+              await options.sendTelegramAlert(reminderMessage);
+            }
           }
         } catch (error) {
           console.warn(
