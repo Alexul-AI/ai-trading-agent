@@ -24,18 +24,7 @@ import {
   mapExecuteSafeTradeResultToLegOutcome,
   mapEtfRotationExecutionStatusToRebalanceStatus,
 } from "./etfRotationCycle.js";
-import {
-  readRebalanceStateStrict,
-  recordOffTargetReminderSent,
-} from "./etfRotationWorkerState.js";
-import {
-  readEtfRotationOrderAuditLog,
-  appendEtfRotationOrderAuditEvent,
-} from "./etfRotationOrderAuditLog.js";
-import {
-  deriveEtfRotationOffTargetState,
-  shouldSendEtfRotationOffTargetReminder,
-} from "./etfRotationReview.js";
+import { runEtfOffTargetReminderCheck } from "./etfRotationReview.js";
 import { resolveTimeZone, toLocalDateKey } from "./src/utils/time.js";
 import {
   analyzeTicker,
@@ -52,11 +41,10 @@ export {
 import {
   updatePortfolioCircuitBreaker,
   getMaxDrawdownFromPeakPercent,
-  shouldSendDailyReminder,
-  recordReminderSent,
+  runCircuitBreakerTripAlert,
+  runCircuitBreakerDailyReminder,
   type CircuitBreakerState,
 } from "./portfolioCircuitBreaker.js";
-import { appendCircuitBreakerAuditEvent } from "./circuitBreakerAuditLog.js";
 import {
   computeBucketRegimeByDate,
   type RegimeBucketConfig,
@@ -678,37 +666,20 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           circuitBreakerUpdate.state.peakEquity) *
         100;
 
-      if (circuitBreakerUpdate.justTripped) {
-        const alertMessage = `PORTFOLIO CIRCUIT BREAKER TRIPPED: equity ${portfolio.equity.toFixed(
-          2,
-        )} is down ${circuitBreakerDrawdownPercent.toFixed(
-          1,
-        )}% from peak ${circuitBreakerUpdate.state.peakEquity.toFixed(
-          2,
-        )}. New BUYs are blocked until manually reset.`;
-
-        options.broadcastSSE({
-          type: "notification",
-          level: "error",
-          message: alertMessage,
-        });
-
-        if (options.sendTelegramAlert) {
-          await options.sendTelegramAlert(alertMessage);
-        }
-
-        await appendCircuitBreakerAuditEvent(
-          {
-            type: "CIRCUIT_BREAKER_TRIPPED",
-            timestamp: circuitBreakerUpdate.state.trippedAt ?? new Date().toISOString(),
-            equity: portfolio.equity,
-            peakEquity: circuitBreakerUpdate.state.peakEquity,
-            drawdownPercent: circuitBreakerDrawdownPercent,
-            thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
-          },
-          options.testDataFilePaths?.circuitBreakerAuditLogFilePath,
-        );
-      }
+      // Deliberately unwrapped (no try/catch around this call) - see
+      // runCircuitBreakerTripAlert's own doc comment in
+      // portfolioCircuitBreaker.ts for why a failure here must keep
+      // propagating to this function's outer catch, same as before this
+      // was extracted.
+      await runCircuitBreakerTripAlert({
+        justTripped: circuitBreakerUpdate.justTripped,
+        state: circuitBreakerUpdate.state,
+        portfolioEquity: portfolio.equity,
+        drawdownPercent: circuitBreakerDrawdownPercent,
+        broadcastSSE: options.broadcastSSE,
+        sendTelegramAlert: options.sendTelegramAlert,
+        auditLogFilePath: options.testDataFilePaths?.circuitBreakerAuditLogFilePath,
+      });
 
       // Computed once per cycle, before the concurrent per-ticker loop
       // below - every bucket-representative ticker (SPY, EFA, TLT, GLD,
@@ -879,179 +850,37 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       runDryRunCount = dryRunSignals.length;
       runExecutedCount = executedSignals.length;
 
-      // Once-per-calendar-day nudge while the breaker stays tripped - the
-      // trip alert above only fires once, ever, on the transition; this is
-      // what stops a long halt (see CLAUDE.md's next-open finding: 315 of
-      // 406 simulated days) from going unnoticed in between.
-      //
-      // Idempotency ordering (2026-08-07): the audit event + lastReminderSentDate
-      // are recorded BEFORE the SSE/Telegram send, not after. If the send
-      // throws (e.g. a Telegram network error), the reminder is already
-      // durably marked "sent" for today - the alternative order risks
-      // re-sending every cycle for the rest of the day until a write finally
-      // succeeds. The tradeoff this accepts: a send failure right after a
-      // successful state write means today's reminder is silently not
-      // delivered rather than retried - judged better than duplicate spam,
-      // since the review endpoint remains the durable source of truth
-      // regardless. Wrapped in its own try/catch (previously part of the
-      // outer cycle try/catch) so a Telegram failure here can never abort
-      // the rest of the cycle (journal write, autopilot_worker_finished,
-      // the other end-of-cycle Telegram sends below) - this block used to
-      // share fate with the whole runOnce() call, unlike the ETF off-target
-      // block below, which already had its own isolation since PR #64.
+      // See runCircuitBreakerDailyReminder/runEtfOffTargetReminderCheck's
+      // own doc comments (portfolioCircuitBreaker.ts/etfRotationReview.ts)
+      // for the full rationale (once-per-local-day cadence, idempotency
+      // ordering, try/catch isolation) - kept there rather than duplicated
+      // here now that the logic itself lives there too.
       const todayDateKey = toLocalDateKey(lastRunAt, AUTOPILOT_REMINDER_TIMEZONE);
-      if (
-        shouldSendDailyReminder(
-          circuitBreakerUpdate.state.tripped,
-          circuitBreakerUpdate.state.lastReminderSentDate,
-          todayDateKey,
-        )
-      ) {
-        try {
-          const daysHalted = circuitBreakerUpdate.state.trippedAt
-            ? Math.max(
-                1,
-                Math.round(
-                  (Date.parse(lastRunAt) -
-                    Date.parse(circuitBreakerUpdate.state.trippedAt)) /
-                    (24 * 60 * 60 * 1000),
-                ),
-              )
-            : null;
-          const blockedBuyCountToday = decisions.filter(
-            (decision) => decision.blockReasonCode === "PORTFOLIO_CIRCUIT_BREAKER",
-          ).length;
 
-          const reminderMessage = `Trading still halted by circuit breaker.\nHalted since: ${
-            circuitBreakerUpdate.state.trippedAt ?? "unknown"
-          }\nHalt days: ${daysHalted ?? "unknown"}\nCurrent equity: ${portfolio.equity.toFixed(
-            2,
-          )}\nCurrent drawdown: ${circuitBreakerDrawdownPercent.toFixed(
-            1,
-          )}%\nBUY blocked today: ${blockedBuyCountToday}\nSELL still allowed.`;
+      await runCircuitBreakerDailyReminder({
+        state: circuitBreakerUpdate.state,
+        portfolioEquity: portfolio.equity,
+        drawdownPercent: circuitBreakerDrawdownPercent,
+        decisions,
+        todayDateKey,
+        lastRunAt,
+        broadcastSSE: options.broadcastSSE,
+        sendTelegramAlert: options.sendTelegramAlert,
+        auditLogFilePath: options.testDataFilePaths?.circuitBreakerAuditLogFilePath,
+        stateFilePath: options.testDataFilePaths?.circuitBreakerStateFilePath,
+      });
 
-          await appendCircuitBreakerAuditEvent(
-            {
-              type: "CIRCUIT_BREAKER_REMINDER_SENT",
-              timestamp: lastRunAt,
-              equity: portfolio.equity,
-              peakEquity: circuitBreakerUpdate.state.peakEquity,
-              drawdownPercent: circuitBreakerDrawdownPercent,
-              thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
-            },
-            options.testDataFilePaths?.circuitBreakerAuditLogFilePath,
-          );
-
-          await recordReminderSent(
-            todayDateKey,
-            options.testDataFilePaths?.circuitBreakerStateFilePath,
-          );
-
-          options.broadcastSSE({
-            type: "notification",
-            level: "error",
-            message: reminderMessage,
-          });
-
-          if (options.sendTelegramAlert) {
-            await options.sendTelegramAlert(reminderMessage);
-          }
-        } catch (error) {
-          console.warn(
-            `[CIRCUIT_BREAKER] Daily reminder check failed: ${getErrorMessage(error)}`,
-          );
-        }
-      }
-
-      // Off-target visibility (PR #63) + reminder (PR #64) - direct response
-      // to the 2026-08-03 QQQ incident, where a rebuild BUY was rejected
-      // mid-rebalance and nothing surfaced it until a human happened to
-      // check the review endpoint. Re-reads state/portfolio/audit-log fresh
-      // (same three reads GET /api/autopilot/etf-rotation/review makes)
-      // rather than reusing this cycle's own pre-cycle `portfolio` variable,
-      // so a rebalance that just executed this same cycle is judged against
-      // its actual post-trade positions, not stale pre-cycle ones.
-      // Notification-only, same as the circuit breaker reminder above - no
-      // repair, no orders, wrapped in its own try/catch so a transient
-      // failure here (e.g. a portfolio snapshot fetch hiccup) can never
-      // abort the rest of the cycle.
       if (AUTOPILOT_STRATEGY === "etf_rotation") {
-        try {
-          const [offTargetStateResult, offTargetPortfolio, offTargetAuditEvents] =
-            await Promise.all([
-              readRebalanceStateStrict(options.testDataFilePaths?.etfRotationStateFilePath),
-              options.getPortfolioSnapshot(),
-              readEtfRotationOrderAuditLog(
-                20,
-                options.testDataFilePaths?.etfRotationOrderAuditLogFilePath,
-              ),
-            ]);
-
-          // A corrupt/unreadable state file falls back to { targets: undefined
-          // }, which deriveEtfRotationOffTargetState already treats as
-          // offTarget: false (see its own null-guard) - no separate
-          // fail-closed branch needed here, and nothing gets written to a
-          // state file we don't trust.
-          const offTargetReview = deriveEtfRotationOffTargetState({
-            targets: offTargetStateResult.state.targets ?? null,
-            plannedOrders: offTargetStateResult.state.plannedOrders ?? null,
-            positions: offTargetPortfolio.positions,
-            recentOrderAuditEvents: offTargetAuditEvents,
-            rebalanceMonthKey: offTargetStateResult.state.rebalanceMonthKey ?? null,
-          });
-
-          if (
-            shouldSendEtfRotationOffTargetReminder(
-              offTargetReview.offTarget,
-              offTargetStateResult.state.lastOffTargetReminderSentDate ?? null,
-              todayDateKey,
-            )
-          ) {
-            const legsSummary = offTargetReview.missingLegs
-              .map((leg) => `${leg.ticker}: ${leg.reason}`)
-              .join("; ");
-            const reminderMessage = `ETF Rotation is off-target (rebalance month ${
-              offTargetStateResult.state.rebalanceMonthKey ?? "unknown"
-            }): ${legsSummary}. No auto-repair - review at GET /api/autopilot/etf-rotation/review.`;
-
-            // Idempotency ordering (2026-08-07) - same reasoning as the
-            // circuit breaker reminder above: record the audit event +
-            // lastOffTargetReminderSentDate BEFORE sending, so a Telegram
-            // failure right after a successful write is a silently missed
-            // notification today (acceptable - the review endpoint stays
-            // the durable source of truth) rather than a duplicate resend
-            // next cycle.
-            await appendEtfRotationOrderAuditEvent(
-              {
-                type: "OFF_TARGET_REMINDER_SENT",
-                timestamp: lastRunAt,
-                rebalanceMonthKey: offTargetStateResult.state.rebalanceMonthKey ?? "unknown",
-                configVariantKey: offTargetStateResult.state.configVariantKey ?? "unknown",
-                reason: legsSummary,
-              },
-              options.testDataFilePaths?.etfRotationOrderAuditLogFilePath,
-            );
-
-            await recordOffTargetReminderSent(
-              todayDateKey,
-              options.testDataFilePaths?.etfRotationStateFilePath,
-            );
-
-            options.broadcastSSE({
-              type: "notification",
-              level: "error",
-              message: reminderMessage,
-            });
-
-            if (options.sendTelegramAlert) {
-              await options.sendTelegramAlert(reminderMessage);
-            }
-          }
-        } catch (error) {
-          console.warn(
-            `[ETF_ROTATION] Off-target reminder check failed: ${getErrorMessage(error)}`,
-          );
-        }
+        await runEtfOffTargetReminderCheck({
+          getPortfolioSnapshot: options.getPortfolioSnapshot,
+          todayDateKey,
+          lastRunAt,
+          broadcastSSE: options.broadcastSSE,
+          sendTelegramAlert: options.sendTelegramAlert,
+          etfRotationStateFilePath: options.testDataFilePaths?.etfRotationStateFilePath,
+          etfRotationOrderAuditLogFilePath:
+            options.testDataFilePaths?.etfRotationOrderAuditLogFilePath,
+        });
       }
 
       try {

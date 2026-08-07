@@ -2,14 +2,16 @@ import { promises as fs } from "fs";
 import os from "os";
 import path from "path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import { readCircuitBreakerAuditLog } from "./circuitBreakerAuditLog.js";
 import {
   applyStickyTrip,
   evaluatePortfolioDrawdown,
   findPeakSinceTracking,
   getPortfolioCircuitBreakerState,
   resetPortfolioCircuitBreaker,
+  runCircuitBreakerTripAlert,
   shouldSendDailyReminder,
   updatePortfolioCircuitBreaker,
   type CircuitBreakerState,
@@ -276,6 +278,125 @@ describe("circuit breaker restart persistence", () => {
       const entries = await fs.readdir(path.dirname(filePath));
 
       expect(entries).toEqual([path.basename(filePath)]);
+    });
+  });
+});
+
+// Extracted from autopilotWorker.ts's runOnce() (autopilotWorker refactor
+// Slice 1) - a real, pre-existing gap this extraction surfaced: no
+// characterization test ever exercises a fresh justTripped: true
+// transition through runOnce() (both circuit-breaker characterization
+// tests seed an already-tripped fixture from a prior day), so this
+// orchestration had zero test coverage of any kind before this. Direct
+// unit tests against a real temp audit-log file, matching this file's own
+// established convention for the other I/O orchestration functions above.
+describe("runCircuitBreakerTripAlert", () => {
+  async function withTempAuditLogFile(
+    run: (filePath: string) => Promise<void>,
+  ): Promise<void> {
+    const dir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "circuit-breaker-trip-alert-test-"),
+    );
+    const filePath = path.join(dir, "circuit-breaker-audit.jsonl");
+    try {
+      await run(filePath);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  const trippedState: CircuitBreakerState = {
+    trackingStartDate: "2026-08-01T00:00:00.000Z",
+    peakEquity: 100000,
+    peakEquityAt: "2026-08-01T00:00:00.000Z",
+    tripped: true,
+    trippedAt: "2026-08-07T12:00:00.000Z",
+    dataStale: false,
+    lastReminderSentDate: null,
+  };
+
+  it("does nothing when justTripped is false - no SSE, no Telegram, no audit event", async () => {
+    await withTempAuditLogFile(async (filePath) => {
+      const broadcastSSE = vi.fn();
+      const sendTelegramAlert = vi.fn(async () => {});
+
+      await runCircuitBreakerTripAlert({
+        justTripped: false,
+        state: trippedState,
+        portfolioEquity: 85000,
+        drawdownPercent: -15,
+        broadcastSSE,
+        sendTelegramAlert,
+        auditLogFilePath: filePath,
+      });
+
+      expect(broadcastSSE).not.toHaveBeenCalled();
+      expect(sendTelegramAlert).not.toHaveBeenCalled();
+      expect(await readCircuitBreakerAuditLog(10, filePath)).toEqual([]);
+    });
+  });
+
+  it("broadcasts SSE, sends Telegram with the equity/drawdown/peak, and appends a CIRCUIT_BREAKER_TRIPPED audit event when justTripped is true", async () => {
+    await withTempAuditLogFile(async (filePath) => {
+      const broadcastSSE = vi.fn();
+      const sendTelegramAlert = vi.fn(async () => {});
+
+      await runCircuitBreakerTripAlert({
+        justTripped: true,
+        state: trippedState,
+        portfolioEquity: 85000,
+        drawdownPercent: -15,
+        broadcastSSE,
+        sendTelegramAlert,
+        auditLogFilePath: filePath,
+      });
+
+      expect(broadcastSSE).toHaveBeenCalledTimes(1);
+      const [ssePayload] = broadcastSSE.mock.calls[0]!;
+      expect(ssePayload).toMatchObject({ type: "notification", level: "error" });
+      expect((ssePayload as { message: string }).message).toContain("85000.00");
+      expect((ssePayload as { message: string }).message).toContain("-15.0%");
+      expect((ssePayload as { message: string }).message).toContain("100000.00");
+
+      expect(sendTelegramAlert).toHaveBeenCalledTimes(1);
+      expect(sendTelegramAlert.mock.calls[0]![0]).toBe(
+        (broadcastSSE.mock.calls[0]![0] as { message: string }).message,
+      );
+
+      const events = await readCircuitBreakerAuditLog(10, filePath);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        type: "CIRCUIT_BREAKER_TRIPPED",
+        timestamp: trippedState.trippedAt,
+        equity: 85000,
+        peakEquity: 100000,
+        drawdownPercent: -15,
+      });
+    });
+  });
+
+  it("propagates a sendTelegramAlert failure uncaught, rather than swallowing it - matches the pre-existing, unwrapped call site in runOnce()", async () => {
+    await withTempAuditLogFile(async (filePath) => {
+      const sendTelegramAlert = vi.fn(async () => {
+        throw new Error("simulated Telegram network failure");
+      });
+
+      await expect(
+        runCircuitBreakerTripAlert({
+          justTripped: true,
+          state: trippedState,
+          portfolioEquity: 85000,
+          drawdownPercent: -15,
+          broadcastSSE: () => {},
+          sendTelegramAlert,
+          auditLogFilePath: filePath,
+        }),
+      ).rejects.toThrow("simulated Telegram network failure");
+
+      // The throw happened before the audit-event append (Telegram is sent
+      // first in this block, matching the original inline order) - confirms
+      // the failure isn't silently swallowed partway through.
+      expect(await readCircuitBreakerAuditLog(10, filePath)).toEqual([]);
     });
   });
 });

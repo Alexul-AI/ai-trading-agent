@@ -1,6 +1,22 @@
 import { promises as fs } from "fs";
 import path from "path";
 
+import { appendCircuitBreakerAuditEvent } from "./circuitBreakerAuditLog.js";
+
+// Small, stateless, deliberately duplicated rather than shared via a new
+// module - same precedent as autopilotWorker.ts/analyzeTicker.ts (see
+// docs/ops/AUTOPILOT_WORKER_MAP.md).
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return "Unknown error";
+  }
+}
+
 const DATA_DIR = path.resolve(process.cwd(), "data");
 const STATE_FILE = path.join(DATA_DIR, "circuit-breaker-state.json");
 
@@ -283,4 +299,139 @@ export async function recordReminderSent(
   if (!existing) return;
 
   await writeState({ ...existing, lastReminderSentDate: todayDateKey }, filePath);
+}
+
+// Extracted from autopilotWorker.ts's runOnce() (2026-08-07, autopilotWorker
+// refactor Slice 1 - see docs/ops/AUTOPILOT_WORKER_MAP.md) - a pure move, no
+// behavior change. The call site in runOnce() must stay unwrapped (no
+// try/catch around the call) and this function must not swallow errors -
+// today, a sendTelegramAlert failure here aborts the rest of that cycle
+// (regime prefetch, strategy dispatch, journal write) via runOnce()'s own
+// outer catch. That's pre-existing behavior this move must not change, not
+// something to "fix" as a drive-by - see the daily reminder function below
+// for the deliberately different (isolated, try/catch-wrapped) treatment.
+export async function runCircuitBreakerTripAlert(params: {
+  justTripped: boolean;
+  state: CircuitBreakerState;
+  portfolioEquity: number;
+  drawdownPercent: number;
+  broadcastSSE: (payload: unknown) => void;
+  sendTelegramAlert?: (message: string) => Promise<void>;
+  auditLogFilePath?: string;
+}): Promise<void> {
+  if (!params.justTripped) return;
+
+  const alertMessage = `PORTFOLIO CIRCUIT BREAKER TRIPPED: equity ${params.portfolioEquity.toFixed(
+    2,
+  )} is down ${params.drawdownPercent.toFixed(
+    1,
+  )}% from peak ${params.state.peakEquity.toFixed(
+    2,
+  )}. New BUYs are blocked until manually reset.`;
+
+  params.broadcastSSE({
+    type: "notification",
+    level: "error",
+    message: alertMessage,
+  });
+
+  if (params.sendTelegramAlert) {
+    await params.sendTelegramAlert(alertMessage);
+  }
+
+  await appendCircuitBreakerAuditEvent(
+    {
+      type: "CIRCUIT_BREAKER_TRIPPED",
+      timestamp: params.state.trippedAt ?? new Date().toISOString(),
+      equity: params.portfolioEquity,
+      peakEquity: params.state.peakEquity,
+      drawdownPercent: params.drawdownPercent,
+      thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
+    },
+    params.auditLogFilePath,
+  );
+}
+
+// Extracted from autopilotWorker.ts's runOnce() (2026-08-07, autopilotWorker
+// refactor Slice 1) - a pure move, no behavior change. Once-per-calendar-day
+// nudge while the breaker stays tripped - the trip alert above only fires
+// once, ever, on the transition; this is what stops a long halt (see
+// CLAUDE.md's next-open finding: 315 of 406 simulated days) from going
+// unnoticed in between. Idempotency ordering (2026-08-07, PR #65): the audit
+// event + lastReminderSentDate are recorded BEFORE the SSE/Telegram send,
+// not after - see recordReminderSent's own call site below. Isolated in its
+// own try/catch (PR #65) so a Telegram failure here can never abort the rest
+// of the calling cycle, unlike the trip alert above.
+export async function runCircuitBreakerDailyReminder(params: {
+  state: CircuitBreakerState;
+  portfolioEquity: number;
+  drawdownPercent: number;
+  decisions: Array<{ blockReasonCode?: string }>;
+  todayDateKey: string;
+  lastRunAt: string;
+  broadcastSSE: (payload: unknown) => void;
+  sendTelegramAlert?: (message: string) => Promise<void>;
+  auditLogFilePath?: string;
+  stateFilePath?: string;
+}): Promise<void> {
+  if (
+    !shouldSendDailyReminder(
+      params.state.tripped,
+      params.state.lastReminderSentDate,
+      params.todayDateKey,
+    )
+  ) {
+    return;
+  }
+
+  try {
+    const daysHalted = params.state.trippedAt
+      ? Math.max(
+          1,
+          Math.round(
+            (Date.parse(params.lastRunAt) - Date.parse(params.state.trippedAt)) /
+              (24 * 60 * 60 * 1000),
+          ),
+        )
+      : null;
+    const blockedBuyCountToday = params.decisions.filter(
+      (decision) => decision.blockReasonCode === "PORTFOLIO_CIRCUIT_BREAKER",
+    ).length;
+
+    const reminderMessage = `Trading still halted by circuit breaker.\nHalted since: ${
+      params.state.trippedAt ?? "unknown"
+    }\nHalt days: ${daysHalted ?? "unknown"}\nCurrent equity: ${params.portfolioEquity.toFixed(
+      2,
+    )}\nCurrent drawdown: ${params.drawdownPercent.toFixed(
+      1,
+    )}%\nBUY blocked today: ${blockedBuyCountToday}\nSELL still allowed.`;
+
+    await appendCircuitBreakerAuditEvent(
+      {
+        type: "CIRCUIT_BREAKER_REMINDER_SENT",
+        timestamp: params.lastRunAt,
+        equity: params.portfolioEquity,
+        peakEquity: params.state.peakEquity,
+        drawdownPercent: params.drawdownPercent,
+        thresholdPercent: getMaxDrawdownFromPeakPercent() * 100,
+      },
+      params.auditLogFilePath,
+    );
+
+    await recordReminderSent(params.todayDateKey, params.stateFilePath);
+
+    params.broadcastSSE({
+      type: "notification",
+      level: "error",
+      message: reminderMessage,
+    });
+
+    if (params.sendTelegramAlert) {
+      await params.sendTelegramAlert(reminderMessage);
+    }
+  } catch (error) {
+    console.warn(
+      `[CIRCUIT_BREAKER] Daily reminder check failed: ${getErrorMessage(error)}`,
+    );
+  }
 }

@@ -125,8 +125,14 @@ separate instance per characterization test safe.
   re-exports both so `autopilotFilters.test.ts` needed zero changes.
 - **`runOnce`** - the single public orchestrator: lock claim → portfolio
   snapshot → circuit-breaker update → strategy dispatch (`runEtfRotationCycle`
-  vs. the per-ticker `analyzeTicker` loop) → daily-reminder check → journal
-  write → SSE broadcast → Telegram sends. The only place that mutates
+  vs. the per-ticker `analyzeTicker` loop) → journal write → SSE broadcast →
+  Telegram sends. The three circuit-breaker/off-target notification blocks
+  (trip alert, daily reminder, off-target reminder) were extracted into
+  `runCircuitBreakerTripAlert`/`runCircuitBreakerDailyReminder`
+  (`portfolioCircuitBreaker.ts`) and `runEtfOffTargetReminderCheck`
+  (`etfRotationReview.ts`) in the autopilotWorker refactor Slice 1
+  (2026-08-07) - `runOnce` now just calls them with already-in-scope values,
+  the logic itself lives in those files. The only place that mutates
   `running`/`lastError`/`lastDecisions`/`lastRunAt`/`lastCircuitBreakerState`/
   `lastJournalRunId`.
 - **`start`/`stop`** - arm/clear the `setInterval` scheduler.
@@ -172,7 +178,7 @@ have corrupted or depended on live paper-trading state:
 |---|---|---|
 | `autopilot-worker.lock` | `tryClaimWorkerLock` (`runOnce`), `releaseWorkerLock` (`releaseLockOnShutdown`) | `options.testDataFilePaths.lockFilePath` (PR #52) |
 | `circuit-breaker-state.json` | `updatePortfolioCircuitBreaker`, `recordReminderSent` | `options.testDataFilePaths.circuitBreakerStateFilePath` (PR #52) |
-| `circuit-breaker-audit.jsonl` | `appendCircuitBreakerAuditEvent` (2 call sites: trip, daily reminder) | `options.testDataFilePaths.circuitBreakerAuditLogFilePath` (PR #52) |
+| `circuit-breaker-audit.jsonl` | `appendCircuitBreakerAuditEvent` (2 call sites: trip, daily reminder - both now inside `portfolioCircuitBreaker.ts` as of the 2026-08-07 refactor Slice 1, `filePath` still threaded through from `runOnce`'s call params) | `options.testDataFilePaths.circuitBreakerAuditLogFilePath` (PR #52) |
 | `etf-rotation-worker-state.json` | `readRebalanceStateStrict`, `recordRebalancePlanned`, `recordRebalanceExecuting`, `recordRebalanceTerminal` (2 call sites) | `options.testDataFilePaths.etfRotationStateFilePath` (PR #52) |
 | `etf-rotation-order-audit.jsonl` | `appendEtfRotationOrderAuditEvent` (called once per submitted leg, inside `executeEtfRotationOrders`) | `options.testDataFilePaths.etfRotationOrderAuditLogFilePath` (PR #53 - **a real gap PR #52 missed**: none of its 3 characterization tests ever reached a real submitted leg, so this file kept writing to the live path until PR #53's own new tests - the first to exercise a real accepted execution - actually polluted the real file locally and got caught before merge) |
 | `autopilot-decisions.jsonl` | `appendAutopilotRun` | `options.testDataFilePaths.journalFilePath` (PR #52, required adding a `filePath` param to `decisionJournal.ts`'s `appendAutopilotRun` too - it was the one sibling module missing this convention) |
