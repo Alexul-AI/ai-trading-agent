@@ -38,9 +38,9 @@ export type EtfRotationOrderAuditEventType =
   // "paired-SELL-fill-unconfirmed" case is exactly what future incident
   // review needs to find quickly (2026-08-04, the QQQ 403 race condition).
   | "PAIRED_SELL_FILL_UNCONFIRMED"
-  // Emitted at most once per calendar day by autopilotWorker.ts while
-  // etfRotationReview.ts's deriveEtfRotationOffTargetState reports
-  // offTarget: true (see shouldSendEtfRotationOffTargetReminder) - a
+  // Emitted at most once per calendar day by etfRotationReview.ts's
+  // runEtfOffTargetReminderCheck while deriveEtfRotationOffTargetState
+  // reports offTarget: true (see shouldSendEtfRotationOffTargetReminder) - a
   // lifecycle/notification event, not an order leg, same category as
   // REBALANCE_MANUALLY_CLEARED: ticker/side are left unset and the full
   // per-ticker detail goes in `reason` instead, since one reminder can
