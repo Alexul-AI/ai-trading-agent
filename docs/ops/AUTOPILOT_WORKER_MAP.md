@@ -284,6 +284,24 @@ real `createAutopilotWorker(...)` call site needs zero changes.
   deleted outright once genuinely dead repo-wide, not kept as unused
   exports. See `autopilotConfig.ts`'s own file header and each field's
   inline comment for the full per-field reasoning.
+- **Slice 3 (2026-08-07, same day)**: extracted the post-`decisions`
+  signal-counting block out of `runOnce()` into
+  `backend/autopilotDecisionsSummary.ts`'s `summarizeAutopilotDecisions`
+  (pure, no I/O, no closure state, no broker/execution path - the
+  lowest-risk remaining candidate after Slices 1-2, per the user's own
+  review). `isSignalReadyDecision` moved with it unchanged (it's a
+  dependency of the new function) and is re-exported from
+  `autopilotWorker.ts` so `autopilotFilters.test.ts` needed zero changes.
+  `runOnce()` now holds only the call + five-line assignment that used to
+  be a 16-line inline block. `autopilotWorker.ts`: 910 → 892 lines. Also
+  noted along the way, not touched: `decisionJournal.ts` has its own,
+  independently-defined, differently-typed `isSignalReadyDecision` (on
+  `JournalDecision`, not `AutopilotDecisionLog`) and its own
+  `calculateRunSignalCounts` doing a structurally similar count - a
+  coincidental name collision and a real pre-existing duplication, not one
+  this Slice introduced, and not reconciled here (same "not worth taking
+  in a foundation PR" reasoning as the `AutopilotDecisionLog`/
+  `JournalDecision` note below).
 
 Also noted, deliberately not acted on: `AutopilotDecisionLog` (this file) is
 structurally similar to but independently-evolved from `decisionJournal.ts`'s
