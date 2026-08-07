@@ -260,6 +260,30 @@ real `createAutopilotWorker(...)` call site needs zero changes.
   copies). `runOnce()`'s own line count is unaffected by this slice (the
   block moved was outside `runOnce()`); `autopilotWorker.ts` overall:
   1090 → 910 lines.
+- **Strict numeric env parsing safety PR (2026-08-07, same day, follow-up
+  to Slice 2)**: Slice 2's own review flagged a real gap it deliberately
+  preserved (pure-relocation constraint) - `parseIntWithDefault`/
+  `parseFloatWithDefault` silently produce `NaN` on a garbage env value,
+  e.g. a typo'd `AUTOPILOT_INTERVAL_MS` (empirically confirmed:
+  `setInterval(fn, NaN | 0 | negative)` all fire the cycle essentially
+  immediately/repeatedly). This PR traced the actual downstream consumer
+  of every numeric field in `autopilotConfig.ts` and split them into two
+  tiers by real danger, not uniformly: **fail-loud** (`AUTOPILOT_INTERVAL_MS`,
+  `AUTOPILOT_LOCK_STALE_AFTER_MS`, `AUTOPILOT_MIN_CONFIDENCE`,
+  `AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION`, `AUTOPILOT_HIGH_BETA_BUCKET_EQUITY_FRACTION`
+  - each confirmed to either defeat a safety-relevant gate/cap or corrupt a
+  computed order quantity into `NaN`) vs. **bounded-fallback with a warning**
+  (`AUTOPILOT_BARS_DAYS`, `AUTOPILOT_ETF_ROTATION_BARS_DAYS`,
+  `AUTOPILOT_COOLDOWN_MINUTES`, `AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES` -
+  each confirmed to degrade to a contained, non-dangerous failure). One
+  real correction found along the way: `AUTOPILOT_COOLDOWN_MINUTES`'s
+  danger direction isn't uniform - `NaN` makes the cooldown stick "on"
+  (safe), but negative/zero defeats it outright (the opposite direction) -
+  the bounded-fallback function rejects all three uniformly, not just
+  `NaN`. `parseIntWithDefault`/`parseFloatWithDefault` (Slice 2) were
+  deleted outright once genuinely dead repo-wide, not kept as unused
+  exports. See `autopilotConfig.ts`'s own file header and each field's
+  inline comment for the full per-field reasoning.
 
 Also noted, deliberately not acted on: `AutopilotDecisionLog` (this file) is
 structurally similar to but independently-evolved from `decisionJournal.ts`'s
