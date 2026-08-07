@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
-  parseFloatWithDefault,
-  parseIntWithDefault,
+  parseIntWithFallbackWarning,
+  parseStrictFractionWithDefault,
+  parseStrictPositiveIntWithDefault,
   resolveAutopilotStrategy,
   resolveAutopilotTickers,
 } from "./autopilotConfig.js";
@@ -11,46 +12,159 @@ import {
 // the module's own top-level "wiring" consts (see autopilotConfig.ts's file
 // header and docs/ops/AUTOPILOT_WORKER_MAP.md's Slice 2 entry for why).
 
-describe("parseIntWithDefault", () => {
+describe("parseStrictPositiveIntWithDefault", () => {
   it("returns the default when unset", () => {
-    expect(parseIntWithDefault(undefined, 180)).toBe(180);
+    expect(parseStrictPositiveIntWithDefault("X", undefined, 180)).toBe(180);
   });
 
   it("parses a valid explicit value", () => {
-    expect(parseIntWithDefault("60", 180)).toBe(60);
+    expect(parseStrictPositiveIntWithDefault("X", "60", 180)).toBe(60);
   });
 
-  it("returns the default for an empty string (falsy, same as unset)", () => {
-    expect(parseIntWithDefault("", 180)).toBe(180);
+  it("throws on zero - the exact NaN-equivalent danger for setInterval/lock-staleness fields", () => {
+    expect(() => parseStrictPositiveIntWithDefault("X", "0", 180)).toThrow(
+      /Invalid X \("0"\)/,
+    );
   });
 
-  it("silently returns NaN for an invalid value - existing behavior, not new validation", () => {
-    // This is a real, pre-existing latent footgun (e.g. a typo'd
-    // AUTOPILOT_INTERVAL_MS would make setInterval coerce to a 0ms
-    // interval) - deliberately not fixed by this extraction, only moved.
-    expect(parseIntWithDefault("garbage", 180)).toBeNaN();
+  it("throws on a negative value", () => {
+    expect(() => parseStrictPositiveIntWithDefault("X", "-5", 180)).toThrow(
+      /Invalid X \("-5"\)/,
+    );
   });
 
-  it("truncates a decimal value the same way Number.parseInt always has", () => {
-    expect(parseIntWithDefault("60.9", 180)).toBe(60);
+  it("throws on a non-numeric value, naming the env var in the message", () => {
+    expect(() => parseStrictPositiveIntWithDefault("AUTOPILOT_INTERVAL_MS", "garbage", 180)).toThrow(
+      /Invalid AUTOPILOT_INTERVAL_MS \("garbage"\)/,
+    );
+  });
+
+  it("throws on a decimal value - stricter than Number.parseInt's silent truncation", () => {
+    expect(() => parseStrictPositiveIntWithDefault("X", "60.9", 180)).toThrow(
+      /Invalid X \("60.9"\)/,
+    );
+  });
+
+  it("throws on trailing garbage that Number.parseInt would have silently ignored", () => {
+    expect(() => parseStrictPositiveIntWithDefault("X", "60abc", 180)).toThrow();
   });
 });
 
-describe("parseFloatWithDefault", () => {
+describe("parseStrictFractionWithDefault", () => {
   it("returns the default when unset", () => {
-    expect(parseFloatWithDefault(undefined, 0.75)).toBe(0.75);
+    expect(parseStrictFractionWithDefault("X", undefined, 0.75)).toBe(0.75);
   });
 
   it("parses a valid explicit value", () => {
-    expect(parseFloatWithDefault("0.5", 0.75)).toBe(0.5);
+    expect(parseStrictFractionWithDefault("X", "0.5", 0.75)).toBe(0.5);
   });
 
-  it("returns the default for an empty string (falsy, same as unset)", () => {
-    expect(parseFloatWithDefault("", 0.75)).toBe(0.75);
+  it("accepts 1 as a legitimate inclusive upper boundary", () => {
+    expect(parseStrictFractionWithDefault("X", "1", 0.75)).toBe(1);
   });
 
-  it("silently returns NaN for an invalid value - existing behavior, not new validation", () => {
-    expect(parseFloatWithDefault("garbage", 0.75)).toBeNaN();
+  it("throws on zero", () => {
+    expect(() => parseStrictFractionWithDefault("X", "0", 0.75)).toThrow(
+      /Invalid X \("0"\)/,
+    );
+  });
+
+  it("throws on a negative value", () => {
+    expect(() => parseStrictFractionWithDefault("X", "-0.1", 0.75)).toThrow();
+  });
+
+  it("throws above the inclusive upper bound of 1", () => {
+    expect(() => parseStrictFractionWithDefault("X", "1.5", 0.75)).toThrow();
+  });
+
+  it("throws on a non-numeric value, naming the env var in the message", () => {
+    expect(() =>
+      parseStrictFractionWithDefault("AUTOPILOT_MIN_CONFIDENCE", "garbage", 0.75),
+    ).toThrow(/Invalid AUTOPILOT_MIN_CONFIDENCE \("garbage"\)/);
+  });
+});
+
+describe("parseIntWithFallbackWarning", () => {
+  it("returns the default when unset, without warning", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(parseIntWithFallbackWarning("X", undefined, 180)).toBe(180);
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("parses a valid explicit value, without warning", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(parseIntWithFallbackWarning("X", "60", 180)).toBe(60);
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("falls back to the default and warns on zero, rather than throwing", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(parseIntWithFallbackWarning("X", "0", 180)).toBe(180);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    warnSpy.mockRestore();
+  });
+
+  it("falls back to the default and warns on a negative value - closes the cooldown-defeating direction, not just NaN", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(parseIntWithFallbackWarning("X", "-5", 180)).toBe(180);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    warnSpy.mockRestore();
+  });
+
+  it("falls back to the default and warns, naming the env var, on a non-numeric value", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(parseIntWithFallbackWarning("AUTOPILOT_BARS_DAYS", "garbage", 180)).toBe(180);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("AUTOPILOT_BARS_DAYS"),
+    );
+    warnSpy.mockRestore();
+  });
+});
+
+// Concrete, field-by-field proof that every real production default value -
+// plus the one confirmed real Render override, AUTOPILOT_LOCK_STALE_AFTER_MS
+// =600000 (see CLAUDE.md) - still parses successfully under the new strict
+// validation, not just an assertion that "defaults are preserved."
+describe("real production values parse cleanly under the new strict validation", () => {
+  it("every fail-loud integer field's real default, and the one confirmed Render override, parse without throwing", () => {
+    expect(parseStrictPositiveIntWithDefault("AUTOPILOT_INTERVAL_MS", undefined, 3600000)).toBe(
+      3600000,
+    );
+    expect(
+      parseStrictPositiveIntWithDefault("AUTOPILOT_LOCK_STALE_AFTER_MS", "600000", 10800000),
+    ).toBe(600000);
+  });
+
+  it("every fail-loud fraction field's real default parses without throwing", () => {
+    expect(parseStrictFractionWithDefault("AUTOPILOT_MIN_CONFIDENCE", undefined, 0.75)).toBe(
+      0.75,
+    );
+    expect(
+      parseStrictFractionWithDefault("AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION", undefined, 0.4),
+    ).toBe(0.4);
+    expect(
+      parseStrictFractionWithDefault(
+        "AUTOPILOT_HIGH_BETA_BUCKET_EQUITY_FRACTION",
+        undefined,
+        0.2,
+      ),
+    ).toBe(0.2);
+  });
+
+  it("every bounded-fallback field's real default parses without a warning", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(parseIntWithFallbackWarning("AUTOPILOT_BARS_DAYS", undefined, 180)).toBe(180);
+    expect(parseIntWithFallbackWarning("AUTOPILOT_ETF_ROTATION_BARS_DAYS", undefined, 400)).toBe(
+      400,
+    );
+    expect(parseIntWithFallbackWarning("AUTOPILOT_COOLDOWN_MINUTES", undefined, 60)).toBe(60);
+    expect(
+      parseIntWithFallbackWarning("AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES", undefined, 30),
+    ).toBe(30);
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 });
 

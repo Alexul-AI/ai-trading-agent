@@ -1,8 +1,14 @@
-// Env-var/config resolution for autopilotWorker.ts - extracted in the
+// Env-var/config resolution for autopilotWorker.ts. Extracted in the
 // autopilotWorker refactor Slice 2 (2026-08-07, see
-// docs/ops/AUTOPILOT_WORKER_MAP.md). Pure move: every default value,
-// fail-soft/fail-loud behavior, and env var name is unchanged from before
-// this extraction - only the file each expression lives in changed.
+// docs/ops/AUTOPILOT_WORKER_MAP.md) as a pure move - every default value
+// and env var name was unchanged from before that extraction. A follow-up
+// safety PR the same day upgraded 9 numeric fields' parsing from lenient
+// (silent NaN on garbage input) to strict - see
+// parseStrictPositiveIntWithDefault/parseStrictFractionWithDefault/
+// parseIntWithFallbackWarning below for the fail-loud-vs-bounded-fallback
+// split and why each field landed where it did. Default values and env var
+// names are still unchanged by that PR - only invalid-input handling
+// changed, deliberately.
 //
 // Excluded on purpose (stayed in autopilotWorker.ts, not config
 // resolution): WORKER_OWNER_ID (randomUUID(), runtime process identity,
@@ -26,30 +32,99 @@ import {
 import { resolveTimeZone } from "./src/utils/time.js";
 import type { AutopilotStrategyKind } from "./src/types/autopilotTypes.js";
 
-// No existing shared int/float-with-default helper exists anywhere in
-// backend/ - these two are new, but small and self-contained, modeled
-// directly on this codebase's own established resolveXxx(raw, ...)
-// convention (resolveTimeZone, resolveRampMaxPositionEquityPercent,
-// resolveMaxAllowedPositions, resolveEtfRotationSellFillTimingMs).
+// Strict numeric env parsing (2026-08-07 safety PR, follow-up to Slice 2) -
+// three tiers, chosen per field by actually tracing what an invalid value
+// does downstream, not applied uniformly:
 //
-// Deliberately as lenient as Number.parseInt/parseFloat themselves are -
-// an invalid string (e.g. "garbage") silently produces NaN, exactly
-// matching every one of these values' pre-extraction behavior. Not adding
-// new validation here, even though a NaN interval/threshold is a real
-// latent footgun (e.g. setInterval(fn, NaN) coerces to a 0ms interval) -
-// fixing that is a deliberate non-goal of this pure-relocation PR.
-export function parseIntWithDefault(
+// - parseStrictPositiveIntWithDefault / parseStrictFractionWithDefault:
+//   fail loud (throw at module load) for fields where NaN/negative/zero is
+//   genuinely dangerous - matches this codebase's own established
+//   resolveRampMaxPositionEquityPercent/resolveMaxAllowedPositions
+//   convention in etfRotationExecution.ts (regex-validate the trimmed
+//   string first, since parseInt/parseFloat silently truncate trailing
+//   garbage like "10abc", then range-validate, then throw a descriptive
+//   Error naming the env var - or return the parsed value).
+// - parseIntWithFallbackWarning: warn + fall back to the default for
+//   fields where an invalid value only degrades functionality (a per-
+//   ticker error, a defeated cooldown bounded by other safety layers) -
+//   no existing precedent in this repo for this exact pattern, genuinely
+//   new here, not modeled on prior code.
+//
+// Parameter order (name, raw, defaultValue) matches the closer existing
+// precedent, etfRotationExecution.ts's private, multi-use
+// parseStrictPositiveIntEnv(name, raw, defaultValue) - not the single-use
+// resolveRampMaxPositionEquityPercent's (raw) order. Duplicated rather
+// than imported from that file: small, stateless, matches this codebase's
+// own established duplication precedent (getErrorMessage/extractErrorMessage
+// independently defined in 5+ files) rather than exporting a private
+// helper from a file this PR shouldn't otherwise touch.
+export function parseStrictPositiveIntWithDefault(
+  name: string,
   raw: string | undefined,
   defaultValue: number,
 ): number {
-  return Number.parseInt(raw || String(defaultValue), 10);
+  if (raw === undefined) return defaultValue;
+  const trimmed = raw.trim();
+  if (!/^-?\d+$/.test(trimmed)) {
+    throw new Error(
+      `Invalid ${name} (${JSON.stringify(raw)}): must be a positive integer, or unset to default to ${defaultValue}.`,
+    );
+  }
+  const parsed = Number(trimmed);
+  if (parsed <= 0) {
+    throw new Error(
+      `Invalid ${name} (${JSON.stringify(raw)}): must be a positive integer, or unset to default to ${defaultValue}.`,
+    );
+  }
+  return parsed;
 }
 
-export function parseFloatWithDefault(
+// Range (0, 1] - inclusive of 1, which is a legitimate value for every
+// fail-loud fraction field this feeds (confidence is clamped to max 1.0 in
+// strategyEngine.ts; a bucket fraction of 1.0 legitimately means "no real
+// cap," a valid extreme, not a typo).
+export function parseStrictFractionWithDefault(
+  name: string,
   raw: string | undefined,
   defaultValue: number,
 ): number {
-  return Number.parseFloat(raw || String(defaultValue));
+  if (raw === undefined) return defaultValue;
+  const trimmed = raw.trim();
+  if (!/^-?\d+(\.\d+)?$/.test(trimmed)) {
+    throw new Error(
+      `Invalid ${name} (${JSON.stringify(raw)}): must be a number greater than 0 and at most 1, or unset to default to ${defaultValue}.`,
+    );
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1) {
+    throw new Error(
+      `Invalid ${name} (${JSON.stringify(raw)}): must be a number greater than 0 and at most 1, or unset to default to ${defaultValue}.`,
+    );
+  }
+  return parsed;
+}
+
+// Rejects NaN/non-numeric AND negative/zero uniformly (not just NaN) -
+// for AUTOPILOT_COOLDOWN_MINUTES specifically, a negative/zero value
+// defeats the cooldown outright (the opposite failure direction from NaN,
+// which makes it stick "on" instead - see this PR's own plan/commit
+// history for the full trace), so both must fall back to the same
+// known-safe default, not just NaN.
+export function parseIntWithFallbackWarning(
+  name: string,
+  raw: string | undefined,
+  defaultValue: number,
+): number {
+  if (raw === undefined) return defaultValue;
+  const trimmed = raw.trim();
+  const parsed = Number(trimmed);
+  if (!/^-?\d+$/.test(trimmed) || parsed <= 0) {
+    console.warn(
+      `[CONFIG] Invalid ${name} (${JSON.stringify(raw)}) - falling back to default ${defaultValue}.`,
+    );
+    return defaultValue;
+  }
+  return parsed;
 }
 
 export function resolveAutopilotTickers(raw: string | undefined): string[] {
@@ -76,7 +151,12 @@ export const APCA_API_SECRET_KEY = process.env.APCA_API_SECRET_KEY ?? "";
 // inputs ~390 times between meaningful data changes - added log/journal
 // noise and API calls, not information. Hourly gives 24 evaluations/day
 // instead, still frequent enough to react same-day, without the churn.
-export const AUTOPILOT_INTERVAL_MS = parseIntWithDefault(
+// Fails loud at process startup on a bad value - empirically confirmed
+// (2026-08-07): setInterval(fn, NaN | 0 | negative) all fire the autopilot
+// cycle essentially immediately and repeatedly, hammering the Alpaca API
+// and the worker-lock claim/release cycle.
+export const AUTOPILOT_INTERVAL_MS = parseStrictPositiveIntWithDefault(
+  "AUTOPILOT_INTERVAL_MS",
   process.env.AUTOPILOT_INTERVAL_MS,
   3600000,
 );
@@ -84,28 +164,55 @@ export const AUTOPILOT_INTERVAL_MS = parseIntWithDefault(
 // Best-effort, same-host-only protection (see autopilotWorkerLock.ts for
 // the honest limitation) - default 3x the cycle interval, long enough that
 // a normal cycle never falsely looks stale, short enough that a crashed
-// process doesn't block recovery for long.
-export const AUTOPILOT_LOCK_STALE_AFTER_MS = parseIntWithDefault(
+// process doesn't block recovery for long. Fails loud on a bad value: NaN
+// makes a crashed process's lock unreclaimable forever (matches this
+// project's own 2026-07-17 incident); zero/negative makes the lock always
+// look stale, letting two processes race/double-claim it continuously -
+// both directions dangerous, both rejected.
+export const AUTOPILOT_LOCK_STALE_AFTER_MS = parseStrictPositiveIntWithDefault(
+  "AUTOPILOT_LOCK_STALE_AFTER_MS",
   process.env.AUTOPILOT_LOCK_STALE_AFTER_MS,
   AUTOPILOT_INTERVAL_MS * 3,
 );
 
-export const AUTOPILOT_BARS_DAYS = parseIntWithDefault(
+// Falls back (with a warning, not a crash) on a bad value - degrades to
+// every baseline ticker getting an ANALYSIS_ERROR HOLD decision that
+// cycle (an Invalid Date inside fetchAlpacaBarsUncached, caught by the
+// existing per-ticker try/catch), not a dangerous outcome.
+export const AUTOPILOT_BARS_DAYS = parseIntWithFallbackWarning(
+  "AUTOPILOT_BARS_DAYS",
   process.env.AUTOPILOT_BARS_DAYS,
   180,
 );
 
-export const AUTOPILOT_MIN_CONFIDENCE = parseFloatWithDefault(
+// Fails loud on a bad value: strategyEngine.ts clamps decision.confidence
+// to [0,1], so any minConfidence <= 0 (not just NaN) defeats the quality
+// gate in analyzeTicker.ts outright - a zero/negative threshold and a NaN
+// one have the same dangerous effect (every signal passes uncontested).
+export const AUTOPILOT_MIN_CONFIDENCE = parseStrictFractionWithDefault(
+  "AUTOPILOT_MIN_CONFIDENCE",
   process.env.AUTOPILOT_MIN_CONFIDENCE,
   0.75,
 );
 
-export const AUTOPILOT_COOLDOWN_MINUTES = parseIntWithDefault(
+// Falls back (with a warning, not a crash) on a bad value. NaN makes the
+// cooldown stick "on" (self-limiting - blocks future buys for that ticker
+// until restart); zero/negative does the opposite, defeating the cooldown
+// outright (bounded only by other independent safety layers - bucket cap,
+// per-ticker cap, cash, circuit breaker) - this function rejects NaN AND
+// negative AND zero uniformly, substituting the known-safe default in
+// every invalid case, not just guarding against NaN.
+export const AUTOPILOT_COOLDOWN_MINUTES = parseIntWithFallbackWarning(
+  "AUTOPILOT_COOLDOWN_MINUTES",
   process.env.AUTOPILOT_COOLDOWN_MINUTES,
   60,
 );
 
-export const AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES = parseIntWithDefault(
+// Falls back (with a warning, not a crash) on a bad value - only defeats
+// the Telegram alert dedup cooldown (spam), zero effect on any trade or
+// decision logic.
+export const AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES = parseIntWithFallbackWarning(
+  "AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES",
   process.env.AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES,
   30,
 );
@@ -178,7 +285,13 @@ export const AUTOPILOT_ALLOW_FRACTIONAL_SHARES_ENABLED =
 // bucket, but blocks the AMD+NVDA+TSLA-all-at-20%-each scenario. Only bites
 // for multi-ticker buckets (us_broad, high_beta_growth) - the single-ticker
 // buckets never approach 40% since they're already capped at 20% each.
-export const AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION = parseFloatWithDefault(
+// Fails loud on a bad value: NaN propagates through the bucket-cap math in
+// portfolioSafety.ts's Math.max/Math.min chain all the way to the final
+// share count, which becomes NaN itself - not "cap defeated", the
+// computed order quantity is corrupted (JSON.stringify({qty: NaN}) is
+// "{\"qty\":null}", an unpredictable value to hand to order construction).
+export const AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION = parseStrictFractionWithDefault(
+  "AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION",
   process.env.AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION,
   0.4,
 );
@@ -190,7 +303,10 @@ export const AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION = parseFloatWithDefault(
 // meaningfully reduces how concentrated the bot can get in speculative
 // single names versus the ETF-heavy buckets (us_broad/international/
 // bonds/commodities), which keep the looser 40% default.
-export const AUTOPILOT_HIGH_BETA_BUCKET_EQUITY_FRACTION = parseFloatWithDefault(
+// Same NaN-corrupts-the-share-count reasoning as
+// AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION above - fails loud on a bad value.
+export const AUTOPILOT_HIGH_BETA_BUCKET_EQUITY_FRACTION = parseStrictFractionWithDefault(
+  "AUTOPILOT_HIGH_BETA_BUCKET_EQUITY_FRACTION",
   process.env.AUTOPILOT_HIGH_BETA_BUCKET_EQUITY_FRACTION,
   0.2,
 );
@@ -242,7 +358,14 @@ export const ETF_ROTATION_STRATEGY_CONFIG_HASH = createStrategyConfigHash(
 // convention as backtest-etf-rotation.ts) - far more than the baseline
 // path's 180-calendar-day default. 400 calendar days clears that with
 // weekend/holiday margin to spare.
-export const AUTOPILOT_ETF_ROTATION_BARS_DAYS = parseIntWithDefault(
+// Falls back (with a warning, not a crash) on a bad value. Unlike
+// AUTOPILOT_BARS_DAYS, the ETF rotation path's bars fetch
+// (etfRotationCycle.ts) has no per-ticker try/catch - an Invalid-Date
+// throw here aborts the entire rotation cycle for that run (caught only
+// by runOnce()'s outer try/catch), not a per-ticker degradation. Still no
+// crash and no trade either way, just a coarser-grained failure.
+export const AUTOPILOT_ETF_ROTATION_BARS_DAYS = parseIntWithFallbackWarning(
+  "AUTOPILOT_ETF_ROTATION_BARS_DAYS",
   process.env.AUTOPILOT_ETF_ROTATION_BARS_DAYS,
   400,
 );
