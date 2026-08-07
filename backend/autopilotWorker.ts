@@ -4,33 +4,58 @@
 // easier to keep in sync as the file changes.
 import { randomUUID } from "crypto";
 import { DEFAULT_STRATEGY_CONFIG } from "./strategyEngine.js";
-import {
-  appendAutopilotRun,
-  createStrategyConfigHash,
-} from "./decisionJournal.js";
-import {
-  ETF_ROTATION_CONFIG_VARIANTS,
-  resolveEtfRotationConfigVariant,
-  type EtfRotationConfig,
-} from "./etfRotationStrategy.js";
-import {
-  createWaitForSellFill,
-  resolveEtfRotationSellFillTimingMs,
-  resolveMaxAllowedPositions,
-  resolveRampMaxPositionEquityPercent,
-} from "./etfRotationExecution.js";
+import { appendAutopilotRun } from "./decisionJournal.js";
 import {
   runEtfRotationCycle,
   mapExecuteSafeTradeResultToLegOutcome,
   mapEtfRotationExecutionStatusToRebalanceStatus,
 } from "./etfRotationCycle.js";
 import { runEtfOffTargetReminderCheck } from "./etfRotationReview.js";
-import { resolveTimeZone, toLocalDateKey } from "./src/utils/time.js";
+import { toLocalDateKey } from "./src/utils/time.js";
 import {
   analyzeTicker,
   evaluateSentimentVeto,
   evaluateInsiderVeto,
 } from "./analyzeTicker.js";
+import { createWaitForSellFill } from "./etfRotationExecution.js";
+import {
+  APCA_API_KEY_ID,
+  APCA_API_SECRET_KEY,
+  AUTOPILOT_INTERVAL_MS,
+  AUTOPILOT_LOCK_STALE_AFTER_MS,
+  AUTOPILOT_BARS_DAYS,
+  AUTOPILOT_MIN_CONFIDENCE,
+  AUTOPILOT_COOLDOWN_MINUTES,
+  AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES,
+  AUTOPILOT_REMINDER_TIMEZONE,
+  ALPACA_DATA_FEED,
+  AUTOPILOT_TICKERS,
+  AUTOPILOT_EXECUTE_TRADES,
+  AUTOPILOT_ALLOW_BUY,
+  AUTOPILOT_ALLOW_SELL,
+  AUTOPILOT_SENTIMENT_FILTER_ENABLED,
+  AUTOPILOT_INSIDER_FILTER_ENABLED,
+  AUTOPILOT_REGIME_FILTER_ENABLED,
+  AUTOPILOT_REGIME_EXEMPT_HIGH_BETA_DEFAULT,
+  AUTOPILOT_ALLOW_FRACTIONAL_SHARES_ENABLED,
+  AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION,
+  BUCKET_EQUITY_FRACTION_OVERRIDES,
+  AUTOPILOT_BLOCK_SELL_BELOW_AVG,
+  AUTOPILOT_ENABLED_DEFAULT,
+  STRATEGY_VERSION,
+  STRATEGY_CONFIG_HASH,
+  AUTOPILOT_STRATEGY,
+  ETF_ROTATION_CONFIG_VARIANT_KEY,
+  ETF_ROTATION_ACTIVE_CONFIG,
+  ETF_ROTATION_STRATEGY_VERSION,
+  ETF_ROTATION_STRATEGY_CONFIG_HASH,
+  AUTOPILOT_ETF_ROTATION_BARS_DAYS,
+  AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT,
+  AUTOPILOT_ALLOW_REBALANCE_SELLS,
+  AUTOPILOT_ETF_ROTATION_MAX_POSITIONS,
+  AUTOPILOT_ETF_ROTATION_SELL_FILL_TIMEOUT_MS,
+  AUTOPILOT_ETF_ROTATION_SELL_FILL_POLL_MS,
+} from "./autopilotConfig.js";
 
 export {
   mapExecuteSafeTradeResultToLegOutcome,
@@ -105,110 +130,16 @@ export type {
   SignalStatus,
 };
 
-const APCA_API_KEY_ID = process.env.APCA_API_KEY_ID ?? "";
-const APCA_API_SECRET_KEY = process.env.APCA_API_SECRET_KEY ?? "";
-
-// Strategy decisions are computed from daily bars (RSI/MACD/BB don't change
-// intraday), so polling every 60s previously just re-evaluated the same
-// inputs ~390 times between meaningful data changes - added log/journal
-// noise and API calls, not information. Hourly gives 24 evaluations/day
-// instead, still frequent enough to react same-day, without the churn.
-const AUTOPILOT_INTERVAL_MS = Number.parseInt(
-  process.env.AUTOPILOT_INTERVAL_MS || "3600000",
-  10,
-);
-
-// Best-effort, same-host-only protection (see autopilotWorkerLock.ts for
-// the honest limitation) - default 3x the cycle interval, long enough that
-// a normal cycle never falsely looks stale, short enough that a crashed
-// process doesn't block recovery for long.
-const AUTOPILOT_LOCK_STALE_AFTER_MS = Number.parseInt(
-  process.env.AUTOPILOT_LOCK_STALE_AFTER_MS ||
-    String(AUTOPILOT_INTERVAL_MS * 3),
-  10,
-);
-
+// All env-var/config resolution below moved to autopilotConfig.ts in the
+// autopilotWorker refactor Slice 2 (2026-08-07, see
+// docs/ops/AUTOPILOT_WORKER_MAP.md). What's left here is not config
+// resolution: WORKER_OWNER_ID (runtime process identity, not env-derived),
+// REGIME_BUCKETS/TICKER_TO_BUCKET (static domain data - REGIME_BUCKETS'
+// one env-derived field, AUTOPILOT_REGIME_EXEMPT_HIGH_BETA, is imported
+// from autopilotConfig.ts as AUTOPILOT_REGIME_EXEMPT_HIGH_BETA_DEFAULT
+// rather than read here directly), ETF_ROTATION_WARMUP_TRADING_DAYS
+// (hardcoded, not env-derived).
 const WORKER_OWNER_ID = randomUUID();
-
-const AUTOPILOT_BARS_DAYS = Number.parseInt(
-  process.env.AUTOPILOT_BARS_DAYS || "180",
-  10,
-);
-
-const AUTOPILOT_MIN_CONFIDENCE = Number.parseFloat(
-  process.env.AUTOPILOT_MIN_CONFIDENCE || "0.75",
-);
-
-const AUTOPILOT_COOLDOWN_MINUTES = Number.parseInt(
-  process.env.AUTOPILOT_COOLDOWN_MINUTES || "60",
-  10,
-);
-
-const AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES = Number.parseInt(
-  process.env.AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES || "30",
-  10,
-);
-
-// Timezone the daily circuit-breaker/off-target reminders' "once per
-// calendar day" boundary is computed in (2026-08-07) - previously always
-// UTC (lastRunAt.slice(0, 10)), which meant a reminder just after UTC
-// midnight read as a same-night "duplicate" to a user in a non-UTC
-// timezone even though it was technically a new UTC day. Defaults to
-// Asia/Jerusalem (this deployment's actual user), not UTC, since the whole
-// point is for "once a day" to match the day the user experiences it on.
-// Cosmetic only - see resolveTimeZone's own doc comment for why an invalid
-// value fails soft to UTC instead of crashing the worker.
-const AUTOPILOT_REMINDER_TIMEZONE = resolveTimeZone(
-  process.env.AUTOPILOT_REMINDER_TIMEZONE,
-  "Asia/Jerusalem",
-);
-
-const ALPACA_DATA_FEED = process.env.ALPACA_DATA_FEED || "iex";
-
-const AUTOPILOT_TICKERS = (
-  process.env.AUTOPILOT_TICKERS ||
-  "AMD,NVDA,AAPL,MSFT,TSLA,JPM,JNJ,XOM,PG,SPY,GLD,TLT,EFA"
-)
-  .split(",")
-  .map((ticker) => ticker.trim().toUpperCase())
-  .filter(Boolean);
-
-const AUTOPILOT_EXECUTE_TRADES =
-  process.env.AUTOPILOT_EXECUTE_TRADES === "true";
-
-const AUTOPILOT_ALLOW_BUY = process.env.AUTOPILOT_ALLOW_BUY === "true";
-const AUTOPILOT_ALLOW_SELL = process.env.AUTOPILOT_ALLOW_SELL === "true";
-
-// Off by default: this signal cannot be backtested (news APIs only return
-// current data, not point-in-time history), so enabling it is an explicit,
-// unvalidated opt-in rather than a proven improvement.
-const AUTOPILOT_SENTIMENT_FILTER_ENABLED =
-  process.env.AUTOPILOT_SENTIMENT_FILTER === "true";
-
-// Same rationale as the sentiment filter: unbacktestable, off by default.
-// Threshold is intentionally conservative - a single insider sale is a
-// weak/noisy signal (taxes, diversification), so it only blocks on a
-// cluster of open-market sells with zero offsetting buys.
-const AUTOPILOT_INSIDER_FILTER_ENABLED =
-  process.env.AUTOPILOT_INSIDER_FILTER === "true";
-
-// Off by default: backtest-validated (see backtest-sweep.ts's
-// regime-filter-* variants), but "roughly matches baseline" isn't strong
-// enough evidence to flip a new filter on by default - same standard
-// already applied to useAtrStops.
-const AUTOPILOT_REGIME_FILTER_ENABLED =
-  process.env.AUTOPILOT_REGIME_FILTER === "true";
-
-// Off by default: lets a BUY that would otherwise size to 0 whole shares
-// (most/all tickers below ~$1,000-3,000 of capital) fall back to a
-// fractional/notional order instead. That order gives up Alpaca's
-// broker-side bracket stop_loss/take_profit (see
-// strategyEngine.ts's allowFractionalShares doc comment) - an explicit
-// capability-for-protection trade-off, not a pure risk reduction, so it's
-// opt-in like the sentiment/insider filters rather than always-on like the
-// bucket cap.
-const AUTOPILOT_ALLOW_FRACTIONAL_SHARES_ENABLED =
-  process.env.AUTOPILOT_ALLOW_FRACTIONAL_SHARES === "true";
 
 // Every bucket-representative ticker below (SPY, EFA, TLT, GLD, AMD, NVDA,
 // TSLA) is already part of AUTOPILOT_TICKERS and already fetched every
@@ -244,10 +175,7 @@ const REGIME_BUCKETS: RegimeBucketConfig[] = [
     label: "High-beta growth",
     tickers: ["AMD", "NVDA", "TSLA"],
     smaWindowDays: 200,
-    // Backtest-validated: see backtest-sweep.ts's regime-filter-* variants -
-    // an unvalidated hypothesis until checked against our own tickers, not
-    // accepted as a given just because it was suggested.
-    exempt: process.env.AUTOPILOT_REGIME_EXEMPT_HIGH_BETA !== "false",
+    exempt: AUTOPILOT_REGIME_EXEMPT_HIGH_BETA_DEFAULT,
   },
 ];
 
@@ -269,117 +197,12 @@ const TICKER_TO_BUCKET: Record<string, string> = {
   TSLA: "high_beta_growth",
 };
 
-// Twice the single-ticker cap (maxPositionEquityFraction is 0.2) - allows up
-// to two full-sized positions' worth of concentration in one correlated
-// bucket, but blocks the AMD+NVDA+TSLA-all-at-20%-each scenario. Only bites
-// for multi-ticker buckets (us_broad, high_beta_growth) - the single-ticker
-// buckets never approach 40% since they're already capped at 20% each.
-const AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION = Number.parseFloat(
-  process.env.AUTOPILOT_MAX_BUCKET_EQUITY_FRACTION || "0.4",
-);
-
-// ETF-first tilt: high_beta_growth (AMD/NVDA/TSLA) gets a tighter cap than
-// the other buckets - equal to the single-ticker cap, so the whole bucket
-// combined can never exceed what one full-sized individual position would
-// already be allowed. Doesn't remove these tickers from the universe, just
-// meaningfully reduces how concentrated the bot can get in speculative
-// single names versus the ETF-heavy buckets (us_broad/international/
-// bonds/commodities), which keep the looser 40% default.
-const AUTOPILOT_HIGH_BETA_BUCKET_EQUITY_FRACTION = Number.parseFloat(
-  process.env.AUTOPILOT_HIGH_BETA_BUCKET_EQUITY_FRACTION || "0.2",
-);
-
-const BUCKET_EQUITY_FRACTION_OVERRIDES: Record<string, number> = {
-  high_beta_growth: AUTOPILOT_HIGH_BETA_BUCKET_EQUITY_FRACTION,
-};
-
-// Default safety behavior:
-// normal SELL_SIGNAL should not sell a held position below average entry.
-// STOP_LOSS remains allowed to protect capital.
-const AUTOPILOT_BLOCK_SELL_BELOW_AVG =
-  process.env.AUTOPILOT_BLOCK_SELL_BELOW_AVG !== "false";
-
-const AUTOPILOT_ENABLED_DEFAULT =
-  process.env.AUTOPILOT_ENABLED_DEFAULT === "true";
-
-const STRATEGY_VERSION =
-  process.env.STRATEGY_VERSION ?? "v1.2-confluence-scoring";
-
-const STRATEGY_CONFIG_HASH = createStrategyConfigHash(DEFAULT_STRATEGY_CONFIG);
-
-// Mutually exclusive with the baseline strategy above - never both in the
-// same process. See docs/product/ROADMAP.md Phase 3 and the ETF Rotation
-// live-integration plan: the baseline's 13-ticker universe and rotation's
-// 5-ETF universe overlap (SPY/EFA/TLT/GLD), and neither order idempotency
-// (server.ts's client_order_id, keyed only "TICKER:ACTION") nor position
-// tracking (ticker-keyed only, no strategy attribution) could safely
-// disambiguate two strategies trading the same ticker concurrently.
-const AUTOPILOT_STRATEGY: AutopilotStrategyKind =
-  process.env.AUTOPILOT_STRATEGY === "etf_rotation"
-    ? "etf_rotation"
-    : "baseline";
-
-const ETF_ROTATION_CONFIG_VARIANT_KEY = resolveEtfRotationConfigVariant(
-  process.env.ETF_ROTATION_CONFIG,
-);
-const ETF_ROTATION_ACTIVE_CONFIG: EtfRotationConfig =
-  ETF_ROTATION_CONFIG_VARIANTS[ETF_ROTATION_CONFIG_VARIANT_KEY].config;
-
-const ETF_ROTATION_STRATEGY_VERSION = `etf-rotation-${ETF_ROTATION_CONFIG_VARIANT_KEY}`;
-const ETF_ROTATION_STRATEGY_CONFIG_HASH = createStrategyConfigHash(
-  ETF_ROTATION_ACTIVE_CONFIG,
-);
-
 // Momentum(126 trading days) + SMA(200 trading days) need ~210 trading days
 // of runway before a decision is numerically valid (same WARMUP_BARS
 // convention as backtest-etf-rotation.ts) - far more than the baseline
-// path's 180-calendar-day default. 400 calendar days clears that with
-// weekend/holiday margin to spare.
-const AUTOPILOT_ETF_ROTATION_BARS_DAYS = Number.parseInt(
-  process.env.AUTOPILOT_ETF_ROTATION_BARS_DAYS || "400",
-  10,
-);
+// path's 180-calendar-day default. Not env-derived, so not part of
+// autopilotConfig.ts.
 const ETF_ROTATION_WARMUP_TRADING_DAYS = 210;
-
-// Fails loud at process startup on a bad value (see
-// resolveRampMaxPositionEquityPercent's own doc comment) - unset stays
-// uncapped (current, unchanged behavior); this is the paper-execution ramp
-// gate for the first real BUYs, a sibling of AUTOPILOT_ALLOW_BUY/SELL, not
-// a strategy config.
-const AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT =
-  resolveRampMaxPositionEquityPercent(
-    process.env.AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT,
-  );
-
-// Independent of the baseline strategy's AUTOPILOT_ALLOW_SELL, which stays
-// untouched - this only unblocks the rotation cycle's own liquidate-and-
-// rebuy SELL legs (see EtfRotationExecutionGates.allowRebalanceSells's own
-// doc comment). Off by default, matching every other new gate in this
-// project's history (sentiment/insider filters, regime filter, fractional
-// shares, the ramp cap itself) - explicit user approval required in Render
-// before ever setting this true (2026-07-19 decision, see CLAUDE.md).
-const AUTOPILOT_ALLOW_REBALANCE_SELLS =
-  process.env.AUTOPILOT_ALLOW_REBALANCE_SELLS === "true";
-
-// Always-on guardrail (not opt-in like the ramp cap) - see
-// resolveMaxAllowedPositions's own doc comment for why this exists
-// alongside allowRebalanceSells rather than instead of it.
-const AUTOPILOT_ETF_ROTATION_MAX_POSITIONS = resolveMaxAllowedPositions(
-  process.env.AUTOPILOT_ETF_ROTATION_MAX_POSITIONS,
-  ETF_ROTATION_ACTIVE_CONFIG.holdCount,
-);
-
-// See EtfRotationExecutionGates.maxAllowedPositions's sibling comment on
-// waitForSellFill / etfRotationExecution.ts's file-level 2026-08-04 update
-// for why this exists: a liquidate_existing SELL being merely "accepted"
-// wasn't safe enough for its paired rebuild BUY (a real production 403).
-const {
-  timeoutMs: AUTOPILOT_ETF_ROTATION_SELL_FILL_TIMEOUT_MS,
-  pollIntervalMs: AUTOPILOT_ETF_ROTATION_SELL_FILL_POLL_MS,
-} = resolveEtfRotationSellFillTimingMs(
-  process.env.AUTOPILOT_ETF_ROTATION_SELL_FILL_TIMEOUT_MS,
-  process.env.AUTOPILOT_ETF_ROTATION_SELL_FILL_POLL_MS,
-);
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;

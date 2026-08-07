@@ -232,6 +232,34 @@ real `createAutopilotWorker(...)` call site needs zero changes.
   behavior change for either caller. New direct unit tests cover pagination
   and the error path (`alpacaMarketData.ts` had no test coverage before this).
 - **PR #56**: shrink `server.ts` further if still warranted.
+- **PR #67, "Slice 1" (merged, 2026-08-07)**: extracted the three
+  circuit-breaker/off-target notification blocks out of `runOnce()` into
+  `runCircuitBreakerTripAlert`/`runCircuitBreakerDailyReminder`
+  (`portfolioCircuitBreaker.ts`) and `runEtfOffTargetReminderCheck`
+  (`etfRotationReview.ts`) - pure relocation, verified via the full
+  existing characterization suite passing completely unmodified.
+  `runOnce()` ~547 → ~380 lines; `autopilotWorker.ts` 1261 → 1090 lines.
+  Also added direct unit tests for the trip alert, a real gap this PR
+  found (zero test coverage of any kind existed for a fresh
+  `justTripped: true` transition before this).
+- **"Slice 2" (2026-08-07)**: extracted the ~278-line module-level
+  env-var/config resolution block into `backend/autopilotConfig.ts` -
+  pure relocation, no default value/fail-soft-vs-fail-loud/env-var-name
+  changes. New pure resolver functions (`parseIntWithDefault`/
+  `parseFloatWithDefault`/`resolveAutopilotTickers`/
+  `resolveAutopilotStrategy`) matching the codebase's own established
+  `resolveXxx(raw, ...)` convention, directly unit-tested with zero
+  env-stubbing needed. `WORKER_OWNER_ID`/`TICKER_TO_BUCKET`/`REGIME_BUCKETS`
+  (mostly static domain data)/`ETF_ROTATION_WARMUP_TRADING_DAYS` (hardcoded,
+  not env-derived) deliberately stayed in `autopilotWorker.ts` - see
+  `autopilotConfig.ts`'s own file-header comment for the exact boundary.
+  Also found and removed, as a separate commit: `SENTIMENT_CACHE_TTL_MS`/
+  `INSIDER_CACHE_TTL_MS`/`INSIDER_SELL_CLUSTER_THRESHOLD`, dead code
+  orphaned in `autopilotWorker.ts` since the sentiment/insider caching
+  logic moved to `analyzeTicker.ts` in PR #54 (which has its own live
+  copies). `runOnce()`'s own line count is unaffected by this slice (the
+  block moved was outside `runOnce()`); `autopilotWorker.ts` overall:
+  1090 → 910 lines.
 
 Also noted, deliberately not acted on: `AutopilotDecisionLog` (this file) is
 structurally similar to but independently-evolved from `decisionJournal.ts`'s
