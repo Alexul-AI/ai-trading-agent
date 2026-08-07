@@ -32,6 +32,12 @@ vi.stubEnv("AUTOPILOT_STRATEGY", "etf_rotation");
 vi.stubEnv("AUTOPILOT_EXECUTE_TRADES", "false");
 vi.stubEnv("APCA_API_KEY_ID", "test-key-id");
 vi.stubEnv("APCA_API_SECRET_KEY", "test-secret-key");
+// Pinned to UTC (2026-08-07) - this file tests reminder isolation/ordering,
+// not the Jerusalem-local day-boundary itself (see
+// autopilotWorker.characterization.reminderLocalDayCadence.test.ts for
+// that), and every `today`/`month` value below is computed via the
+// UTC-based todayDateKey()/currentMonthKey() helpers.
+vi.stubEnv("AUTOPILOT_REMINDER_TIMEZONE", "UTC");
 
 const { createAutopilotWorker } = await import("./autopilotWorker.js");
 

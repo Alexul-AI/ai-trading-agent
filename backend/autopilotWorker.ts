@@ -36,6 +36,7 @@ import {
   deriveEtfRotationOffTargetState,
   shouldSendEtfRotationOffTargetReminder,
 } from "./etfRotationReview.js";
+import { resolveTimeZone, toLocalDateKey } from "./src/utils/time.js";
 import {
   analyzeTicker,
   evaluateSentimentVeto,
@@ -158,6 +159,20 @@ const AUTOPILOT_COOLDOWN_MINUTES = Number.parseInt(
 const AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES = Number.parseInt(
   process.env.AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES || "30",
   10,
+);
+
+// Timezone the daily circuit-breaker/off-target reminders' "once per
+// calendar day" boundary is computed in (2026-08-07) - previously always
+// UTC (lastRunAt.slice(0, 10)), which meant a reminder just after UTC
+// midnight read as a same-night "duplicate" to a user in a non-UTC
+// timezone even though it was technically a new UTC day. Defaults to
+// Asia/Jerusalem (this deployment's actual user), not UTC, since the whole
+// point is for "once a day" to match the day the user experiences it on.
+// Cosmetic only - see resolveTimeZone's own doc comment for why an invalid
+// value fails soft to UTC instead of crashing the worker.
+const AUTOPILOT_REMINDER_TIMEZONE = resolveTimeZone(
+  process.env.AUTOPILOT_REMINDER_TIMEZONE,
+  "Asia/Jerusalem",
 );
 
 const ALPACA_DATA_FEED = process.env.ALPACA_DATA_FEED || "iex";
@@ -884,7 +899,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       // the other end-of-cycle Telegram sends below) - this block used to
       // share fate with the whole runOnce() call, unlike the ETF off-target
       // block below, which already had its own isolation since PR #64.
-      const todayDateKey = lastRunAt.slice(0, 10);
+      const todayDateKey = toLocalDateKey(lastRunAt, AUTOPILOT_REMINDER_TIMEZONE);
       if (
         shouldSendDailyReminder(
           circuitBreakerUpdate.state.tripped,
@@ -1225,6 +1240,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       maxSellFraction: clampFraction(AUTOPILOT_MAX_SELL_FRACTION),
       blockSellBelowAverageEntry: AUTOPILOT_BLOCK_SELL_BELOW_AVG,
       telegramCooldownMinutes: AUTOPILOT_TELEGRAM_COOLDOWN_MINUTES,
+      reminderTimeZone: AUTOPILOT_REMINDER_TIMEZONE,
       lastJournalRunId,
       lastRunAt,
       lastError,

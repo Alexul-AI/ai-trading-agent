@@ -183,6 +183,7 @@ export interface AutopilotStatus {
   maxSellFraction: number;
   blockSellBelowAverageEntry: boolean;
   telegramCooldownMinutes: number;
+  reminderTimeZone: string;
   lastJournalRunId: string | null;
   lastRunAt: string | null;
   lastError: string | null;
