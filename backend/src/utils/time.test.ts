@@ -27,13 +27,16 @@ describe("toLocalDateKey", () => {
     expect(toLocalDateKey("2026-08-07T13:45:00.000Z", "Asia/Jerusalem")).toBe("2026-08-07");
   });
 
-  // Israel Daylight Time (IDT, UTC+3) in August - the exact real-world
-  // scenario from the 2026-08-06/07 QQQ off-target reminders: a timestamp
-  // just after UTC midnight is already the *next* calendar day in Jerusalem
-  // local time, not the same day UTC would report.
-  it("reports the next calendar day in Asia/Jerusalem (IDT, UTC+3) shortly after UTC midnight", () => {
-    expect(toLocalDateKey("2026-08-07T00:36:00.000Z", "UTC")).toBe("2026-08-07");
-    expect(toLocalDateKey("2026-08-07T00:36:00.000Z", "Asia/Jerusalem")).toBe("2026-08-07");
+  // Israel Daylight Time (IDT, UTC+3) in August - the disagreement window
+  // (Jerusalem's local midnight, at UTC 21:00, falls a full 3 hours before
+  // UTC's own midnight) is *before* UTC rolls over, not after. 21:30 UTC on
+  // Aug 6 is already 00:30 Aug 7 in Jerusalem, while UTC still reads Aug 6.
+  // (00:36 UTC on Aug 7 - the exact real-world timestamp of the second
+  // 2026-08-06/07 QQQ off-target reminder - is *not* a disagreement case:
+  // by then both UTC and Jerusalem already agree it's Aug 7.)
+  it("reports the next calendar day in Asia/Jerusalem (IDT, UTC+3) while UTC's own day hasn't rolled over yet", () => {
+    expect(toLocalDateKey("2026-08-06T21:30:00.000Z", "UTC")).toBe("2026-08-06");
+    expect(toLocalDateKey("2026-08-06T21:30:00.000Z", "Asia/Jerusalem")).toBe("2026-08-07");
   });
 
   // Israel Standard Time (IST, UTC+2) in January - the disagreement window
