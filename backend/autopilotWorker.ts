@@ -19,6 +19,10 @@ import {
 } from "./analyzeTicker.js";
 import { createWaitForSellFill } from "./etfRotationExecution.js";
 import {
+  isSignalReadyDecision,
+  summarizeAutopilotDecisions,
+} from "./autopilotDecisionsSummary.js";
+import {
   APCA_API_KEY_ID,
   APCA_API_SECRET_KEY,
   AUTOPILOT_INTERVAL_MS,
@@ -62,6 +66,7 @@ export {
   mapEtfRotationExecutionStatusToRebalanceStatus,
   evaluateSentimentVeto,
   evaluateInsiderVeto,
+  isSignalReadyDecision,
 };
 import {
   updatePortfolioCircuitBreaker,
@@ -213,19 +218,6 @@ function getErrorMessage(error: unknown): string {
   } catch {
     return "Unknown error";
   }
-}
-
-export function isSignalReadyDecision(decision: AutopilotDecisionLog): boolean {
-  if (typeof decision.isSignalReady === "boolean") {
-    return decision.isSignalReady;
-  }
-
-  return (
-    decision.action !== "HOLD" &&
-    decision.confidence >= AUTOPILOT_MIN_CONFIDENCE &&
-    (decision.suggestedShares > 0 || (decision.suggestedNotional ?? 0) > 0) &&
-    !decision.skippedReason
-  );
 }
 
 async function fetchAlpacaBarsUncached(
@@ -653,22 +645,12 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       lastDecisions = decisions;
       lastRunAt = new Date().toISOString();
 
-      const signalReady = decisions.filter(isSignalReadyDecision);
-      const signalCandidates = decisions.filter(
-        (decision) => decision.action === "BUY" || decision.action === "SELL",
-      );
-      const dryRunSignals = signalReady.filter(
-        (decision) => decision.executionStatus === "dry_run",
-      );
-      const executedSignals = signalReady.filter(
-        (decision) =>
-          decision.executed || decision.executionStatus === "executed",
-      );
-
-      runSignalReadyCount = signalReady.length;
-      runSignalBlockedCount = signalCandidates.length - signalReady.length;
-      runDryRunCount = dryRunSignals.length;
-      runExecutedCount = executedSignals.length;
+      const decisionsSummary = summarizeAutopilotDecisions(decisions);
+      const signalReady = decisionsSummary.signalReady;
+      runSignalReadyCount = decisionsSummary.signalReadyCount;
+      runSignalBlockedCount = decisionsSummary.signalBlockedCount;
+      runDryRunCount = decisionsSummary.dryRunCount;
+      runExecutedCount = decisionsSummary.executedCount;
 
       // See runCircuitBreakerDailyReminder/runEtfOffTargetReminderCheck's
       // own doc comments (portfolioCircuitBreaker.ts/etfRotationReview.ts)
