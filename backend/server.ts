@@ -701,21 +701,38 @@ async function executeSafeTrade(
       orderId,
     });
 
-    broadcastSSE({
-      type: "trade",
-      data: {
-        ticker,
-        action,
-        shares: finalShares,
-        notional: finalNotional,
-        price: estimatedPrice,
-        orderId,
-      },
-    });
+    // Best-effort only: the broker has already accepted this order by this
+    // point (createOrder succeeded, or the duplicate_client_order_id branch
+    // above confirmed it via getOrderByClientId) - a notification failure
+    // here must never turn an already-successful order into a reported
+    // failure. Without this, the outer catch below would convert a thrown
+    // sendTelegramAlert into { status: "error" }, which callers like
+    // etfRotationRepair.ts's mapExecuteSafeTradeResultToLegOutcome treat as
+    // "rejected" - misreporting a real, broker-accepted order as rejected
+    // (same risk class as the repair endpoint's own notification-isolation
+    // fix, one layer deeper).
+    try {
+      broadcastSSE({
+        type: "trade",
+        data: {
+          ticker,
+          action,
+          shares: finalShares,
+          notional: finalNotional,
+          price: estimatedPrice,
+          orderId,
+        },
+      });
 
-    await sendTelegramAlert(
-      `ORDER ${action} ${quantityLabel} ${ticker} @ approx $${estimatedPrice}`,
-    );
+      await sendTelegramAlert(
+        `ORDER ${action} ${quantityLabel} ${ticker} @ approx $${estimatedPrice}`,
+      );
+    } catch (notifyError) {
+      console.warn(
+        "[TRADE] Notification failed after a successful order:",
+        notifyError,
+      );
+    }
 
     return {
       status: "success",
