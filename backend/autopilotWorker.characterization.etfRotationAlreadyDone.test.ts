@@ -6,13 +6,12 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   assertRealDataFilesUnchanged,
   currentMonthKey,
-  makeDailyBarsSeries,
   makePortfolioSnapshot,
   makeTempDataDir,
   makeThrowingExecuteSafeTrade,
+  makeThrowingFetchStub,
   makeThrowingGetOrderStatus,
   snapshotRealDataFiles,
-  stubFetchForBarsByTicker,
   todayDateKey,
   type RealDataFileSnapshot,
 } from "./autopilotWorker.characterization.helpers.js";
@@ -57,11 +56,13 @@ describe("autopilotWorker characterization: ETF Rotation already-done-this-month
       "utf-8",
     );
 
-    // Only 5 bars per ticker - deliberately short. The already-done-this-month
-    // gate is checked before the 210-trading-day warmup check, so this
-    // proves the gate short-circuits before that check even matters.
-    const bars = makeDailyBarsSeries(5, today);
-    stubFetchForBarsByTicker({ SPY: bars, QQQ: bars, EFA: bars, TLT: bars, GLD: bars });
+    // A throwing fetch stub, not a canned bars series (2026-08-08): the
+    // already-done-this-month gate now short-circuits BEFORE any bars fetch
+    // at all (etfRotationCycle.ts's cheap wall-clock pre-check), so this
+    // proves market data is never touched - a strictly stronger guarantee
+    // than the previous version, which only proved the gate short-circuited
+    // before the 210-trading-day warmup check could matter.
+    makeThrowingFetchStub();
 
     const executeSafeTrade = makeThrowingExecuteSafeTrade();
 

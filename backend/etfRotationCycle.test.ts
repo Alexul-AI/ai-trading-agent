@@ -1,8 +1,10 @@
+import { promises as fs } from "fs";
 import path from "path";
 
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  currentMonthKey,
   makeDailyBarsSeries,
   makePortfolioSnapshot,
   makeTempDataDir,
@@ -220,8 +222,90 @@ describe("runEtfRotationCycle: real accepted-outcome bookkeeping", () => {
     // cycle's own recordRebalancePlanned/recordRebalanceExecuting/
     // recordRebalanceTerminal calls should have left the state file in a
     // fully resolved (not stuck "executing") state.
-    const { promises: fs } = await import("fs");
     const state = JSON.parse(await fs.readFile(etfRotationStateFilePath, "utf-8"));
     expect(state.status).toBe("executed");
+  });
+});
+
+describe("runEtfRotationCycle: cheap already-done-this-month short-circuit (2026-08-08)", () => {
+  it("never calls fetchBars when this month is already terminal-successful, and sources price from the portfolio snapshot", async () => {
+    const tempDir = await makeTempDataDir("etf-rotation-cycle-already-done-");
+    const today = todayDateKey();
+    const month = currentMonthKey();
+    const etfRotationStateFilePath = path.join(tempDir, "etf-rotation-worker-state.json");
+
+    await fs.writeFile(
+      etfRotationStateFilePath,
+      JSON.stringify({
+        lastRebalanceDateKey: today,
+        rebalanceMonthKey: month,
+        status: "executed",
+      }),
+      "utf-8",
+    );
+
+    const portfolio = makePortfolioSnapshot({
+      equity: 10_000,
+      balance: 10_000,
+      positions: {
+        SPY: { shares: 5, avgPrice: 100, currentPrice: 123.45, pnl: 0, pnlPercent: 0 },
+      },
+    });
+
+    // Throws if ever invoked - proves the bar-fetch is genuinely skipped,
+    // not just that its result happened to go unused.
+    const fetchBars = vi.fn(async (): Promise<ReturnType<typeof makeDailyBarsSeries>> => {
+      throw new Error("fetchBars should never be called - already done this month.");
+    });
+
+    const decisions = await runEtfRotationCycle({
+      portfolio,
+      config: ETF_ROTATION_MVP_BASELINE_CONFIG,
+      configVariantKey: "baseline-2",
+      barsDays: 400,
+      warmupTradingDays: 210,
+      executionGates: {
+        executeTradesEnabled: true,
+        allowBuy: true,
+        allowRebalanceSells: true,
+        maxAllowedPositions: Number.POSITIVE_INFINITY,
+      },
+      fetchBars,
+      broadcastSSE: () => {},
+      executeSafeTrade: vi.fn(async (): Promise<ExecuteSafeTradeResult> => {
+        throw new Error("executeSafeTrade should never be called - already done this month.");
+      }),
+      getPortfolioSnapshot: async () => portfolio,
+      etfRotationStateFilePath,
+      etfRotationOrderAuditLogFilePath: path.join(tempDir, "etf-rotation-order-audit.jsonl"),
+    });
+
+    expect(fetchBars).not.toHaveBeenCalled();
+    expect(decisions).toHaveLength(UNIVERSE.length);
+
+    const byTicker = new Map(decisions.map((d) => [d.ticker, d]));
+
+    for (const ticker of UNIVERSE) {
+      const decision = byTicker.get(ticker);
+      expect(decision?.reasonType).toBe("NOT_REBALANCE_DAY");
+      expect(decision?.action).toBe("HOLD");
+      expect(decision?.executionStatus).toBe("not_attempted");
+      expect(decision?.executed).toBe(false);
+      expect(decision?.reason).toContain("skipped market-data fetch");
+    }
+
+    // Held ticker (SPY) gets a real price from the portfolio snapshot, not
+    // a bare 0 - the observability improvement over the state_corrupt/
+    // stale_executing blocks above, which have no such shortcut available.
+    expect(byTicker.get("SPY")?.price).toBe(123.45);
+
+    // Unheld universe tickers (no position in the snapshot) fall back to 0
+    // - consistent with the other pre-bars early-return blocks, not a
+    // regression introduced by this change.
+    expect(byTicker.get("QQQ")?.price).toBe(0);
+
+    // The state file's own month must actually match "now" for this test
+    // to be a meaningful proof, not an accident of a stale fixture.
+    expect(month).toBe(today.slice(0, 7));
   });
 });

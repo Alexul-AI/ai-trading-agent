@@ -106,6 +106,16 @@ export function makeThrowingGetOrderStatus() {
   });
 }
 
+/** Same "prove it's genuinely unreached" convention as makeThrowingExecuteSafeTrade, for the ambient global `fetch` (fetchAlpacaBarsUncached calls it directly - see stubFetchForBarsByTicker above). Use in a scenario that should never fetch market data at all, not just skip a specific downstream decision. */
+export function makeThrowingFetchStub(): void {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      throw new Error("fetch should never be called in this scenario.");
+    }),
+  );
+}
+
 const REAL_DATA_FILES = [
   "autopilot-decisions.jsonl",
   "autopilot-worker.lock",
