@@ -427,14 +427,28 @@ export async function performEtfRotationRepairMissingBuy(
     legOutcome.reason ? ` (${legOutcome.reason})` : ""
   }. Requested ${requestedShares} shares. Admin reason: ${params.reason}`;
 
-  params.broadcastSSE({
-    type: "notification",
-    level: legOutcome.outcome === "accepted" ? "info" : "error",
-    message: notifyMessage,
-  });
+  // Best-effort only: the broker outcome above is already decided and
+  // audit-logged by this point, so a notification failure (e.g. Telegram
+  // down) must never turn an already-resolved outcome into a thrown
+  // exception - the caller (server.ts) would otherwise report a false
+  // "endpoint failed" 500 for a repair that may well have been accepted,
+  // risking a confused manual retry even though the prior-accepted-repair
+  // check would actually block a real double-submit.
+  try {
+    params.broadcastSSE({
+      type: "notification",
+      level: legOutcome.outcome === "accepted" ? "info" : "error",
+      message: notifyMessage,
+    });
 
-  if (params.sendTelegramAlert) {
-    await params.sendTelegramAlert(notifyMessage);
+    if (params.sendTelegramAlert) {
+      await params.sendTelegramAlert(notifyMessage);
+    }
+  } catch (error) {
+    console.warn(
+      `[ETF Rotation Repair] Notification failed after a resolved outcome (${legOutcome.outcome}) for ${ticker}:`,
+      error,
+    );
   }
 
   return {

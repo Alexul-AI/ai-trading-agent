@@ -429,6 +429,51 @@ describe("performEtfRotationRepairMissingBuy", () => {
     });
   });
 
+  it("a notification failure after an accepted outcome does not turn a resolved repair into a thrown exception", async () => {
+    // The broker outcome and its audit event are already committed by the
+    // time notification runs - a down Telegram must not make the caller
+    // (server.ts) report a false 500 for a repair that may well have gone
+    // through, which could provoke a confused manual retry.
+    await withTempDataFiles(async (paths) => {
+      await seedRealIncidentState(paths.statePath);
+      await seedRealIncidentAuditLog(paths.auditLogPath);
+
+      const executeSafeTrade = vi.fn(
+        async (): Promise<ExecuteSafeTradeResult> => ({
+          status: "success",
+          order: { id: "broker-order-repair-2" },
+        }),
+      );
+      const sendTelegramAlert = vi.fn(async () => {
+        throw new Error("Telegram is down.");
+      });
+
+      const result = await performEtfRotationRepairMissingBuy({
+        ...baseOrchestratorParams(paths),
+        executeSafeTrade,
+        sendTelegramAlert,
+      });
+
+      expect(sendTelegramAlert).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({
+        kind: "resolved",
+        outcome: "accepted",
+        ticker: "QQQ",
+        rebalanceMonthKey: MONTH,
+        targetWeightPercent: 50,
+        requestedShares: 2,
+        brokerOrderId: "broker-order-repair-2",
+        reason: undefined,
+      });
+
+      const auditLines = (await readAuditLines(paths.auditLogPath)).slice(1);
+      expect(auditLines.map((e) => e.type)).toEqual([
+        "REPAIR_MISSING_BUY_ATTEMPTED",
+        "ORDER_ACCEPTED",
+      ]);
+    });
+  });
+
   it("repeated successful repair for the same rebalanceMonthKey+ticker: blocks before calling executeSafeTrade", async () => {
     await withTempDataFiles(async (paths) => {
       await seedRealIncidentState(paths.statePath);
@@ -540,6 +585,42 @@ describe("performEtfRotationRepairMissingBuy", () => {
       expect(auditLines[1]).toMatchObject({
         legType: "repair",
         error: "Request failed with status code 403",
+      });
+    });
+  });
+
+  it("a notification failure after a rejected outcome also does not turn a resolved repair into a thrown exception", async () => {
+    await withTempDataFiles(async (paths) => {
+      await seedRealIncidentState(paths.statePath);
+      await seedRealIncidentAuditLog(paths.auditLogPath);
+
+      const executeSafeTrade = vi.fn(
+        async (): Promise<ExecuteSafeTradeResult> => ({
+          status: "error",
+          reason: "Request failed with status code 403",
+          classification: "definitive_rejection",
+        }),
+      );
+      const sendTelegramAlert = vi.fn(async () => {
+        throw new Error("Telegram is down.");
+      });
+
+      const result = await performEtfRotationRepairMissingBuy({
+        ...baseOrchestratorParams(paths),
+        executeSafeTrade,
+        sendTelegramAlert,
+      });
+
+      expect(sendTelegramAlert).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({
+        kind: "resolved",
+        outcome: "rejected",
+        ticker: "QQQ",
+        rebalanceMonthKey: MONTH,
+        targetWeightPercent: 50,
+        requestedShares: 2,
+        brokerOrderId: undefined,
+        reason: "Request failed with status code 403",
       });
     });
   });
