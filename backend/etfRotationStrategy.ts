@@ -17,6 +17,24 @@ export interface EtfRotationConfig {
   momentumLookbackDays: number;
   trendFilterSmaPeriod: number;
   holdCount: number;
+  /**
+   * Optional, off by default (2026-08-08, small-capital tranche design) -
+   * mirrors strategyEngine.ts's identically-named StrategyConfig field.
+   * When a BUY slot's whole-share sizing (computeRebalanceOrders) would
+   * floor to 0, and this is true, and the pre-capped dollar amount clears
+   * minFractionalNotionalUsd, a notional (fractional-dollar) order is used
+   * instead of skipping the slot. Neither shipped config sets this -
+   * unreachable from the live worker until a future, separate PR wires it
+   * into etfRotationCycle.ts.
+   */
+  allowFractionalShares?: boolean;
+  /**
+   * Alpaca's own minimum fractional order is $1 notional; this repo's
+   * convention (matching strategyEngine.ts's identical field) is a
+   * stricter $5 floor to avoid dust-sized orders. Only consulted when
+   * allowFractionalShares is true.
+   */
+  minFractionalNotionalUsd?: number;
 }
 
 /**
@@ -229,6 +247,13 @@ export interface RebalanceOrder {
   shares: number;
   /** The target's weightPercent for a BUY (undefined for a SELL, which always fully liquidates). */
   targetWeightPercent?: number;
+  /**
+   * Set only for a fractional-fallback BUY (allowFractionalShares) whose
+   * whole-share sizing floored to 0 - shares is 0 in this case, and this
+   * dollar amount drives sizing instead. Mirrors StrategyDecision's
+   * suggestedNotional field (strategyEngine.ts).
+   */
+  notional?: number;
 }
 
 /**
@@ -250,6 +275,8 @@ export function computeRebalanceOrders(
   currentSharesByTicker: Map<string, number>,
   currentPriceByTicker: Map<string, number>,
   universe: string[],
+  allowFractionalShares = false,
+  minFractionalNotionalUsd = 5,
 ): RebalanceOrder[] {
   const orders: RebalanceOrder[] = [];
 
@@ -266,14 +293,31 @@ export function computeRebalanceOrders(
 
     const targetDollars = (target.weightPercent / 100) * currentEquity;
     const shares = Math.floor(targetDollars / price);
-    if (shares <= 0) continue;
 
-    orders.push({
-      ticker: target.ticker,
-      action: "BUY",
-      shares,
-      targetWeightPercent: target.weightPercent,
-    });
+    if (shares > 0) {
+      orders.push({
+        ticker: target.ticker,
+        action: "BUY",
+        shares,
+        targetWeightPercent: target.weightPercent,
+      });
+      continue;
+    }
+
+    // Fractional fallback (2026-08-08, small-capital tranche design) -
+    // mirrors strategyEngine.ts's identical fallback shape: only reached
+    // when whole-share sizing floored to exactly 0, fractional mode is on,
+    // and the same targetDollars figure (not a separately-derived one)
+    // clears the notional floor.
+    if (allowFractionalShares && targetDollars >= minFractionalNotionalUsd) {
+      orders.push({
+        ticker: target.ticker,
+        action: "BUY",
+        shares: 0,
+        notional: Number(targetDollars.toFixed(2)),
+        targetWeightPercent: target.weightPercent,
+      });
+    }
   }
 
   return orders;
