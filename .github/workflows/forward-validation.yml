@@ -42,11 +42,26 @@ jobs:
         env:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+      # Adjusted-shadow track (2026-08-08, PRs #76-79's decision plan) -
+      # same simulation engine and read criteria (runForwardValidationTrack,
+      # shared with the raw-production step above), but under
+      # adjustment=all bars, its own separate anchor (2026-08-08), and its
+      # own separate output files - never touches the raw-production
+      # track's own clock/files above. Deliberately NOT continue-on-error:
+      # this is now part of the evidence pipeline the September read
+      # depends on, so a failure here must fail the job and trigger the
+      # same Telegram alert below as a raw-production failure would.
+      - name: Run adjusted-shadow forward-validation script
+        run: npm run test:backtest-etf-rotation-forward-validation-adjusted-shadow
+        env:
+          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
       # data/ is gitignored repo-wide (research reports are normally
-      # local-only, see CLAUDE.md) - these two files are a deliberate,
+      # local-only, see CLAUDE.md) - these four files are a deliberate,
       # narrow exception via `add -f`, since the entire point of this
       # automation is a log the user can actually read in the repo, not
-      # just something a CI job quietly reads for itself.
+      # just something a CI job quietly reads for itself. One commit covers
+      # both tracks' updates from this run, not two separate commits.
       - name: Commit the updated report/log if anything changed
         working-directory: .
         run: |
@@ -54,7 +69,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f \
             backend/data/backtest-reports/etf-rotation/etf-rotation-forward-validation-report.md \
-            backend/data/backtest-reports/etf-rotation/etf-rotation-forward-validation-log.csv
+            backend/data/backtest-reports/etf-rotation/etf-rotation-forward-validation-log.csv \
+            backend/data/backtest-reports/etf-rotation/etf-rotation-forward-validation-adjusted-shadow-report.md \
+            backend/data/backtest-reports/etf-rotation/etf-rotation-forward-validation-adjusted-shadow-log.csv
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
