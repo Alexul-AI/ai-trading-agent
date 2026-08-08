@@ -18,6 +18,7 @@
     "test:backtest-etf-rotation-forward-validation": "tsx backtest-etf-rotation-forward-validation.ts",
     "test:backtest-etf-rotation-forward-validation-adjusted-shadow": "tsx backtest-etf-rotation-forward-validation-adjusted-shadow.ts",
     "test:backtest-etf-rotation-adjustment-comparison": "tsx backtest-etf-rotation-adjustment-comparison.ts",
+    "test:backtest-etf-rotation-small-tranche-simulation": "tsx backtest-etf-rotation-small-tranche-simulation.ts",
     "export-realized-pnl": "tsx export-realized-pnl.ts",
     "test": "vitest run"
   },
