@@ -93,6 +93,15 @@ export type EtfRotationSubmitOrderLeg = (
   ticker: string,
   action: "BUY" | "SELL",
   requestedShares: number,
+  /**
+   * Set only for a fractional-fallback BUY leg (order.notional in
+   * etfRotationStrategy.ts's RebalanceOrder) - mirrors executeSafeTrade's
+   * (server.ts) existing rawNotional param. Optional so every existing
+   * implementation (the real one in etfRotationCycle.ts, and every test
+   * fixture) keeps working unchanged - none of them pass or read a 4th
+   * argument today, and this PR does not wire any live caller to set it.
+   */
+  requestedNotional?: number,
 ) => Promise<EtfRotationSubmitOrderLegResult>;
 
 // "filled": safe to submit the paired rebuild BUY. "definitively_not_filled":
@@ -252,8 +261,12 @@ export interface EtfRotationLegOutcome {
   action: "BUY" | "SELL";
   legType: EtfRotationOrderLegType;
   requestedQty: number;
+  /** Set only for a fractional-fallback BUY leg (order.notional) - mirrors requestedQty for the dollar-denominated case. */
+  requestedNotional?: number;
   /** The actually-attempted quantity, which may be less than requestedQty for a cash-resized BUY leg. Absent if never attempted (blocked). */
   submittedQty?: number;
+  /** Set only for an attempted fractional-fallback BUY leg - mirrors submittedQty for the dollar-denominated case. */
+  submittedNotional?: number;
   brokerOrderId?: string;
   error?: string;
   /** Only set for blockedOrders - why this leg was never attempted. */
@@ -353,6 +366,24 @@ export function computeRampMaxShares(
     0,
     Math.floor((rampMaxPositionEquityPercent / 100) * equity / price),
   );
+}
+
+/**
+ * Dollar-denominated sibling of computeRampMaxShares, for a fractional-
+ * fallback BUY leg (order.notional set - see etfRotationStrategy.ts's
+ * computeRebalanceOrders). Simpler than the share version, not more
+ * complex - no price division/floor step, matching the same "dollar
+ * ceilings are simpler than share ceilings" shape as
+ * src/strategy/portfolioSafety.ts's getSafeBuyNotionalForBucketCap vs.
+ * getSafeBuySharesForBucketCap. `undefined` means uncapped, same
+ * convention as computeRampMaxShares.
+ */
+export function computeRampMaxNotional(
+  equity: number,
+  rampMaxPositionEquityPercent: number | undefined,
+): number {
+  if (rampMaxPositionEquityPercent === undefined) return Infinity;
+  return Math.max(0, (rampMaxPositionEquityPercent / 100) * equity);
 }
 
 /**
@@ -471,6 +502,7 @@ export async function executeEtfRotationOrders(
       action: order.action,
       legType: deriveLegType(order.action, hasPairedOpposite),
       requestedQty: order.shares,
+      requestedNotional: order.notional,
     };
   }
 
@@ -524,9 +556,11 @@ export async function executeEtfRotationOrders(
   async function attemptLeg(
     order: RebalanceOrder,
     submittedQty: number,
+    submittedNotional?: number,
   ): Promise<void> {
     const outcome = makeOutcome(order);
     outcome.submittedQty = submittedQty;
+    outcome.submittedNotional = submittedNotional;
 
     await appendAuditEvent({
       type: "ORDER_SUBMITTED",
@@ -538,12 +572,14 @@ export async function executeEtfRotationOrders(
       legType: outcome.legType,
       requestedQty: order.shares,
       submittedQty,
+      requestedNotional: order.notional,
+      submittedNotional,
     });
 
     let legResult: EtfRotationSubmitOrderLegResult;
 
     try {
-      legResult = await submitOrderLeg(order.ticker, order.action, submittedQty);
+      legResult = await submitOrderLeg(order.ticker, order.action, submittedQty, submittedNotional);
     } catch (error) {
       // submitOrderLeg is contractually required to classify and never
       // throw - but if it does anyway, treat it the safest possible way:
@@ -567,6 +603,8 @@ export async function executeEtfRotationOrders(
         legType: outcome.legType,
         requestedQty: order.shares,
         submittedQty,
+        requestedNotional: order.notional,
+        submittedNotional,
         error: outcome.error,
       });
       return;
@@ -591,6 +629,8 @@ export async function executeEtfRotationOrders(
         legType: outcome.legType,
         requestedQty: order.shares,
         submittedQty,
+        requestedNotional: order.notional,
+        submittedNotional,
         error: outcome.error,
       });
       return;
@@ -611,6 +651,8 @@ export async function executeEtfRotationOrders(
       legType: outcome.legType,
       requestedQty: order.shares,
       submittedQty,
+      requestedNotional: order.notional,
+      submittedNotional,
       brokerOrderId: outcome.brokerOrderId,
     });
   }
@@ -792,6 +834,56 @@ export async function executeEtfRotationOrders(
         ...makeOutcome(order),
         blockReason: "No known current price for this ticker - cannot size or submit.",
       });
+      continue;
+    }
+
+    // Fractional-fallback BUY leg (etfRotationStrategy.ts's
+    // computeRebalanceOrders, order.notional set) - every ceiling below is
+    // dollar-based, mirroring the whole-share path's ramp-then-cash
+    // sequential staging one block down so a block can still be
+    // attributed to whichever ceiling actually bound. Unreachable from the
+    // live worker today (no shipped config sets allowFractionalShares).
+    if (order.notional !== undefined) {
+      const rampMaxNotional = computeRampMaxNotional(
+        refreshedSnapshot.equity,
+        executionGates.rampMaxPositionEquityPercent,
+      );
+      const rampCappedNotional = Math.min(order.notional, rampMaxNotional);
+
+      if (rampCappedNotional <= 0) {
+        blockedOrders.push({
+          ...makeOutcome(order),
+          blockReason: `Blocked by AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT=${executionGates.rampMaxPositionEquityPercent} (wanted $${order.notional.toFixed(2)}, ramp cap allows $0).`,
+        });
+        continue;
+      }
+
+      const sizedNotional = Number(
+        Math.min(rampCappedNotional, availableCash).toFixed(2),
+      );
+
+      if (sizedNotional <= 0) {
+        blockedOrders.push({
+          ...makeOutcome(order),
+          blockReason: `Insufficient available cash after SELL legs settled (wanted $${rampCappedNotional.toFixed(2)}, can afford $0).`,
+        });
+        continue;
+      }
+
+      const acceptedCountBefore = acceptedOrders.length;
+      const ambiguousCountBefore = ambiguousOrders.length;
+
+      await attemptLeg(order, 0, sizedNotional);
+
+      if (
+        acceptedOrders.length > acceptedCountBefore ||
+        ambiguousOrders.length > ambiguousCountBefore
+      ) {
+        availableCash -= sizedNotional;
+        if (opensNewPosition) {
+          openPositionTickers.add(order.ticker);
+        }
+      }
       continue;
     }
 
