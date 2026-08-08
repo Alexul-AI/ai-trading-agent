@@ -45,7 +45,18 @@ export type EtfRotationOrderAuditEventType =
   // REBALANCE_MANUALLY_CLEARED: ticker/side are left unset and the full
   // per-ticker detail goes in `reason` instead, since one reminder can
   // cover multiple missing legs at once.
-  | "OFF_TARGET_REMINDER_SENT";
+  | "OFF_TARGET_REMINDER_SENT"
+  // Emitted by the manual repair-missing-buy endpoint (server.ts,
+  // 2026-08-08) right before calling executeSafeTrade - mirrors
+  // etfRotationExecution.ts's own ORDER_SUBMITTED-then-outcome pattern
+  // (attemptLeg), just under a repair-specific name since this event's
+  // `reason` field carries the admin's stated reason for the repair, not
+  // an error detail. The actual outcome is logged afterward via the
+  // existing ORDER_ACCEPTED/ORDER_REJECTED/ORDER_AMBIGUOUS types with
+  // legType: "repair" (see EtfRotationOrderLegType below) - deliberately
+  // not a new combined "RESOLVED"-with-outcome-field type, since this log
+  // has never used that shape anywhere else.
+  | "REPAIR_MISSING_BUY_ATTEMPTED";
 
 // Audit-only classification of why a leg exists - never drives any
 // execution decision (design doc §11's Stage 2A resolution). Derived at
@@ -55,7 +66,15 @@ export type EtfRotationOrderLegType =
   | "liquidate_existing"
   | "rebuild_target"
   | "open_new"
-  | "exit_removed";
+  | "exit_removed"
+  // A manually-triggered repair BUY (server.ts's
+  // POST /api/autopilot/etf-rotation/repair-missing-buy), never assigned by
+  // deriveLegType below - distinguishes a repair leg's ORDER_ACCEPTED/
+  // REJECTED/AMBIGUOUS event from an ordinary rebalance-cycle leg's, so the
+  // "was there already a successful repair for this rebalanceMonthKey+ticker"
+  // check (etfRotationRepair.ts's hasAcceptedPriorRepair) can find it
+  // unambiguously.
+  | "repair";
 
 export interface EtfRotationOrderAuditEvent {
   type: EtfRotationOrderAuditEventType;
