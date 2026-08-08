@@ -61,3 +61,50 @@ jobs:
             git commit -m "chore: append ETF rotation forward-validation data point [skip ci]"
             git push
           fi
+      # This pipeline feeds the candidate-hold3 promotion decision (see
+      # GOLIVE_CRITERIA.md/ROADMAP.md's 3+/6+ rebalance-cycle read
+      # criteria) - it already failed silently once (2026-07-28, HTTP 401,
+      # Alpaca secrets not yet configured) and nobody noticed until a later
+      # manual `gh run list` check. Every live-trading alert in this
+      # codebase goes through Telegram (server.ts's sendTelegramAlert) -
+      # this research-evidence pipeline had none. `if: failure()` runs
+      # this regardless of which earlier step in the job failed (the
+      # script run or the commit/push). Fail-soft if the secrets aren't
+      # configured yet, mirroring sendTelegramAlert's own early-out - a
+      # missing secret must never itself become a second, confusing
+      # failure on top of the real one.
+      - name: Alert on failure via Telegram
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set as GitHub Actions secrets - skipping alert."
+            exit 0
+          fi
+          node -e '
+            const https = require("https");
+            const text = [
+              `${process.env.WORKFLOW_NAME} workflow FAILED`,
+              `Workflow: ${process.env.WORKFLOW_NAME}`,
+              `Branch: ${process.env.BRANCH_NAME}`,
+              "Conclusion: failure",
+              `Run: ${process.env.RUN_URL}`,
+            ].join("\n");
+            const body = JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text });
+            const req = https.request(
+              `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+              { method: "POST", headers: { "Content-Type": "application/json" } },
+              (res) => {
+                res.on("data", () => {});
+                res.on("end", () => process.exit(res.statusCode && res.statusCode < 400 ? 0 : 1));
+              },
+            );
+            req.on("error", (err) => { console.error(err); process.exit(1); });
+            req.write(body);
+            req.end();
+          '
