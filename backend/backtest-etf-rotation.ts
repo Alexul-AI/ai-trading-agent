@@ -76,6 +76,7 @@ async function fetchAlpacaBars(
   ticker: string,
   days: number,
   endDaysAgo: number,
+  adjustment: "raw" | "all" = "raw",
 ): Promise<AlpacaBar[]> {
   const endDate = new Date();
   endDate.setDate(endDate.getDate() - endDaysAgo);
@@ -90,7 +91,7 @@ async function fetchAlpacaBars(
     url.searchParams.set("timeframe", "1Day");
     url.searchParams.set("start", toIsoDate(startDate));
     url.searchParams.set("end", toIsoDate(endDate));
-    url.searchParams.set("adjustment", "raw");
+    url.searchParams.set("adjustment", adjustment);
     url.searchParams.set("feed", FEED);
     url.searchParams.set("limit", "1000");
     if (pageToken) url.searchParams.set("page_token", pageToken);
@@ -425,13 +426,26 @@ export async function runEtfRotationWindowAnalysis(options: {
    * every existing caller is unaffected when omitted.
    */
   simStartDateOverride?: string;
+  /**
+   * Optional and additive (2026-08-08, same shape as simStartDateOverride
+   * above) - every existing caller omits this and keeps today's "raw"
+   * behavior unchanged. Added for backtest-etf-rotation-adjustment-comparison.ts
+   * to run this exact, already-validated simulation twice (raw vs all) and
+   * get directly comparable CAGR/max-drawdown/Calmar numbers, instead of
+   * building a second, parallel simulation that could subtly diverge.
+   */
+  adjustment?: "raw" | "all";
 }): Promise<EtfRotationWindowAnalysisResult> {
   const config = options.config ?? DEFAULT_ETF_ROTATION_CONFIG;
+  const adjustment = options.adjustment ?? "raw";
   const barsByTicker = new Map<string, AlpacaBar[]>();
 
   for (const ticker of config.universe) {
     console.log(`[${options.label}] Fetching ${ticker}...`);
-    barsByTicker.set(ticker, await fetchAlpacaBars(ticker, options.days, options.endDaysAgo));
+    barsByTicker.set(
+      ticker,
+      await fetchAlpacaBars(ticker, options.days, options.endDaysAgo, adjustment),
+    );
   }
 
   const { commonDates, indexByTickerByDate } = alignByIntersection(
