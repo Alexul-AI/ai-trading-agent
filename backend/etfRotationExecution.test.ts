@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   computeOverallExecutionStatus,
+  computeRampMaxNotional,
   computeRampMaxShares,
   createWaitForSellFill,
   executeEtfRotationOrders,
@@ -424,6 +425,178 @@ describe("executeEtfRotationOrders - cash-aware BUY resizing", () => {
     expect(submittedQtyByTicker.QQQ).toBeUndefined();
     expect(result.blockedOrders.map((o) => o.ticker)).toEqual(["QQQ"]);
     expect(result.blockedOrders[0]!.blockReason).toContain("Insufficient available cash");
+  });
+});
+
+describe("executeEtfRotationOrders - notional (fractional-fallback) BUY legs (2026-08-08, unreachable from the live worker today - no shipped config sets allowFractionalShares)", () => {
+  it("submits a notional BUY leg's requested dollar amount when ramp/cash allow it in full", async () => {
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 0, notional: 50, targetWeightPercent: 50 },
+    ];
+
+    let capturedNotional: number | undefined;
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (_ticker, _action, _shares, notional) => {
+      capturedNotional = notional;
+      return { outcome: "accepted", brokerOrderId: "broker-1" };
+    };
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: ALLOW_ALL,
+      submitOrderLeg,
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+    });
+
+    expect(capturedNotional).toBe(50);
+    expect(result.acceptedOrders).toHaveLength(1);
+    expect(result.acceptedOrders[0]!.submittedNotional).toBe(50);
+    expect(result.acceptedOrders[0]!.submittedQty).toBe(0);
+  });
+
+  it("caps a notional BUY leg to the ramp-derived dollar ceiling, independent of price (no Math.floor/price division)", async () => {
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 0, notional: 50, targetWeightPercent: 50 },
+    ];
+
+    let capturedNotional: number | undefined;
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (_ticker, _action, _shares, notional) => {
+      capturedNotional = notional;
+      return { outcome: "accepted", brokerOrderId: "broker-1" };
+    };
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      // 2% of $100 equity = $2 - tighter than the $50 requested.
+      executionGates: { ...ALLOW_ALL, rampMaxPositionEquityPercent: 2 },
+      submitOrderLeg,
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => makeSnapshot(100),
+    });
+
+    expect(capturedNotional).toBe(2);
+    expect(result.acceptedOrders[0]!.submittedNotional).toBe(2);
+  });
+
+  it("blocks a notional BUY leg entirely when the ramp cap allows $0, without ever calling submitOrderLeg", async () => {
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 0, notional: 50, targetWeightPercent: 50 },
+    ];
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: { ...ALLOW_ALL, rampMaxPositionEquityPercent: 0 },
+      submitOrderLeg: throwingSubmitOrderLeg(),
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+    });
+
+    expect(result.blockedOrders).toHaveLength(1);
+    expect(result.blockedOrders[0]!.blockReason).toContain(
+      "AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT",
+    );
+  });
+
+  it("resizes a notional BUY leg down to available cash when cash is the binding ceiling", async () => {
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 0, notional: 50, targetWeightPercent: 50 },
+    ];
+
+    let capturedNotional: number | undefined;
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (_ticker, _action, _shares, notional) => {
+      capturedNotional = notional;
+      return { outcome: "accepted", brokerOrderId: "broker-1" };
+    };
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: ALLOW_ALL,
+      submitOrderLeg,
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => makeSnapshot(30), // only $30 available, wanted $50
+    });
+
+    expect(capturedNotional).toBe(30);
+    expect(result.acceptedOrders[0]!.submittedNotional).toBe(30);
+  });
+
+  it("blocks a notional BUY leg entirely when there's no cash left", async () => {
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 0, notional: 50, targetWeightPercent: 50 },
+    ];
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: ALLOW_ALL,
+      submitOrderLeg: throwingSubmitOrderLeg(),
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => makeSnapshot(0),
+    });
+
+    expect(result.blockedOrders).toHaveLength(1);
+    expect(result.blockedOrders[0]!.blockReason).toContain("Insufficient available cash");
+  });
+
+  it("decrements the running cash pool by the notional dollar amount, not shares * price, across multiple legs", async () => {
+    const submittedByTicker: Record<string, number | undefined> = {};
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (ticker, _action, _shares, notional) => {
+      submittedByTicker[ticker] = notional;
+      return { outcome: "accepted", brokerOrderId: `broker-${ticker}` };
+    };
+
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 0, notional: 40, targetWeightPercent: 50 },
+      { ticker: "QQQ", action: "BUY", shares: 0, notional: 40, targetWeightPercent: 50 },
+    ];
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: ALLOW_ALL,
+      submitOrderLeg,
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => makeSnapshot(50), // enough for SPY's $40, only $10 left for QQQ
+    });
+
+    expect(submittedByTicker.SPY).toBe(40);
+    expect(submittedByTicker.QQQ).toBe(10);
+    expect(result.acceptedOrders).toHaveLength(2);
+  });
+
+  it("records requestedNotional/submittedNotional on the audit event and outcome for a notional leg, and leaves them undefined for a whole-share leg", async () => {
+    const audit = collectingAuditRecorder();
+    const orders: RebalanceOrder[] = [
+      { ticker: "SPY", action: "BUY", shares: 0, notional: 50, targetWeightPercent: 50 },
+      { ticker: "QQQ", action: "BUY", shares: 10, targetWeightPercent: 50 },
+    ];
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: ALLOW_ALL,
+      submitOrderLeg: acceptingSubmitOrderLeg(),
+      appendAuditEvent: audit.appendAuditEvent,
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+    });
+
+    const spyOutcome = result.acceptedOrders.find((o) => o.ticker === "SPY")!;
+    const qqqOutcome = result.acceptedOrders.find((o) => o.ticker === "QQQ")!;
+
+    expect(spyOutcome.requestedNotional).toBe(50);
+    expect(spyOutcome.submittedNotional).toBe(50);
+    expect(qqqOutcome.requestedNotional).toBeUndefined();
+    expect(qqqOutcome.submittedNotional).toBeUndefined();
+
+    const spySubmitted = audit.events.find(
+      (e) => e.type === "ORDER_SUBMITTED" && e.ticker === "SPY",
+    )!;
+    expect(spySubmitted.requestedNotional).toBe(50);
+    expect(spySubmitted.submittedNotional).toBe(50);
   });
 });
 
@@ -1086,6 +1259,20 @@ describe("computeRampMaxShares", () => {
 
   it("is 0 when the ramp percent is 0", () => {
     expect(computeRampMaxShares(500, 100000, 0)).toBe(0);
+  });
+});
+
+describe("computeRampMaxNotional", () => {
+  it("is Infinity when the ramp percent is undefined (uncapped)", () => {
+    expect(computeRampMaxNotional(100000, undefined)).toBe(Infinity);
+  });
+
+  it("computes a dollar ceiling directly, with no price division/floor step", () => {
+    expect(computeRampMaxNotional(100000, 10)).toBe(10000);
+  });
+
+  it("is 0 when the ramp percent is 0", () => {
+    expect(computeRampMaxNotional(100000, 0)).toBe(0);
   });
 });
 

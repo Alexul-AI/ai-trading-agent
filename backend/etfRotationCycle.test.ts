@@ -10,7 +10,11 @@ import {
   makeTempDataDir,
   todayDateKey,
 } from "./autopilotWorker.characterization.helpers.js";
-import { runEtfRotationCycle } from "./etfRotationCycle.js";
+import {
+  buildLiveSubmitOrderLeg,
+  rejectUnsupportedNotionalLeg,
+  runEtfRotationCycle,
+} from "./etfRotationCycle.js";
 import { ETF_ROTATION_MVP_BASELINE_CONFIG } from "./etfRotationStrategy.js";
 import type { ExecuteSafeTradeResult } from "./src/types/autopilotTypes.js";
 
@@ -179,6 +183,52 @@ describe("runEtfRotationCycle: asymmetric allowBuy/allowRebalanceSells gates", (
     const calledTickers = executeSafeTrade.mock.calls.map((call) => call[0]);
     expect(calledTickers).toContain("GLD");
     expect(calledTickers).not.toEqual(expect.arrayContaining(["SPY", "QQQ"]));
+  });
+});
+
+describe("rejectUnsupportedNotionalLeg", () => {
+  it("returns a clear, actionable rejection reason naming the ticker, amount, and the adapter gap - not a generic message", () => {
+    const result = rejectUnsupportedNotionalLeg("SPY", 50);
+
+    expect(result.outcome).toBe("rejected");
+    expect(result.reason).toContain("SPY");
+    expect(result.reason).toContain("$50.00");
+    expect(result.reason).toContain("does not yet support notional");
+    expect(result.reason).toContain("allowFractionalShares");
+  });
+});
+
+describe("buildLiveSubmitOrderLeg", () => {
+  it("rejects a notional leg with a clear reason and never calls executeSafeTrade", async () => {
+    const executeSafeTrade = vi.fn(
+      async (): Promise<ExecuteSafeTradeResult> => ({
+        status: "success",
+        order: { id: "should-never-be-called" },
+      }),
+    );
+
+    const submitOrderLeg = buildLiveSubmitOrderLeg(executeSafeTrade);
+    const result = await submitOrderLeg("SPY", "BUY", 0, 50);
+
+    expect(result.outcome).toBe("rejected");
+    expect(result.reason).toContain("does not yet support notional");
+    expect(executeSafeTrade).not.toHaveBeenCalled();
+  });
+
+  it("still forwards an ordinary whole-share leg to executeSafeTrade unchanged (no requestedNotional)", async () => {
+    const executeSafeTrade = vi.fn(
+      async (): Promise<ExecuteSafeTradeResult> => ({
+        status: "success",
+        order: { id: "broker-1" },
+      }),
+    );
+
+    const submitOrderLeg = buildLiveSubmitOrderLeg(executeSafeTrade);
+    const result = await submitOrderLeg("SPY", "BUY", 10);
+
+    expect(result.outcome).toBe("accepted");
+    expect(result.brokerOrderId).toBe("broker-1");
+    expect(executeSafeTrade).toHaveBeenCalledWith("SPY", "BUY", 10);
   });
 });
 

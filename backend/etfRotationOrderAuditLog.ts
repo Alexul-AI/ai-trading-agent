@@ -88,6 +88,13 @@ export interface EtfRotationOrderAuditEvent {
   legType?: EtfRotationOrderLegType;
   requestedQty?: number;
   submittedQty?: number;
+  /**
+   * Set only for a fractional-fallback BUY leg (2026-08-08, small-capital
+   * tranche design) - mirrors requestedQty/submittedQty's shape for the
+   * dollar-denominated case. Absent for every ordinary whole-share leg.
+   */
+  requestedNotional?: number;
+  submittedNotional?: number;
   clientOrderId?: string;
   brokerOrderId?: string;
   error?: string;

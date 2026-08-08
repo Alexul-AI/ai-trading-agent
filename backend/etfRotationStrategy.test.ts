@@ -336,4 +336,126 @@ describe("computeRebalanceOrders", () => {
       [],
     );
   });
+
+  it("sells the exact fractional share quantity currently held, not rounded (proves fractional SELL is already safe end to end - see riskManager.ts's evaluateTrade, which Math.min's without ever flooring)", () => {
+    const orders = computeRebalanceOrders(
+      [],
+      10000,
+      new Map([["TLT", 1.5]]),
+      new Map(),
+      universe,
+    );
+
+    expect(orders).toEqual([{ ticker: "TLT", action: "SELL", shares: 1.5 }]);
+  });
+
+  describe("fractional-fallback BUY (allowFractionalShares, 2026-08-08 small-capital tranche design)", () => {
+    it("skips the slot (does not fall back to notional) when allowFractionalShares is omitted - default behavior unchanged", () => {
+      const targets: RotationTarget[] = [{ ticker: "SPY", weightPercent: 50 }];
+
+      // 50% of $100 = $50; SPY at $773/share floors to 0 whole shares.
+      const orders = computeRebalanceOrders(
+        targets,
+        100,
+        new Map(),
+        new Map([["SPY", 773]]),
+        universe,
+      );
+
+      expect(orders).toEqual([]);
+    });
+
+    it("falls back to a notional order when whole-share sizing floors to 0, fractional mode is on, and the dollar amount clears the floor", () => {
+      const targets: RotationTarget[] = [{ ticker: "SPY", weightPercent: 50 }];
+
+      const orders = computeRebalanceOrders(
+        targets,
+        100,
+        new Map(),
+        new Map([["SPY", 773]]),
+        universe,
+        true, // allowFractionalShares
+        5, // minFractionalNotionalUsd
+      );
+
+      expect(orders).toEqual([
+        {
+          ticker: "SPY",
+          action: "BUY",
+          shares: 0,
+          notional: 50,
+          targetWeightPercent: 50,
+        },
+      ]);
+    });
+
+    it("does not fall back to notional when the dollar amount is below minFractionalNotionalUsd, even with fractional mode on", () => {
+      const targets: RotationTarget[] = [{ ticker: "GLD", weightPercent: 1 }];
+
+      // 1% of $100 = $1, below a $5 floor.
+      const orders = computeRebalanceOrders(
+        targets,
+        100,
+        new Map(),
+        new Map([["GLD", 250]]),
+        universe,
+        true,
+        5,
+      );
+
+      expect(orders).toEqual([]);
+    });
+
+    it("uses the default $5 notional floor when minFractionalNotionalUsd is omitted", () => {
+      const targets: RotationTarget[] = [{ ticker: "GLD", weightPercent: 1 }];
+
+      // 1% of $100 = $1, below the default $5 floor.
+      const belowFloor = computeRebalanceOrders(
+        targets,
+        100,
+        new Map(),
+        new Map([["GLD", 250]]),
+        universe,
+        true, // minFractionalNotionalUsd omitted -> defaults to 5
+      );
+      expect(belowFloor).toEqual([]);
+
+      // 10% of $100 = $10, clears the default $5 floor; GLD still floors to 0 shares.
+      const clearsFloor = computeRebalanceOrders(
+        [{ ticker: "GLD", weightPercent: 10 }],
+        100,
+        new Map(),
+        new Map([["GLD", 398]]),
+        universe,
+        true,
+      );
+      expect(clearsFloor).toEqual([
+        {
+          ticker: "GLD",
+          action: "BUY",
+          shares: 0,
+          notional: 10,
+          targetWeightPercent: 10,
+        },
+      ]);
+    });
+
+    it("still produces a normal whole-share BUY when sizing already yields >= 1 share, even with fractional mode on", () => {
+      const targets: RotationTarget[] = [{ ticker: "QQQ", weightPercent: 50 }];
+
+      const orders = computeRebalanceOrders(
+        targets,
+        10000,
+        new Map(),
+        new Map([["QQQ", 400]]),
+        universe,
+        true,
+        5,
+      );
+
+      expect(orders).toEqual([
+        { ticker: "QQQ", action: "BUY", shares: 12, targetWeightPercent: 50 },
+      ]);
+    });
+  });
 });

@@ -4,6 +4,7 @@ import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 
 import {
+  computeRebalanceOrders,
   decideRotationTargets,
   DEFAULT_ETF_ROTATION_CONFIG,
   ETF_ROTATION_CONFIG_VARIANTS,
@@ -12,6 +13,10 @@ import {
   type EtfRotationConfig,
   type RotationTarget,
 } from "./etfRotationStrategy.js";
+import {
+  computeRampMaxNotional,
+  computeRampMaxShares,
+} from "./etfRotationExecution.js";
 import {
   buildBenchmarkMetrics,
   buildScorecardMetrics,
@@ -196,6 +201,19 @@ export interface EtfRotationSimResult {
   rebalanceCount: number;
   trades: TradeLogEntry[];
   equityCurve: EquityCurvePoint[];
+  /**
+   * Count of individual BUY slots, across every rebalance, where a
+   * qualifying momentum/trend-filter pick (decideRotationTargets already
+   * returned it as a target) ended up with zero actual position afterward -
+   * whether from whole-share rounding, the fractional-fallback floor, or
+   * the ramp cap (2026-08-08, small-capital tranche diagnostic). This is a
+   * direct measurement of "could this tranche actually deploy capital,"
+   * not inferred after the fact from trade counts - purely additive,
+   * every existing caller ignores it.
+   */
+  strandedBuySlotCount: number;
+  /** Total qualifying BUY slots across all rebalances - the denominator for strandedBuySlotCount. A slot the trend filter itself already dropped (never became a target) is not counted here. */
+  totalBuySlotCount: number;
   /** True if a rebalance decided on the last simulated day never got a following day to execute on (next_open only) - a window-edge effect, not dropped silently. */
   finalRebalanceUnexecuted: boolean;
   totalSimDays: number;
@@ -226,16 +244,32 @@ export function runEtfRotationSimulation(
   simStartIndex: number,
   executionModel: ExecutionModel,
   config: EtfRotationConfig,
+  startingEquity: number = STARTING_CAPITAL,
+  /**
+   * Optional, additive (2026-08-08, small-capital tranche simulation) -
+   * every existing caller omits these 3 and keeps today's uncapped/
+   * whole-share-only behavior unchanged. Mirrors the live ramp cap
+   * (etfRotationExecution.ts's computeRampMaxShares/computeRampMaxNotional)
+   * and the fractional-fallback BUY (etfRotationStrategy.ts's
+   * computeRebalanceOrders) so this simulation can answer "what would the
+   * live worker's ramp cap + fractional support actually do at a small
+   * tranche," not just "what does unlimited whole-share sizing do."
+   */
+  rampMaxPositionEquityPercent: number | undefined = undefined,
+  allowFractionalShares = false,
+  minFractionalNotionalUsd = 5,
 ): EtfRotationSimResult {
-  let cash = STARTING_CAPITAL;
+  let cash = startingEquity;
   const holdings = new Map<string, number>();
   const trades: TradeLogEntry[] = [];
   const equityCurve: EquityCurvePoint[] = [];
 
-  let runningPeak = STARTING_CAPITAL;
+  let runningPeak = startingEquity;
   let maxDrawdown = 0;
   let exposureSum = 0;
   let rebalanceCount = 0;
+  let strandedBuySlotCount = 0;
+  let totalBuySlotCount = 0;
   let previousDateKey: string | null = null;
   let pendingTargets: RotationTarget[] | null = null;
   let finalRebalanceUnexecuted = false;
@@ -259,6 +293,20 @@ export function runEtfRotationSimulation(
   // trades for a ticker that happens to stay in both the old and new
   // target set. Documented simplification (see report caveats), not a
   // hidden one - revisit if trade count matters more than this MVP assumes.
+  //
+  // Sizing itself (2026-08-08) reuses computeRebalanceOrders
+  // (etfRotationStrategy.ts) - the exact same function the live worker
+  // calls - rather than a second copy of the Math.floor(targetDollars/price)
+  // formula, so this backtest and live can never silently drift apart on
+  // how a slot's dollar target becomes a share count. Slippage stays
+  // modeled by pre-adjusting the price fed into computeRebalanceOrders'
+  // BUY-side price map, not by duplicating its math. One real difference
+  // from the pre-refactor version: SELL legs are now processed in
+  // config.universe order (matching computeRebalanceOrders' own iteration,
+  // and the live worker's), not "whichever order they were bought" - the
+  // same set of SELLs happens either way, just summed into `cash` in a
+  // different order, which can only ever shift a floating-point sum at a
+  // precision far below this project's 2-decimal-place reporting.
   function executeRebalance(
     targets: RotationTarget[],
     date: string,
@@ -266,23 +314,87 @@ export function runEtfRotationSimulation(
   ) {
     const equityBeforeTrade = computeEquity(date, field);
 
-    for (const [ticker, shares] of Array.from(holdings.entries())) {
-      if (shares <= 0) continue;
-      const sellPrice = priceAt(ticker, date, field) * (1 - SLIPPAGE_PERCENT);
-      cash += shares * sellPrice;
-      trades.push({ date, ticker, action: "SELL", shares, price: sellPrice });
+    const buyPriceByTicker = new Map<string, number>();
+    for (const ticker of config.universe) {
+      const rawPrice = priceAt(ticker, date, field);
+      if (rawPrice > 0) {
+        buyPriceByTicker.set(ticker, rawPrice * (1 + SLIPPAGE_PERCENT));
+      }
     }
+
+    const orders = computeRebalanceOrders(
+      targets,
+      equityBeforeTrade,
+      new Map(holdings),
+      buyPriceByTicker,
+      config.universe,
+      allowFractionalShares,
+      minFractionalNotionalUsd,
+    );
+
+    totalBuySlotCount += targets.length;
     holdings.clear();
 
-    for (const target of targets) {
-      const buyPrice = priceAt(target.ticker, date, field) * (1 + SLIPPAGE_PERCENT);
+    for (const order of orders) {
+      if (order.action === "SELL") {
+        const sellPrice = priceAt(order.ticker, date, field) * (1 - SLIPPAGE_PERCENT);
+        cash += order.shares * sellPrice;
+        trades.push({ date, ticker: order.ticker, action: "SELL", shares: order.shares, price: sellPrice });
+        continue;
+      }
+
+      // BUY - ramp cap applied here as its own sequential stage
+      // (2026-08-08), mirroring etfRotationExecution.ts's live
+      // ramp-then-execute staging. Dollar-based for a fractional-fallback
+      // leg (order.notional set), share-based otherwise. No separate
+      // cash-affordability re-check beyond what equityBeforeTrade-based
+      // sizing already implies - matches both the pre-refactor behavior
+      // and the live ramp cap's own documented semantics ("independent of
+      // cash affordability").
+      const buyPrice = buyPriceByTicker.get(order.ticker) ?? 0;
       if (buyPrice <= 0) continue;
-      const targetDollars = (target.weightPercent / 100) * equityBeforeTrade;
-      const shares = Math.floor(targetDollars / buyPrice);
-      if (shares <= 0) continue;
-      cash -= shares * buyPrice;
-      holdings.set(target.ticker, shares);
-      trades.push({ date, ticker: target.ticker, action: "BUY", shares, price: buyPrice });
+
+      if (order.notional !== undefined) {
+        const rampMaxNotional = computeRampMaxNotional(
+          equityBeforeTrade,
+          rampMaxPositionEquityPercent,
+        );
+        const cappedNotional = Math.min(order.notional, rampMaxNotional);
+        if (cappedNotional <= 0) continue;
+
+        // Simulation-only: models exactly what a real notional order would
+        // fill (dollars / price), not rounded - there is no broker here to
+        // round for us, unlike the live/paper path.
+        const shares = cappedNotional / buyPrice;
+        cash -= cappedNotional;
+        holdings.set(order.ticker, shares);
+        trades.push({ date, ticker: order.ticker, action: "BUY", shares, price: buyPrice });
+        continue;
+      }
+
+      const rampMaxShares = computeRampMaxShares(
+        buyPrice,
+        equityBeforeTrade,
+        rampMaxPositionEquityPercent,
+      );
+      const cappedShares = Math.min(order.shares, rampMaxShares);
+      if (cappedShares <= 0) continue;
+
+      cash -= cappedShares * buyPrice;
+      holdings.set(order.ticker, cappedShares);
+      trades.push({ date, ticker: order.ticker, action: "BUY", shares: cappedShares, price: buyPrice });
+    }
+
+    // A qualifying target that still has no real position afterward -
+    // whole-share rounding, the fractional floor, or the ramp cap all
+    // funnel into this single "stranded" measurement, since the point is
+    // "did the dollars actually get invested," not which specific ceiling
+    // did it.
+    for (const target of targets) {
+      const heldShares = holdings.get(target.ticker) ?? 0;
+      if (heldShares <= 0) {
+        strandedBuySlotCount += 1;
+      }
     }
   }
 
@@ -328,17 +440,19 @@ export function runEtfRotationSimulation(
   }
 
   const totalSimDays = commonDates.length - simStartIndex;
-  const finalEquity = equityCurve.length > 0 ? equityCurve[equityCurve.length - 1]!.equity : STARTING_CAPITAL;
+  const finalEquity = equityCurve.length > 0 ? equityCurve[equityCurve.length - 1]!.equity : startingEquity;
 
   return {
     finalEquity,
-    totalPnlPercent: ((finalEquity - STARTING_CAPITAL) / STARTING_CAPITAL) * 100,
+    totalPnlPercent: ((finalEquity - startingEquity) / startingEquity) * 100,
     maxDrawdownPercent: maxDrawdown,
     avgExposurePercent: totalSimDays > 0 ? exposureSum / totalSimDays : 0,
     totalTrades: trades.length,
     rebalanceCount,
     trades,
     equityCurve,
+    strandedBuySlotCount,
+    totalBuySlotCount,
     finalRebalanceUnexecuted,
     totalSimDays,
   };
@@ -376,8 +490,9 @@ function computeEqualWeightBuyAndHold(
   commonDates: string[],
   indexByTickerByDate: Map<string, Map<string, number>>,
   simStartIndex: number,
+  startingCapital: number = STARTING_CAPITAL,
 ): number {
-  const perTickerCapital = STARTING_CAPITAL / tickers.length;
+  const perTickerCapital = startingCapital / tickers.length;
   const startDate = commonDates[simStartIndex];
   const endDate = commonDates[commonDates.length - 1];
   if (!startDate || !endDate) return 0;
@@ -394,7 +509,7 @@ function computeEqualWeightBuyAndHold(
     totalFinalValue += shares * endPrice + leftover;
   }
 
-  return ((totalFinalValue - STARTING_CAPITAL) / STARTING_CAPITAL) * 100;
+  return ((totalFinalValue - startingCapital) / startingCapital) * 100;
 }
 
 export interface EtfRotationWindowAnalysisResult {
@@ -407,6 +522,14 @@ export interface EtfRotationWindowAnalysisResult {
   spyBuyAndHoldPercent: number | null;
   /** The actual config this window was simulated with - report writers must read this, not a module-level default, or a report can silently misdescribe what was actually simulated. */
   config: EtfRotationConfig;
+  /**
+   * The actual starting equity this window was simulated with (2026-08-08) -
+   * same "report writers must read this, not a module-level default"
+   * reasoning as the config field above (PR #29 fixed the identical class
+   * of bug for config). Defaults to STARTING_CAPITAL when the caller omits
+   * options.startingEquity.
+   */
+  startingEquity: number;
 }
 
 export async function runEtfRotationWindowAnalysis(options: {
@@ -435,9 +558,36 @@ export async function runEtfRotationWindowAnalysis(options: {
    * building a second, parallel simulation that could subtly diverge.
    */
   adjustment?: "raw" | "all";
+  /**
+   * Optional and additive (2026-08-08, small-capital tranche simulation) -
+   * every existing caller omits this and keeps today's $10,000-default
+   * behavior unchanged. Added for
+   * backtest-etf-rotation-small-tranche-simulation.ts to simulate the
+   * $100/$250/$500/$1000 first-live-tranche range on the same, already-
+   * validated engine instead of a parallel one.
+   */
+  startingEquity?: number;
+  /**
+   * Optional and additive (2026-08-08, same shape as startingEquity above) -
+   * mirrors the live AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT gate
+   * (etfRotationExecution.ts). Every existing caller omits this and keeps
+   * today's uncapped behavior unchanged.
+   */
+  rampMaxPositionEquityPercent?: number;
+  /**
+   * Optional and additive (2026-08-08, same shape as the two above) -
+   * mirrors etfRotationStrategy.ts's EtfRotationConfig.allowFractionalShares/
+   * minFractionalNotionalUsd fields, but as a simulation-run override
+   * rather than baked into the config object, so the same config (e.g.
+   * ETF_ROTATION_MVP_BASELINE_CONFIG) can be simulated both with and
+   * without fractional support in the same script run for comparison.
+   */
+  allowFractionalShares?: boolean;
+  minFractionalNotionalUsd?: number;
 }): Promise<EtfRotationWindowAnalysisResult> {
   const config = options.config ?? DEFAULT_ETF_ROTATION_CONFIG;
   const adjustment = options.adjustment ?? "raw";
+  const startingEquity = options.startingEquity ?? STARTING_CAPITAL;
   const barsByTicker = new Map<string, AlpacaBar[]>();
 
   for (const ticker of config.universe) {
@@ -486,6 +636,10 @@ export async function runEtfRotationWindowAnalysis(options: {
         simStartIndex,
         executionModel,
         config,
+        startingEquity,
+        options.rampMaxPositionEquityPercent,
+        options.allowFractionalShares,
+        options.minFractionalNotionalUsd,
       ),
     );
   }
@@ -496,6 +650,7 @@ export async function runEtfRotationWindowAnalysis(options: {
     commonDates,
     indexByTickerByDate,
     simStartIndex,
+    startingEquity,
   );
   const spyBuyAndHoldPercent = config.universe.includes("SPY")
     ? computeSingleTickerBuyAndHold(barsByTicker, "SPY", commonDates, indexByTickerByDate, simStartIndex)
@@ -510,6 +665,7 @@ export async function runEtfRotationWindowAnalysis(options: {
     buyAndHoldPercent,
     spyBuyAndHoldPercent,
     config,
+    startingEquity,
   };
 }
 
@@ -554,7 +710,7 @@ Generated: ${new Date().toISOString()}
 - Validation status: ${validationStatus}
 - Window: ${result.totalSimDays} simulated trading days (${analysis.startDate} to ${analysis.endDate}, ${annualizationDays} calendar days)
 - Universe: ${config.universe.join(", ")}
-- Starting capital: $${STARTING_CAPITAL}
+- Starting capital: $${analysis.startingEquity}
 - Execution model: ${executionModel === "close_to_close" ? "CLOSE_TO_CLOSE (signal and execution both at day's close - a same-bar assumption)" : "NEXT_OPEN (signal at close[d], executed at open[d+1])"}
 - Rebalance cadence: monthly (first trading day of each new calendar month)
 - Momentum lookback: ${config.momentumLookbackDays} trading days

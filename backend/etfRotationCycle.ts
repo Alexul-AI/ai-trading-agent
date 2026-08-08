@@ -77,6 +77,63 @@ export function mapExecuteSafeTradeResultToLegOutcome(
 }
 
 /**
+ * Fail-closed guard (2026-08-08, PR #80's small-capital tranche design) -
+ * exported for direct testing. `computeRebalanceOrders`
+ * (etfRotationStrategy.ts) can only produce a notional (fractional-fallback)
+ * BUY leg when `allowFractionalShares` is set on the config passed to it -
+ * no shipped ETF Rotation config sets this today, so runOrderLeg below
+ * should never actually receive a `requestedNotional`. If it ever does, the
+ * real adapter genuinely does not know how to submit a notional order yet -
+ * it only ever forwards `requestedShares` to `executeSafeTrade`, never a
+ * notional amount. Without this guard, that call would silently become
+ * `executeSafeTrade(ticker, action, 0)` (shares=0, no notional) - which
+ * `executeSafeTrade` rejects anyway ("Invalid ticker or share quantity."),
+ * so no bad trade could go out, but the failure reason would be generic and
+ * misleading (looks like a data bug, not an intentionally-incomplete
+ * adapter), silently costing the cycle its intended BUY every month with no
+ * clear signal why. This guard makes the real cause explicit instead. A
+ * future PR that wires fractional support up for real must update this
+ * closure to forward `requestedNotional` into `executeSafeTrade`'s own
+ * `rawNotional` parameter - this guard exists specifically so that PR can't
+ * be forgotten without a loud, immediate, correctly-explained failure
+ * instead of a silent/confusing one.
+ */
+export function rejectUnsupportedNotionalLeg(
+  ticker: string,
+  requestedNotional: number,
+): EtfRotationSubmitOrderLegResult {
+  return {
+    outcome: "rejected",
+    reason: `Fractional/notional BUY for ${ticker} was computed (requestedNotional=$${requestedNotional.toFixed(2)}), but this live execution adapter does not yet support notional order submission - it only forwards requestedShares to executeSafeTrade. This should be unreachable (no shipped ETF Rotation config sets allowFractionalShares); if you see this, a config change enabled fractional sizing without also updating etfRotationCycle.ts's submitOrderLeg to forward requestedNotional.`,
+  };
+}
+
+/**
+ * Builds the real submitOrderLeg adapter used by runEtfRotationCycle -
+ * exported (2026-08-08) specifically so the fail-closed notional guard
+ * above can be tested directly, in isolation, without needing to drive an
+ * entire cycle through computeRebalanceOrders' config.allowFractionalShares
+ * path - which etfRotationCycle.ts does not currently forward into its
+ * computeRebalanceOrders call at all (a separate, still-unwired gap; this
+ * guard exists for the day something upstream of this adapter does start
+ * producing a notional leg, whether or not that's the same PR that wires
+ * the forwarding).
+ */
+export function buildLiveSubmitOrderLeg(
+  executeSafeTrade: ExecuteSafeTrade,
+): EtfRotationSubmitOrderLeg {
+  return async (ticker, action, requestedShares, requestedNotional) => {
+    if (requestedNotional !== undefined) {
+      return rejectUnsupportedNotionalLeg(ticker, requestedNotional);
+    }
+
+    return mapExecuteSafeTradeResultToLegOutcome(
+      await executeSafeTrade(ticker, action, requestedShares),
+    );
+  };
+}
+
+/**
  * Bridges etfRotationExecution.ts's own result vocabulary into the
  * rebalance state machine's (etfRotationWorkerState.ts) terminal
  * RebalanceStatus values. The one deliberate word-mapping decision flagged
@@ -545,14 +602,7 @@ export async function runEtfRotationCycle(
   // assumptions baked into this module.
   await recordRebalanceExecuting(etfRotationStateFilePath);
 
-  const submitOrderLeg: EtfRotationSubmitOrderLeg = async (
-    ticker,
-    action,
-    requestedShares,
-  ) =>
-    mapExecuteSafeTradeResultToLegOutcome(
-      await executeSafeTrade(ticker, action, requestedShares),
-    );
+  const submitOrderLeg = buildLiveSubmitOrderLeg(executeSafeTrade);
 
   const executionResult = await executeEtfRotationOrders({
     rebalanceMonthKey: monthKey,
