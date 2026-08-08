@@ -165,15 +165,30 @@ export interface EtfRotationRepairDecision {
   rebalanceMonthKey?: string;
 }
 
+export type EtfRotationRepairPreconditionResult =
+  | {
+      allowed: true;
+      rebalanceMonthKey: string;
+      targetWeightPercent: number;
+    }
+  | {
+      allowed: false;
+      blockReason: EtfRotationRepairBlockReason;
+      blockDetail: string;
+    };
+
 /**
- * Every input is an explicit param, already fetched by the caller - no I/O,
- * directly unit-testable, same style as deriveEtfRotationOffTargetState/
- * decideEtfRotationGateAction. `offTargetState` must be derived by the
- * caller from the SAME state/portfolio/audit reads passed in here (not
- * independently re-fetched), so this function's own checks and the
- * off-target check agree on one consistent snapshot in time.
+ * The state/market/order/idempotency/position-count checks - deliberately
+ * separated from sizing (decideEtfRotationRepairSizing below) so the
+ * orchestrator can run these first and only fetch a live price quote once
+ * every one of them has already passed. Without this split, a price-API
+ * call would run even when the repair was already going to be blocked for
+ * an unrelated reason (e.g. market closed) - not a trading risk (no order
+ * is submitted either way), but a needless external call that could turn a
+ * clean 409 into a spurious 500 if the price fetch itself failed
+ * (2026-08-08 review finding).
  */
-export function decideEtfRotationRepairEligibility(params: {
+export function decideEtfRotationRepairPreconditions(params: {
   stateResult: RebalanceStateReadResult;
   offTargetState: EtfRotationOffTargetState;
   ticker: string;
@@ -182,10 +197,7 @@ export function decideEtfRotationRepairEligibility(params: {
   recentAuditEvents: EtfRotationOrderAuditEvent[];
   openPositionCountInUniverse: number;
   maxAllowedPositions: number;
-  currentEquity: number;
-  currentPrice: number;
-  rampMaxPositionEquityPercent: number | undefined;
-}): EtfRotationRepairDecision {
+}): EtfRotationRepairPreconditionResult {
   const {
     stateResult,
     offTargetState,
@@ -195,9 +207,6 @@ export function decideEtfRotationRepairEligibility(params: {
     recentAuditEvents,
     openPositionCountInUniverse,
     maxAllowedPositions,
-    currentEquity,
-    currentPrice,
-    rampMaxPositionEquityPercent,
   } = params;
 
   if (stateResult.corrupt) {
@@ -256,11 +265,33 @@ export function decideEtfRotationRepairEligibility(params: {
     };
   }
 
+  return {
+    allowed: true,
+    rebalanceMonthKey,
+    targetWeightPercent: missingLeg.targetWeightPercent,
+  };
+}
+
+export type EtfRotationRepairSizingResult =
+  | { allowed: true; requestedShares: number }
+  | { allowed: false; blockReason: "SIZE_ZERO"; blockDetail: string };
+
+/**
+ * The one check that genuinely needs a live price - kept separate so the
+ * orchestrator only calls this (and only fetches a price) after
+ * decideEtfRotationRepairPreconditions has already passed.
+ */
+export function decideEtfRotationRepairSizing(params: {
+  targetWeightPercent: number;
+  currentEquity: number;
+  currentPrice: number;
+  rampMaxPositionEquityPercent: number | undefined;
+}): EtfRotationRepairSizingResult {
   const requestedShares = computeRepairBuyShares(
-    missingLeg.targetWeightPercent,
-    currentEquity,
-    currentPrice,
-    rampMaxPositionEquityPercent,
+    params.targetWeightPercent,
+    params.currentEquity,
+    params.currentPrice,
+    params.rampMaxPositionEquityPercent,
   );
 
   if (requestedShares <= 0) {
@@ -272,11 +303,66 @@ export function decideEtfRotationRepairEligibility(params: {
     };
   }
 
+  return { allowed: true, requestedShares };
+}
+
+/**
+ * Every input is an explicit param, already fetched by the caller - no I/O,
+ * directly unit-testable, same style as deriveEtfRotationOffTargetState/
+ * decideEtfRotationGateAction. `offTargetState` must be derived by the
+ * caller from the SAME state/portfolio/audit reads passed in here (not
+ * independently re-fetched), so this function's own checks and the
+ * off-target check agree on one consistent snapshot in time.
+ *
+ * A thin composition of decideEtfRotationRepairPreconditions +
+ * decideEtfRotationRepairSizing, kept as one function for callers (and
+ * tests) that don't need the price-fetch-deferral split the orchestrator
+ * uses - see performEtfRotationRepairMissingBuy below for the split-call
+ * version.
+ */
+export function decideEtfRotationRepairEligibility(params: {
+  stateResult: RebalanceStateReadResult;
+  offTargetState: EtfRotationOffTargetState;
+  ticker: string;
+  marketIsOpen: boolean;
+  openBuyOrderExistsForTicker: boolean;
+  recentAuditEvents: EtfRotationOrderAuditEvent[];
+  openPositionCountInUniverse: number;
+  maxAllowedPositions: number;
+  currentEquity: number;
+  currentPrice: number;
+  rampMaxPositionEquityPercent: number | undefined;
+}): EtfRotationRepairDecision {
+  const preconditions = decideEtfRotationRepairPreconditions(params);
+
+  if (!preconditions.allowed) {
+    return {
+      allowed: false,
+      blockReason: preconditions.blockReason,
+      blockDetail: preconditions.blockDetail,
+    };
+  }
+
+  const sizing = decideEtfRotationRepairSizing({
+    targetWeightPercent: preconditions.targetWeightPercent,
+    currentEquity: params.currentEquity,
+    currentPrice: params.currentPrice,
+    rampMaxPositionEquityPercent: params.rampMaxPositionEquityPercent,
+  });
+
+  if (!sizing.allowed) {
+    return {
+      allowed: false,
+      blockReason: sizing.blockReason,
+      blockDetail: sizing.blockDetail,
+    };
+  }
+
   return {
     allowed: true,
-    requestedShares,
-    targetWeightPercent: missingLeg.targetWeightPercent,
-    rebalanceMonthKey,
+    requestedShares: sizing.requestedShares,
+    targetWeightPercent: preconditions.targetWeightPercent,
+    rebalanceMonthKey: preconditions.rebalanceMonthKey,
   };
 }
 
@@ -360,14 +446,12 @@ export async function performEtfRotationRepairMissingBuy(
     (universeTicker) => (portfolio.positions[universeTicker]?.shares ?? 0) > 0,
   ).length;
 
-  // A ticker being repaired is, by definition, currently unheld (0 shares -
-  // that's what "missing" means), so it's never in portfolio.positions -
-  // always falls through to a live quote.
-  const currentPrice =
-    portfolio.positions[ticker]?.currentPrice ??
-    (await params.getEstimatedPrice(ticker));
-
-  const decision = decideEtfRotationRepairEligibility({
+  // State/market/order/idempotency/position-count checks first, none of
+  // which need a price - so a repair that was always going to be blocked
+  // for one of those reasons never triggers a live price-API call (an
+  // unnecessary external call that could otherwise turn a clean 409 into a
+  // spurious 500 if the price fetch itself failed).
+  const preconditions = decideEtfRotationRepairPreconditions({
     stateResult,
     offTargetState,
     ticker,
@@ -376,22 +460,42 @@ export async function performEtfRotationRepairMissingBuy(
     recentAuditEvents,
     openPositionCountInUniverse,
     maxAllowedPositions: params.maxAllowedPositions,
+  });
+
+  if (!preconditions.allowed) {
+    return {
+      kind: "blocked",
+      blockReason: preconditions.blockReason,
+      blockDetail: preconditions.blockDetail,
+    };
+  }
+
+  // A ticker being repaired is, by definition, currently unheld (0 shares -
+  // that's what "missing" means), so it's never in portfolio.positions -
+  // always falls through to a live quote. Only reached once every
+  // precondition above has already passed.
+  const currentPrice =
+    portfolio.positions[ticker]?.currentPrice ??
+    (await params.getEstimatedPrice(ticker));
+
+  const sizing = decideEtfRotationRepairSizing({
+    targetWeightPercent: preconditions.targetWeightPercent,
     currentEquity: portfolio.equity,
     currentPrice,
     rampMaxPositionEquityPercent: params.rampMaxPositionEquityPercent,
   });
 
-  if (!decision.allowed) {
+  if (!sizing.allowed) {
     return {
       kind: "blocked",
-      blockReason: decision.blockReason as EtfRotationRepairBlockReason,
-      blockDetail: decision.blockDetail ?? "Repair not allowed.",
+      blockReason: sizing.blockReason,
+      blockDetail: sizing.blockDetail,
     };
   }
 
-  const rebalanceMonthKey = decision.rebalanceMonthKey as string;
-  const targetWeightPercent = decision.targetWeightPercent as number;
-  const requestedShares = decision.requestedShares as number;
+  const rebalanceMonthKey = preconditions.rebalanceMonthKey;
+  const targetWeightPercent = preconditions.targetWeightPercent;
+  const requestedShares = sizing.requestedShares;
 
   // Idempotency ordering: commit intent before the risky call, same
   // reasoning as this project's reminder paths (PR #65) - if the process

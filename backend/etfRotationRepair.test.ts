@@ -9,6 +9,8 @@ import {
   computeRepairBuyShares,
   hasAcceptedPriorRepair,
   decideEtfRotationRepairEligibility,
+  decideEtfRotationRepairPreconditions,
+  decideEtfRotationRepairSizing,
   performEtfRotationRepairMissingBuy,
   type EtfRotationRepairDecision,
 } from "./etfRotationRepair.js";
@@ -316,6 +318,115 @@ describe("decideEtfRotationRepairEligibility", () => {
   });
 });
 
+describe("decideEtfRotationRepairPreconditions", () => {
+  // Same block reasons as decideEtfRotationRepairEligibility above, minus
+  // SIZE_ZERO (which needs a price and belongs to decideEtfRotationRepairSizing
+  // instead) - this is the half of eligibility the orchestrator runs BEFORE
+  // fetching a live price quote (2026-08-08 review finding: a price fetch
+  // must never happen before these checks, since it's wasted work - and a
+  // potential spurious 500 - when the repair was already going to be
+  // blocked for an unrelated reason).
+  function baseParams() {
+    const { currentEquity, currentPrice, rampMaxPositionEquityPercent, ...rest } =
+      baseEligibilityParams();
+    return rest;
+  }
+
+  it("allows the real 2026-08-03 QQQ incident shape without needing a price", () => {
+    const result = decideEtfRotationRepairPreconditions(baseParams());
+    expect(result).toEqual({
+      allowed: true,
+      rebalanceMonthKey: MONTH,
+      targetWeightPercent: 50,
+    });
+  });
+
+  it("blocks with STATE_CORRUPT when the state file is unreadable", () => {
+    const result = decideEtfRotationRepairPreconditions({
+      ...baseParams(),
+      stateResult: { corrupt: true, state: { lastRebalanceDateKey: null } },
+    });
+    expect(result.allowed).toBe(false);
+    expect((result as { blockReason: string }).blockReason).toBe("STATE_CORRUPT");
+  });
+
+  it("blocks with NOT_OFF_TARGET when offTargetState.offTarget is false", () => {
+    const result = decideEtfRotationRepairPreconditions({
+      ...baseParams(),
+      offTargetState: { offTarget: false, missingLegs: [] },
+    });
+    expect(result.allowed).toBe(false);
+    expect((result as { blockReason: string }).blockReason).toBe("NOT_OFF_TARGET");
+  });
+
+  it("blocks with MARKET_CLOSED when the market clock reports closed", () => {
+    const result = decideEtfRotationRepairPreconditions({
+      ...baseParams(),
+      marketIsOpen: false,
+    });
+    expect(result.allowed).toBe(false);
+    expect((result as { blockReason: string }).blockReason).toBe("MARKET_CLOSED");
+  });
+
+  it("blocks with OPEN_ORDER_EXISTS when a pending BUY order for the ticker is already open", () => {
+    const result = decideEtfRotationRepairPreconditions({
+      ...baseParams(),
+      openBuyOrderExistsForTicker: true,
+    });
+    expect(result.allowed).toBe(false);
+    expect((result as { blockReason: string }).blockReason).toBe("OPEN_ORDER_EXISTS");
+  });
+
+  it("blocks with PRIOR_REPAIR_ALREADY_ACCEPTED when this rebalanceMonthKey+ticker was already successfully repaired", () => {
+    const result = decideEtfRotationRepairPreconditions({
+      ...baseParams(),
+      recentAuditEvents: [
+        auditEvent({ type: "ORDER_ACCEPTED", ticker: "QQQ", legType: "repair" }),
+      ],
+    });
+    expect(result.allowed).toBe(false);
+    expect((result as { blockReason: string }).blockReason).toBe(
+      "PRIOR_REPAIR_ALREADY_ACCEPTED",
+    );
+  });
+
+  it("blocks with MAX_POSITIONS_REACHED when already holding the max universe positions", () => {
+    const result = decideEtfRotationRepairPreconditions({
+      ...baseParams(),
+      openPositionCountInUniverse: 3,
+      maxAllowedPositions: 3,
+    });
+    expect(result.allowed).toBe(false);
+    expect((result as { blockReason: string }).blockReason).toBe("MAX_POSITIONS_REACHED");
+  });
+});
+
+describe("decideEtfRotationRepairSizing", () => {
+  it("allows and sizes when the computed shares are positive", () => {
+    const result = decideEtfRotationRepairSizing({
+      targetWeightPercent: 50,
+      currentEquity: 88152.86,
+      currentPrice: 769.8,
+      rampMaxPositionEquityPercent: 2,
+    });
+    expect(result).toEqual({ allowed: true, requestedShares: 2 });
+  });
+
+  it("blocks with SIZE_ZERO when the computed repair size rounds to 0 shares", () => {
+    const result = decideEtfRotationRepairSizing({
+      targetWeightPercent: 50,
+      currentEquity: 100,
+      currentPrice: 769.8,
+      rampMaxPositionEquityPercent: 2,
+    });
+    expect(result).toEqual({
+      allowed: false,
+      blockReason: "SIZE_ZERO",
+      blockDetail: expect.any(String),
+    });
+  });
+});
+
 // --- Orchestrator-level tests, matching the user's own pre-merge scenario
 // list exactly. Every I/O dependency is a fake/spy - no real Alpaca call,
 // no real Express app needed (matches performEtfRotationRepairMissingBuy's
@@ -551,7 +662,7 @@ describe("performEtfRotationRepairMissingBuy", () => {
     });
   });
 
-  it("market closed: blocks before calling executeSafeTrade", async () => {
+  it("market closed: blocks before calling executeSafeTrade, and never fetches a price at all", async () => {
     await withTempDataFiles(async (paths) => {
       await seedRealIncidentState(paths.statePath);
       await seedRealIncidentAuditLog(paths.auditLogPath);
@@ -559,13 +670,21 @@ describe("performEtfRotationRepairMissingBuy", () => {
       const executeSafeTrade = vi.fn(async (): Promise<ExecuteSafeTradeResult> => {
         throw new Error("executeSafeTrade should never be called - market closed.");
       });
+      // 2026-08-08 review finding: a precondition block (market closed here)
+      // must short-circuit before any price fetch - a throwing price
+      // dependency proves the orchestrator never reaches it.
+      const getEstimatedPrice = vi.fn(async (): Promise<number> => {
+        throw new Error("getEstimatedPrice should never be called - blocked before sizing.");
+      });
 
       const result = await performEtfRotationRepairMissingBuy({
         ...baseOrchestratorParams(paths),
         getMarketIsOpen: async () => false,
+        getEstimatedPrice,
         executeSafeTrade,
       });
 
+      expect(getEstimatedPrice).not.toHaveBeenCalled();
       expect(executeSafeTrade).not.toHaveBeenCalled();
       expect(result).toEqual({
         kind: "blocked",
