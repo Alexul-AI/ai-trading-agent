@@ -855,11 +855,9 @@ describe("executeEtfRotationOrders - paired SELL fill-confirmation wait (2026-08
     expect(audit.events.map((e) => e.type)).toContain("PAIRED_SELL_FILL_UNCONFIRMED");
   });
 
-  it("never calls waitForSellFill for an exit_removed SELL (no paired BUY this cycle)", async () => {
+  it("calls waitForSellFill for an exit_removed SELL too (no paired BUY, but still needs fill confirmation - 2026-08-08 generalization) and proceeds normally when filled", async () => {
     const orders: RebalanceOrder[] = [{ ticker: "GLD", action: "SELL", shares: 10 }];
-    const waitForSellFill = vi.fn(async (): Promise<"filled"> => {
-      throw new Error("waitForSellFill should never be called for an unpaired SELL.");
-    });
+    const waitForSellFill = vi.fn(async (): Promise<"filled"> => "filled");
 
     const result = await executeEtfRotationOrders({
       ...baseParams,
@@ -871,8 +869,112 @@ describe("executeEtfRotationOrders - paired SELL fill-confirmation wait (2026-08
       waitForSellFill,
     });
 
-    expect(waitForSellFill).not.toHaveBeenCalled();
+    expect(waitForSellFill).toHaveBeenCalledTimes(1);
+    expect(waitForSellFill).toHaveBeenCalledWith("broker-1", "GLD");
     expect(result.acceptedOrders.map((o) => o.ticker)).toEqual(["GLD"]);
+  });
+
+  it("demotes an unpaired (exit_removed) SELL to ambiguousOrders - not failedOrders - when its own fill cannot be confirmed (2026-08-08)", async () => {
+    const orders: RebalanceOrder[] = [{ ticker: "GLD", action: "SELL", shares: 10 }];
+    const audit = collectingAuditRecorder();
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: ALLOW_ALL,
+      submitOrderLeg: acceptingSubmitOrderLeg(),
+      appendAuditEvent: audit.appendAuditEvent,
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+      waitForSellFill: async () => "unconfirmed",
+    });
+
+    // No paired BUY exists for GLD, so there's nothing to redirect into
+    // ambiguousOrders except the SELL leg itself.
+    expect(result.acceptedOrders).toHaveLength(0);
+    expect(result.failedOrders).toHaveLength(0);
+    expect(result.blockedOrders).toHaveLength(0);
+    expect(result.ambiguousOrders.map((o) => `${o.ticker}:${o.action}`)).toEqual([
+      "GLD:SELL",
+    ]);
+    expect(result.status).toBe("ambiguous");
+
+    const gldEvents = audit.events.filter((e) => e.ticker === "GLD");
+    expect(gldEvents.map((e) => e.type)).toEqual([
+      "ORDER_SUBMITTED",
+      "ORDER_ACCEPTED",
+      "ORDER_AMBIGUOUS",
+    ]);
+  });
+
+  it("demotes an unpaired (exit_removed) SELL to failedOrders when it definitively did not fill (2026-08-08 - previously unreachable for an unpaired ticker)", async () => {
+    const orders: RebalanceOrder[] = [{ ticker: "GLD", action: "SELL", shares: 10 }];
+    const audit = collectingAuditRecorder();
+
+    const result = await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: ALLOW_ALL,
+      submitOrderLeg: acceptingSubmitOrderLeg(),
+      appendAuditEvent: audit.appendAuditEvent,
+      refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+      waitForSellFill: async () => "definitively_not_filled",
+    });
+
+    expect(result.acceptedOrders).toHaveLength(0);
+    expect(result.ambiguousOrders).toHaveLength(0);
+    expect(result.failedOrders.map((o) => `${o.ticker}:${o.action}`)).toEqual([
+      "GLD:SELL",
+    ]);
+    expect(result.status).toBe("failed");
+
+    const gldEvents = audit.events.filter((e) => e.ticker === "GLD");
+    expect(gldEvents.map((e) => e.type)).toEqual([
+      "ORDER_SUBMITTED",
+      "ORDER_ACCEPTED",
+      "ORDER_REJECTED",
+    ]);
+  });
+
+  it("the actual settlement-barrier proof: waitForSellFill is awaited for an unpaired SELL before refreshPortfolioSnapshot is ever called (2026-08-08)", async () => {
+    const callOrder: string[] = [];
+    const orders: RebalanceOrder[] = [
+      { ticker: "GLD", action: "SELL", shares: 10 },
+      { ticker: "QQQ", action: "BUY", shares: 5, targetWeightPercent: 50 },
+    ];
+
+    const submitOrderLeg: EtfRotationSubmitOrderLeg = async (ticker, action) => {
+      callOrder.push(`submit:${ticker}:${action}`);
+      return { outcome: "accepted", brokerOrderId: `broker-${ticker}` };
+    };
+    const waitForSellFill = vi.fn(async (): Promise<"filled"> => {
+      callOrder.push("wait:GLD");
+      return "filled";
+    });
+
+    await executeEtfRotationOrders({
+      ...baseParams,
+      orders,
+      executionGates: ALLOW_ALL,
+      submitOrderLeg,
+      appendAuditEvent: async () => {},
+      refreshPortfolioSnapshot: async () => {
+        callOrder.push("refresh");
+        return makeSnapshot(100000);
+      },
+      waitForSellFill,
+    });
+
+    // GLD's SELL is unpaired (no GLD BUY this cycle) - before this PR,
+    // waitForSellFill was never called for it at all, so "refresh" could
+    // run (and the BUY phase could size/gate itself) before GLD's fill was
+    // ever confirmed. Now the wait must happen, and it must happen before
+    // the refresh that the BUY phase depends on.
+    expect(callOrder).toEqual([
+      "submit:GLD:SELL",
+      "wait:GLD",
+      "refresh",
+      "submit:QQQ:BUY",
+    ]);
   });
 
   it("never calls waitForSellFill when the SELL leg itself is gated off before ever reaching the broker", async () => {

@@ -150,6 +150,13 @@ describe("runEtfRotationCycle: asymmetric allowBuy/allowRebalanceSells gates", (
       broadcastSSE: () => {},
       executeSafeTrade,
       getPortfolioSnapshot: async () => portfolio,
+      // GLD's SELL is unpaired (not a top-2 pick this cycle, so no GLD BUY
+      // to pair it with) - since 2026-08-08, every accepted SELL is
+      // fill-confirmed before the BUY phase, paired or not (see
+      // etfRotationExecution.ts's SELL-settlement barrier), so this must
+      // be supplied even though this test doesn't exercise the wait's
+      // outcome-handling directly.
+      waitForSellFill: async () => "filled" as const,
       etfRotationStateFilePath: path.join(tempDir, "etf-rotation-worker-state.json"),
       etfRotationOrderAuditLogFilePath: path.join(tempDir, "etf-rotation-order-audit.jsonl"),
     });
