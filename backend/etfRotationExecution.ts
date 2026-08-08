@@ -48,6 +48,22 @@
 // its SELL happened to fill before the BUY was submitted). See
 // waitForSellFill below - this is now a genuine fill-confirmation wait,
 // scoped narrowly to exactly the leg pairing that needs it.
+//
+// UPDATE (2026-08-08, review finding, not a production incident): the
+// wait above only covered a paired (same-ticker) SELL/BUY - an unpaired
+// exit_removed SELL (a ticker dropped entirely, no same-cycle BUY) was
+// still only waited for broker acceptance, never fill. Since
+// refreshPortfolioSnapshot() below runs once, after the whole SELL loop,
+// and its result (cash, open-position count) drives every BUY leg's
+// sizing/gating - not just a same-ticker rebuild - an unconfirmed
+// exit_removed SELL could let a *different* ticker's BUY size/gate itself
+// against cash or a position-slot that wasn't actually free yet. Not yet
+// observed in production (current ramp is small and account cash is
+// ample), but a real gap before the ramp is ever raised. Generalized the
+// wait to cover every accepted SELL, paired or not - see the SELL loop
+// below: an unpaired SELL that can't be fill-confirmed now demotes
+// *itself* into ambiguousOrders (there's no paired BUY to redirect into),
+// reusing the existing ORDER_AMBIGUOUS audit event type.
 
 import {
   deriveLegType,
@@ -280,11 +296,11 @@ export interface ExecuteEtfRotationOrdersParams {
   /** Injected clock for deterministic audit-event timestamps in tests. */
   now: () => string;
   /**
-   * Called after an accepted liquidate_existing SELL (one with a paired
-   * rebuild_target BUY this cycle) to confirm it actually filled before the
-   * paired BUY is attempted - see the file-level 2026-08-04 update comment
-   * above for why. Never called for exit_removed SELLs (no paired BUY to
-   * gate) or for BUY legs.
+   * Called after every accepted SELL leg (2026-08-08: paired
+   * liquidate_existing SELLs AND unpaired exit_removed ones alike, see the
+   * file-level update comment above) to confirm it actually filled before
+   * the BUY phase's refreshPortfolioSnapshot() is trusted for sizing/
+   * gating. Never called for BUY legs.
    */
   waitForSellFill: WaitForSellFill;
 }
@@ -616,14 +632,15 @@ export async function executeEtfRotationOrders(
     const acceptedCountBefore = acceptedOrders.length;
     await attemptLeg(order, order.shares);
 
-    // Only a liquidate_existing SELL (paired with a rebuild BUY this cycle)
-    // needs a fill-confirmation wait - see the file-level 2026-08-04 update
-    // comment. An exit_removed SELL (no paired BUY) proceeds exactly as
-    // before, no wait.
+    // Every accepted SELL is fill-confirmed before the BUY phase begins -
+    // not just same-ticker paired rebuilds (2026-08-08 generalization, see
+    // the file-level update comment below). hasPairedBuy only changes
+    // WHERE an "unconfirmed" outcome gets recorded (the paired BUY vs. the
+    // SELL leg itself) - it never gates WHETHER the wait happens.
     const hasPairedBuy = buyTickers.has(order.ticker);
     const wasAccepted = acceptedOrders.length > acceptedCountBefore;
 
-    if (wasAccepted && hasPairedBuy) {
+    if (wasAccepted) {
       const acceptedOutcome = acceptedOrders[acceptedOrders.length - 1]!;
       const waitOutcome = acceptedOutcome.brokerOrderId
         ? await waitForSellFill(acceptedOutcome.brokerOrderId, order.ticker)
@@ -639,7 +656,8 @@ export async function executeEtfRotationOrders(
         // actively misleading, not just imprecise (caught in review before
         // merge, not self-caught). Demoted into failedOrders, the same
         // bucket an immediately-rejected SELL already lands in via
-        // attemptLeg, so both paths converge on one outcome shape.
+        // attemptLeg, so both paths converge on one outcome shape. Applies
+        // the same way whether or not this SELL has a paired BUY.
         sellFailedTickers.add(order.ticker);
         acceptedOrders.pop();
         acceptedOutcome.error = `SELL was initially accepted but did not end up filling (broker order ${acceptedOutcome.brokerOrderId ?? "unknown"} ultimately resolved to rejected/canceled/expired).`;
@@ -681,9 +699,36 @@ export async function executeEtfRotationOrders(
             brokerOrderId: acceptedOutcome.brokerOrderId,
             error: buyOutcome.error,
           });
+        } else {
+          // No paired BUY to redirect into - the SELL's OWN outcome is
+          // what's uncertain (2026-08-08). Demote it out of acceptedOrders
+          // the same way definitively_not_filled does, but into
+          // ambiguousOrders (never assume success, §8) rather than
+          // failedOrders (we don't KNOW it failed, only that we can't
+          // confirm it) - reuses the existing ORDER_AMBIGUOUS event type
+          // (attemptLeg's own ambiguous branch already uses it for the
+          // identical semantic), not a new one.
+          acceptedOrders.pop();
+          acceptedOutcome.error = `SELL was initially accepted but its fill could not be confirmed before the configured timeout (broker order ${acceptedOutcome.brokerOrderId ?? "unknown"}) - cash/position-slot from this SELL cannot be safely assumed available for this cycle's BUY phase.`;
+          ambiguousOrders.push(acceptedOutcome);
+
+          await appendAuditEvent({
+            type: "ORDER_AMBIGUOUS",
+            timestamp: now(),
+            rebalanceMonthKey,
+            configVariantKey,
+            ticker: order.ticker,
+            side: "SELL",
+            legType: acceptedOutcome.legType,
+            requestedQty: acceptedOutcome.requestedQty,
+            submittedQty: acceptedOutcome.submittedQty,
+            brokerOrderId: acceptedOutcome.brokerOrderId,
+            error: acceptedOutcome.error,
+          });
         }
       }
-      // "filled" - no action needed, the paired BUY proceeds normally below.
+      // "filled" - no action needed, the (paired or unpaired) SELL's
+      // acceptance stands and any paired BUY proceeds normally below.
     }
   }
 
