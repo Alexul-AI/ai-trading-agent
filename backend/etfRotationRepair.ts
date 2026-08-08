@@ -38,19 +38,32 @@ export const REPAIR_AUDIT_LOG_SCAN_LIMIT = 10000;
 
 export interface EtfRotationRepairPolicyGateBlock {
   allowed: false;
-  code: "LIVE_MODE_NOT_SUPPORTED" | "EXECUTE_TRADES_DISABLED" | "ALLOW_BUY_DISABLED";
+  code:
+    | "LIVE_MODE_NOT_SUPPORTED"
+    | "ETF_ROTATION_STRATEGY_DISABLED"
+    | "EXECUTE_TRADES_DISABLED"
+    | "ALLOW_BUY_DISABLED";
   error: string;
 }
 
-// The three static, deployment-lifetime policy gates - pure so
-// "tradeMode !== paper -> blocked" is directly testable without an Express
-// app, unlike the state-dependent checks in decideEtfRotationRepairEligibility
-// below, which genuinely need I/O first. Paper-only is a hard block for
-// this version - no live support, not even behind a flag - checked first
-// since it's the one gate meant to never be revisited without a separate,
-// deliberate future decision.
+// The four static, deployment-lifetime policy gates - pure so each is
+// directly testable without an Express app, unlike the state-dependent
+// checks in decideEtfRotationRepairEligibility below, which genuinely need
+// I/O first. Paper-only is a hard block for this version - no live
+// support, not even behind a flag - checked first since it's the one gate
+// meant to never be revisited without a separate, deliberate future
+// decision.
+//
+// activeStrategy is checked second, before the trade-execution gates: this
+// endpoint reads and repairs against etf-rotation-worker-state.json /
+// etf-rotation-order-audit.jsonl, which are meaningless (and could be
+// stale/misleading) whenever AUTOPILOT_STRATEGY isn't currently
+// "etf_rotation" - e.g. if a deployment is ever switched back to the
+// baseline strategy, this endpoint must not still be able to submit a
+// repair BUY against old rotation state (2026-08-08 review finding).
 export function checkEtfRotationRepairPolicyGates(params: {
   tradeMode: string;
+  activeStrategy: string;
   executeTradesEnabled: boolean;
   allowBuyEnabled: boolean;
 }): { allowed: true } | EtfRotationRepairPolicyGateBlock {
@@ -60,6 +73,15 @@ export function checkEtfRotationRepairPolicyGates(params: {
       code: "LIVE_MODE_NOT_SUPPORTED",
       error:
         "ETF Rotation repair is paper-only in this version - no live support.",
+    };
+  }
+
+  if (params.activeStrategy !== "etf_rotation") {
+    return {
+      allowed: false,
+      code: "ETF_ROTATION_STRATEGY_DISABLED",
+      error:
+        "ETF Rotation repair is only available while AUTOPILOT_STRATEGY=etf_rotation is active.",
     };
   }
 

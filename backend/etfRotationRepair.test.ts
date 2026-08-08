@@ -28,9 +28,14 @@ import type { ExecuteSafeTradeResult } from "./src/types/autopilotTypes.js";
 const MONTH = "2026-08";
 
 describe("checkEtfRotationRepairPolicyGates", () => {
-  const paperAllowed = { tradeMode: "paper", executeTradesEnabled: true, allowBuyEnabled: true };
+  const paperAllowed = {
+    tradeMode: "paper",
+    activeStrategy: "etf_rotation",
+    executeTradesEnabled: true,
+    allowBuyEnabled: true,
+  };
 
-  it("allows when paper mode and both trade gates are enabled", () => {
+  it("allows when paper mode, etf_rotation is active, and both trade gates are enabled", () => {
     expect(checkEtfRotationRepairPolicyGates(paperAllowed)).toEqual({ allowed: true });
   });
 
@@ -40,6 +45,18 @@ describe("checkEtfRotationRepairPolicyGates", () => {
       allowed: false,
       code: "LIVE_MODE_NOT_SUPPORTED",
       error: expect.stringContaining("paper-only"),
+    });
+  });
+
+  it("blocks with ETF_ROTATION_STRATEGY_DISABLED when AUTOPILOT_STRATEGY isn't etf_rotation - prevents repairing stale rotation state after a switch back to baseline", () => {
+    const result = checkEtfRotationRepairPolicyGates({
+      ...paperAllowed,
+      activeStrategy: "baseline",
+    });
+    expect(result).toEqual({
+      allowed: false,
+      code: "ETF_ROTATION_STRATEGY_DISABLED",
+      error: expect.stringContaining("etf_rotation"),
     });
   });
 
@@ -61,13 +78,24 @@ describe("checkEtfRotationRepairPolicyGates", () => {
     expect((result as { code: string }).code).toBe("ALLOW_BUY_DISABLED");
   });
 
-  it("checks tradeMode before the trade gates, matching the endpoint's stated check order", () => {
+  it("checks tradeMode before the strategy/trade gates, matching the endpoint's stated check order", () => {
     const result = checkEtfRotationRepairPolicyGates({
       tradeMode: "live",
+      activeStrategy: "baseline",
       executeTradesEnabled: false,
       allowBuyEnabled: false,
     });
     expect((result as { code: string }).code).toBe("LIVE_MODE_NOT_SUPPORTED");
+  });
+
+  it("checks activeStrategy before the trade-execution gates", () => {
+    const result = checkEtfRotationRepairPolicyGates({
+      tradeMode: "paper",
+      activeStrategy: "baseline",
+      executeTradesEnabled: false,
+      allowBuyEnabled: false,
+    });
+    expect((result as { code: string }).code).toBe("ETF_ROTATION_STRATEGY_DISABLED");
   });
 });
 

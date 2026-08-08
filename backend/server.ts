@@ -35,6 +35,7 @@ import {
 import {
   AUTOPILOT_EXECUTE_TRADES,
   AUTOPILOT_ALLOW_BUY,
+  AUTOPILOT_STRATEGY,
   AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT,
   AUTOPILOT_ETF_ROTATION_MAX_POSITIONS,
   ETF_ROTATION_ACTIVE_CONFIG,
@@ -1403,9 +1404,10 @@ const etfRotationRepairMissingBuySchema = z.object({
 // dependencies into performEtfRotationRepairMissingBuy and translates its
 // result into an HTTP response.
 //
-// The three policy gates below are checked before req.body is even parsed
-// (mirrors /api/trade's own areManualTradesAllowed()-first pattern below) -
-// static, deployment-lifetime checks that can never resolve differently on
+// The four policy gates below (paper-only, active-strategy, execute-trades,
+// allow-buy) are checked before req.body is even parsed (mirrors
+// /api/trade's own areManualTradesAllowed()-first pattern below) - static,
+// deployment-lifetime checks that can never resolve differently on
 // a retry within this process, unlike the state-dependent 409 preconditions
 // performEtfRotationRepairMissingBuy itself returns.
 app.post(
@@ -1414,6 +1416,7 @@ app.post(
   async (req, res) => {
     const policyGate = checkEtfRotationRepairPolicyGates({
       tradeMode: ENV.TRADE_MODE,
+      activeStrategy: AUTOPILOT_STRATEGY,
       executeTradesEnabled: AUTOPILOT_EXECUTE_TRADES,
       allowBuyEnabled: AUTOPILOT_ALLOW_BUY,
     });
