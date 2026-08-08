@@ -29,6 +29,19 @@ import {
 } from "./etfRotationOrderAuditLog.js";
 import { deriveEtfRotationOffTargetState } from "./etfRotationReview.js";
 import {
+  checkEtfRotationRepairPolicyGates,
+  performEtfRotationRepairMissingBuy,
+} from "./etfRotationRepair.js";
+import {
+  AUTOPILOT_EXECUTE_TRADES,
+  AUTOPILOT_ALLOW_BUY,
+  AUTOPILOT_STRATEGY,
+  AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT,
+  AUTOPILOT_ETF_ROTATION_MAX_POSITIONS,
+  ETF_ROTATION_ACTIVE_CONFIG,
+  ETF_ROTATION_CONFIG_VARIANT_KEY,
+} from "./autopilotConfig.js";
+import {
   classifyOrderError,
   createPersistedClientOrderIdTracker,
   extractMessage,
@@ -688,21 +701,38 @@ async function executeSafeTrade(
       orderId,
     });
 
-    broadcastSSE({
-      type: "trade",
-      data: {
-        ticker,
-        action,
-        shares: finalShares,
-        notional: finalNotional,
-        price: estimatedPrice,
-        orderId,
-      },
-    });
+    // Best-effort only: the broker has already accepted this order by this
+    // point (createOrder succeeded, or the duplicate_client_order_id branch
+    // above confirmed it via getOrderByClientId) - a notification failure
+    // here must never turn an already-successful order into a reported
+    // failure. Without this, the outer catch below would convert a thrown
+    // sendTelegramAlert into { status: "error" }, which callers like
+    // etfRotationRepair.ts's mapExecuteSafeTradeResultToLegOutcome treat as
+    // "rejected" - misreporting a real, broker-accepted order as rejected
+    // (same risk class as the repair endpoint's own notification-isolation
+    // fix, one layer deeper).
+    try {
+      broadcastSSE({
+        type: "trade",
+        data: {
+          ticker,
+          action,
+          shares: finalShares,
+          notional: finalNotional,
+          price: estimatedPrice,
+          orderId,
+        },
+      });
 
-    await sendTelegramAlert(
-      `ORDER ${action} ${quantityLabel} ${ticker} @ approx $${estimatedPrice}`,
-    );
+      await sendTelegramAlert(
+        `ORDER ${action} ${quantityLabel} ${ticker} @ approx $${estimatedPrice}`,
+      );
+    } catch (notifyError) {
+      console.warn(
+        "[TRADE] Notification failed after a successful order:",
+        notifyError,
+      );
+    }
 
     return {
       status: "success",
@@ -1371,6 +1401,111 @@ app.post(
         error,
       );
       res.status(500).json({ error: "Failed to clear ETF Rotation review" });
+    }
+  },
+);
+
+const etfRotationRepairMissingBuySchema = z.object({
+  ticker: z.string().trim().min(1, "A ticker is required."),
+  reason: z
+    .string()
+    .trim()
+    .min(1, "A reason is required to repair a missing BUY leg."),
+});
+
+// Manual-only repair for a single missing rebalance BUY leg already
+// reported by offTargetReview above (built after the 2026-08-03 QQQ
+// incident). Paper-only, hard block - no live support in this version, not
+// even behind a flag. See backend/etfRotationRepair.ts for the full
+// eligibility/sizing/audit logic - this handler only wires real
+// dependencies into performEtfRotationRepairMissingBuy and translates its
+// result into an HTTP response.
+//
+// The four policy gates below (paper-only, active-strategy, execute-trades,
+// allow-buy) are checked before req.body is even parsed (mirrors
+// /api/trade's own areManualTradesAllowed()-first pattern below) - static,
+// deployment-lifetime checks that can never resolve differently on
+// a retry within this process, unlike the state-dependent 409 preconditions
+// performEtfRotationRepairMissingBuy itself returns.
+app.post(
+  "/api/autopilot/etf-rotation/repair-missing-buy",
+  requireAdminToken,
+  async (req, res) => {
+    const policyGate = checkEtfRotationRepairPolicyGates({
+      tradeMode: ENV.TRADE_MODE,
+      activeStrategy: AUTOPILOT_STRATEGY,
+      executeTradesEnabled: AUTOPILOT_EXECUTE_TRADES,
+      allowBuyEnabled: AUTOPILOT_ALLOW_BUY,
+    });
+
+    if (!policyGate.allowed) {
+      res.status(403).json({ code: policyGate.code, error: policyGate.error });
+      return;
+    }
+
+    const parsedBody = etfRotationRepairMissingBuySchema.safeParse(req.body);
+
+    if (!parsedBody.success) {
+      const fieldErrors = parsedBody.error.flatten().fieldErrors;
+      res.status(400).json({
+        error:
+          fieldErrors.ticker?.[0] ??
+          fieldErrors.reason?.[0] ??
+          "A ticker and reason are required.",
+      });
+      return;
+    }
+
+    const { ticker, reason } = parsedBody.data;
+
+    try {
+      const result = await performEtfRotationRepairMissingBuy({
+        ticker,
+        reason,
+        configVariantKey: ETF_ROTATION_CONFIG_VARIANT_KEY,
+        maxAllowedPositions: AUTOPILOT_ETF_ROTATION_MAX_POSITIONS,
+        rampMaxPositionEquityPercent:
+          AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT,
+        universeTickers: ETF_ROTATION_ACTIVE_CONFIG.universe,
+        getPortfolioSnapshot,
+        getEstimatedPrice: (t) => getEstimatedPrice(t),
+        checkOpenBuyOrderExists: async (t) => {
+          const orders = await getOrdersSnapshot();
+          return orders.some(
+            (order) => order.ticker === t && order.action === "BUY",
+          );
+        },
+        getMarketIsOpen: async () => (await fetchAlpacaMarketClock()).isOpen,
+        executeSafeTrade,
+        broadcastSSE,
+        sendTelegramAlert,
+      });
+
+      if (result.kind === "blocked") {
+        res.status(409).json({
+          error: result.blockDetail,
+          blockReason: result.blockReason,
+        });
+        return;
+      }
+
+      res.status(200).json({
+        outcome: result.outcome,
+        ticker: result.ticker,
+        rebalanceMonthKey: result.rebalanceMonthKey,
+        targetWeightPercent: result.targetWeightPercent,
+        requestedShares: result.requestedShares,
+        brokerOrderId: result.brokerOrderId ?? null,
+        reason: result.reason ?? null,
+      });
+    } catch (error) {
+      console.error(
+        "[API] /api/autopilot/etf-rotation/repair-missing-buy failed:",
+        error,
+      );
+      res
+        .status(500)
+        .json({ error: "Failed to repair ETF Rotation missing BUY leg" });
     }
   },
 );
