@@ -275,6 +275,51 @@ export async function runEtfRotationCycle(
   // preBarsGateAction === "needs_month_key" - no restart hazard applies;
   // safe (and necessary) to fetch market data now.
 
+  // Cheap pre-fetch short-circuit (2026-08-08): the vast majority of hourly
+  // cycles within a month are NOT the rebalance day - fetching 400 days of
+  // bars for all 5 universe tickers just to re-derive "already done this
+  // month" (a conclusion the state file alone can already answer) wastes
+  // ~24 fetches/ticker/day for ~29 of every ~30 days. Reuses `timestamp`
+  // (already computed above, no new clock read) as a wall-clock heuristic
+  // monthKey, fed into the same decideEtfRotationGateAction this function
+  // already trusts - not a new gate, not a refactor of the restart-hazard
+  // checks above (those already ran, unconditionally, against monthKey:
+  // null). If the wall-clock month is ever ahead of the real bar-derived
+  // month (only possible right at a month boundary), isRebalanceMonthDone
+  // simply won't match and this falls through to the real fetch below -
+  // this can only ever cause an extra fetch, never an incorrectly skipped
+  // rebalance day.
+  const cheapMonthKey = timestamp.slice(0, 7);
+  const cheapGateAction = decideEtfRotationGateAction(stateResult, cheapMonthKey);
+
+  if (cheapGateAction === "already_done_this_month") {
+    // portfolio.positions[ticker].currentPrice is Alpaca's own live quote
+    // (server.ts's getPortfolioSnapshot, not our bars cache) - already
+    // fetched unconditionally before this function was even called, so
+    // using it here costs nothing and gives a real price for held tickers
+    // instead of a bare 0, unlike the corrupt/stuck-executing blocks above
+    // (which have no such shortcut available).
+    return config.universe.map((ticker) => ({
+      ticker,
+      timestamp,
+      price: portfolio.positions[ticker]?.currentPrice ?? 0,
+      action: "HOLD",
+      confidence: 0,
+      suggestedShares: 0,
+      reasonType: "NOT_REBALANCE_DAY",
+      reason: `Already rebalanced this month (${cheapMonthKey}, status ${stateResult.state.status}) - skipped market-data fetch.`,
+      finalStatus: "hold",
+      signalStatus: "hold",
+      executionStatus: "not_attempted",
+      isSignalReady: false,
+      executed: false,
+    }));
+  }
+
+  // cheapGateAction === "proceed_to_plan" - the only other reachable value
+  // here (state_corrupt/stale_executing/failed_needs_review were already
+  // handled above) - fetch bars now.
+
   const barsByTicker = new Map<string, AlpacaBar[]>();
 
   await Promise.all(
