@@ -321,6 +321,32 @@ async function main() {
     };
   });
 
+  // Explains, not just discloses, a low reduction number - PR #83's
+  // backtest found 55-85% turnover reduction, but that number assumes a
+  // portfolio already close to target. If the real live portfolio is
+  // currently far from target (e.g. because AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT
+  // is keeping real position sizes well below their nominal weight), the
+  // delta to trade is nearly as large as the full target, so delta-only has
+  // little left to save THIS cycle - not a contradiction of PR #83, a
+  // demonstration of exactly the interaction PR #84's point 4 flagged
+  // (delta-only's benefit and the ramp-cap decision are not independent).
+  // Threshold: half of PR #83's own low end (55%/2 = 27.5%), so this only
+  // fires when the reduction is meaningfully below what a target-tracking
+  // portfolio would show, not on ordinary noise.
+  const avgDeviationPercent =
+    deviationRows.length > 0
+      ? deviationRows.reduce((sum, r) => sum + r.deviationPercent, 0) / deviationRows.length
+      : 0;
+  const minReductionPercent = Math.min(
+    ...thresholdResults.map((tr) =>
+      realFullLiquidateGrossUsd > 0 ? ((realFullLiquidateGrossUsd - tr.grossUsd) / realFullLiquidateGrossUsd) * 100 : 100,
+    ),
+  );
+  const lowReductionExplainerLine =
+    minReductionPercent < 27.5
+      ? `\n**Read this reduction number carefully**: it is well below PR #83's backtest range (55-85%). Average deviation from target this cycle is ${avgDeviationPercent.toFixed(1)}pp - the real live portfolio is currently far from its target weights (see the per-ticker table above), likely due to the live ramp cap (\`AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT\`) constraining real position sizes. When a portfolio is this far from target, the delta to trade is nearly as large as the full target itself, so delta-only has little turnover left to save. This is not a contradiction of PR #83 - it is the real-data confirmation of PR #84's point 4: delta-only's benefit and the ramp-cap decision are not independent questions.\n`
+      : "";
+
   const observedAt = new Date().toISOString();
 
   await appendLogRows(
@@ -368,7 +394,7 @@ ${thresholdResults
       } | ${tr.orders.length} |`,
   )
   .join("\n")}
-
+${lowReductionExplainerLine}
 ## Delta-only legs by threshold (PR #84's proposed legType vocabulary - dormant, read-only, not the real audit log)
 
 ${thresholdResults
