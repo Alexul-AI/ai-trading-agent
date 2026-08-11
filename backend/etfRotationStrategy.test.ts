@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   assertValidEtfRotationConfig,
+  computeDeltaRebalanceOrders,
   computeMomentumReturnPercent,
   computeRebalanceOrders,
   decideRotationTargets,
@@ -11,6 +12,7 @@ import {
   ETF_ROTATION_MVP_BASELINE_CONFIG,
   ETF_ROTATION_HOLD3_CANDIDATE_CONFIG,
   type EtfRotationConfig,
+  type RebalanceOrder,
   type RotationTarget,
 } from "./etfRotationStrategy.js";
 
@@ -457,5 +459,231 @@ describe("computeRebalanceOrders", () => {
         { ticker: "QQQ", action: "BUY", shares: 12, targetWeightPercent: 50 },
       ]);
     });
+  });
+});
+
+// Applies a RebalanceOrder[] to a starting holdings map and returns the
+// resulting holdings - lets the invariant tests below compare FINAL STATE
+// between computeRebalanceOrders and computeDeltaRebalanceOrders, not the
+// (deliberately different) order lists that produce it.
+function applyOrders(
+  startingShares: Map<string, number>,
+  orders: RebalanceOrder[],
+): Map<string, number> {
+  const holdings = new Map(startingShares);
+  for (const order of orders) {
+    const current = holdings.get(order.ticker) ?? 0;
+    if (order.action === "BUY") {
+      holdings.set(order.ticker, current + order.shares);
+    } else {
+      const remaining = current - order.shares;
+      if (remaining <= 0) holdings.delete(order.ticker);
+      else holdings.set(order.ticker, remaining);
+    }
+  }
+  return holdings;
+}
+
+describe("computeDeltaRebalanceOrders - strict algebraic invariant vs computeRebalanceOrders at threshold=0 (hard merge gate)", () => {
+  const universe = ["SPY", "QQQ", "EFA", "TLT", "GLD"];
+
+  it("matches for a fresh-cash rebalance (no prior holdings)", () => {
+    const targets: RotationTarget[] = [
+      { ticker: "SPY", weightPercent: 50 },
+      { ticker: "QQQ", weightPercent: 50 },
+    ];
+    const currentShares = new Map<string, number>();
+    const prices = new Map([["SPY", 500], ["QQQ", 400]]);
+
+    const fullLiquidateFinal = applyOrders(
+      currentShares,
+      computeRebalanceOrders(targets, 10000, currentShares, prices, universe),
+    );
+    const deltaOnlyFinal = applyOrders(
+      currentShares,
+      computeDeltaRebalanceOrders(targets, 10000, currentShares, prices, universe, 0),
+    );
+
+    expect(deltaOnlyFinal).toEqual(fullLiquidateFinal);
+    expect(deltaOnlyFinal).toEqual(new Map([["SPY", 10], ["QQQ", 12]]));
+  });
+
+  it("matches for a continuing pick currently overweight vs. target", () => {
+    const targets: RotationTarget[] = [{ ticker: "SPY", weightPercent: 20 }];
+    const currentShares = new Map([["SPY", 30]]); // 30% of equity, target is 20%
+    const prices = new Map([["SPY", 100]]);
+
+    const fullLiquidateFinal = applyOrders(
+      currentShares,
+      computeRebalanceOrders(targets, 10000, currentShares, prices, universe),
+    );
+    const deltaOnlyFinal = applyOrders(
+      currentShares,
+      computeDeltaRebalanceOrders(targets, 10000, currentShares, prices, universe, 0),
+    );
+
+    expect(deltaOnlyFinal).toEqual(fullLiquidateFinal);
+    expect(deltaOnlyFinal).toEqual(new Map([["SPY", 20]]));
+  });
+
+  it("matches for a continuing pick currently underweight vs. target", () => {
+    const targets: RotationTarget[] = [{ ticker: "SPY", weightPercent: 20 }];
+    const currentShares = new Map([["SPY", 10]]); // 10% of equity, target is 20%
+    const prices = new Map([["SPY", 100]]);
+
+    const fullLiquidateFinal = applyOrders(
+      currentShares,
+      computeRebalanceOrders(targets, 10000, currentShares, prices, universe),
+    );
+    const deltaOnlyFinal = applyOrders(
+      currentShares,
+      computeDeltaRebalanceOrders(targets, 10000, currentShares, prices, universe, 0),
+    );
+
+    expect(deltaOnlyFinal).toEqual(fullLiquidateFinal);
+    expect(deltaOnlyFinal).toEqual(new Map([["SPY", 20]]));
+  });
+
+  it("matches for a continuing pick already exactly at target (full-liquidate round-trips, delta-only trades nothing)", () => {
+    const targets: RotationTarget[] = [{ ticker: "SPY", weightPercent: 20 }];
+    const currentShares = new Map([["SPY", 20]]); // already exactly at the 20-share target
+    const prices = new Map([["SPY", 100]]);
+
+    const deltaOrders = computeDeltaRebalanceOrders(targets, 10000, currentShares, prices, universe, 0);
+    expect(deltaOrders).toEqual([]); // no-op, not a same-quantity round trip
+
+    const fullLiquidateFinal = applyOrders(
+      currentShares,
+      computeRebalanceOrders(targets, 10000, currentShares, prices, universe),
+    );
+    const deltaOnlyFinal = applyOrders(currentShares, deltaOrders);
+
+    expect(deltaOnlyFinal).toEqual(fullLiquidateFinal);
+    expect(deltaOnlyFinal).toEqual(new Map([["SPY", 20]]));
+  });
+
+  it("matches for a new pick (not currently held) alongside an unrelated already-at-target position", () => {
+    const targets: RotationTarget[] = [
+      { ticker: "SPY", weightPercent: 50 },
+      { ticker: "QQQ", weightPercent: 50 },
+    ];
+    const currentShares = new Map([["SPY", 50]]); // already exactly at its own 50-share target
+    const prices = new Map([["SPY", 100], ["QQQ", 200]]);
+
+    const fullLiquidateFinal = applyOrders(
+      currentShares,
+      computeRebalanceOrders(targets, 10000, currentShares, prices, universe),
+    );
+    const deltaOnlyFinal = applyOrders(
+      currentShares,
+      computeDeltaRebalanceOrders(targets, 10000, currentShares, prices, universe, 0),
+    );
+
+    expect(deltaOnlyFinal).toEqual(fullLiquidateFinal);
+    expect(deltaOnlyFinal).toEqual(new Map([["SPY", 50], ["QQQ", 25]]));
+  });
+
+  it("matches for a dropped pick (held, no longer a target - full exit either way)", () => {
+    const targets: RotationTarget[] = [];
+    const currentShares = new Map([["GLD", 15]]);
+    const prices = new Map([["GLD", 150]]);
+
+    const fullLiquidateFinal = applyOrders(
+      currentShares,
+      computeRebalanceOrders(targets, 10000, currentShares, prices, universe),
+    );
+    const deltaOnlyFinal = applyOrders(
+      currentShares,
+      computeDeltaRebalanceOrders(targets, 10000, currentShares, prices, universe, 0),
+    );
+
+    expect(deltaOnlyFinal).toEqual(fullLiquidateFinal);
+    expect(deltaOnlyFinal.has("GLD")).toBe(false);
+  });
+
+  it("matches for a mixed scenario combining exit/overweight/underweight/at-target/new-pick across 5 tickers in one call", () => {
+    const targets: RotationTarget[] = [
+      { ticker: "SPY", weightPercent: 30 }, // continuing, will be overweight (80 held vs 60 target)
+      { ticker: "QQQ", weightPercent: 20 }, // continuing, will be underweight (10 held vs 20 target)
+      { ticker: "EFA", weightPercent: 10 }, // continuing, exactly at target (40 held == 40 target)
+      { ticker: "TLT", weightPercent: 15 }, // new pick, not currently held
+      // GLD not a target this rebalance - currently held, must exit
+    ];
+    const currentShares = new Map([
+      ["SPY", 80],
+      ["QQQ", 10],
+      ["EFA", 40],
+      ["GLD", 25],
+    ]);
+    const prices = new Map([
+      ["SPY", 100],
+      ["QQQ", 200],
+      ["EFA", 50],
+      ["TLT", 80],
+      ["GLD", 150],
+    ]);
+
+    const fullLiquidateFinal = applyOrders(
+      currentShares,
+      computeRebalanceOrders(targets, 20000, currentShares, prices, universe),
+    );
+    const deltaOnlyFinal = applyOrders(
+      currentShares,
+      computeDeltaRebalanceOrders(targets, 20000, currentShares, prices, universe, 0),
+    );
+
+    expect(deltaOnlyFinal).toEqual(fullLiquidateFinal);
+    expect(deltaOnlyFinal).toEqual(
+      new Map([
+        ["SPY", 60],
+        ["QQQ", 20],
+        ["EFA", 40],
+        ["TLT", 37],
+      ]),
+    );
+    expect(deltaOnlyFinal.has("GLD")).toBe(false);
+  });
+});
+
+describe("computeDeltaRebalanceOrders - tolerance-band threshold behavior", () => {
+  const universe = ["SPY"];
+
+  it("skips a trade entirely when the deviation from target is within the threshold", () => {
+    // 22% actual vs 20% target = 2pp deviation - within a 5% band, skip.
+    const targets: RotationTarget[] = [{ ticker: "SPY", weightPercent: 20 }];
+    const currentShares = new Map([["SPY", 22]]); // 22 * 100 / 10000 * 100 = 22%
+    const prices = new Map([["SPY", 100]]);
+
+    const orders = computeDeltaRebalanceOrders(targets, 10000, currentShares, prices, universe, 5);
+
+    expect(orders).toEqual([]);
+  });
+
+  it("still trades once the deviation reaches/exceeds the threshold", () => {
+    // 26% actual vs 20% target = 6pp deviation - at/above a 5% band, trade.
+    const targets: RotationTarget[] = [{ ticker: "SPY", weightPercent: 20 }];
+    const currentShares = new Map([["SPY", 26]]); // 26 * 100 / 10000 * 100 = 26%
+    const prices = new Map([["SPY", 100]]);
+
+    const orders = computeDeltaRebalanceOrders(targets, 10000, currentShares, prices, universe, 5);
+
+    expect(orders).toEqual([{ ticker: "SPY", action: "SELL", shares: 6 }]); // target 20 shares, held 26
+  });
+
+  it("an exit (dropped pick) is never gated by the threshold", () => {
+    const targets: RotationTarget[] = []; // GLD no longer a target at all
+    const currentShares = new Map([["GLD", 1]]); // a tiny position, would be "within tolerance" for any weight-based check
+    const prices = new Map([["GLD", 150]]);
+
+    const orders = computeDeltaRebalanceOrders(
+      targets,
+      10000,
+      currentShares,
+      prices,
+      ["GLD"],
+      50, // a very generous threshold - still must not block the exit
+    );
+
+    expect(orders).toEqual([{ ticker: "GLD", action: "SELL", shares: 1 }]);
   });
 });
