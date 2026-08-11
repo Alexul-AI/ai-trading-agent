@@ -21,6 +21,7 @@
     "test:backtest-etf-rotation-small-tranche-simulation": "tsx backtest-etf-rotation-small-tranche-simulation.ts",
     "test:backtest-etf-rotation-methodology-metrics": "tsx backtest-etf-rotation-methodology-metrics.ts",
     "test:backtest-etf-rotation-delta-rebalance-feasibility": "tsx backtest-etf-rotation-delta-rebalance-feasibility.ts",
+    "test:etf-rotation-delta-only-live-shadow": "tsx etf-rotation-delta-only-live-shadow.ts",
     "export-realized-pnl": "tsx export-realized-pnl.ts",
     "test": "vitest run"
   },

@@ -1,0 +1,113 @@
+name: ETF Rotation Delta-Only Live Shadow
+
+# Runs etf-rotation-delta-only-live-shadow.ts daily so a real, terminal
+# monthly rebalance gets shadowed close to when it actually happens - see
+# docs/ops/ETF_ROTATION_DELTA_ONLY_LIVE_SEMANTICS.md (design spec, PR #84)
+# and the "ETF Rotation delta-only live-portfolio shadow tracking" plan for
+# the full design. Daily rather than forward-validation.yml's weekly cadence
+# - a real live rebalance happens on the first trading day of the month, and
+# a week's delay risks losing the operational context around exactly when it
+# happened. The script itself makes daily cheap: a no-op day (the common
+# case - most days aren't a new, terminal rebalance month) costs one HTTPS
+# call to the public review endpoint and two local file reads, no Alpaca
+# price-API calls, no commit.
+#
+# Read-only against the already-deployed, public GET
+# /api/autopilot/etf-rotation/review endpoint and Alpaca's current-price
+# data API - never touches execution, orders, the repair endpoint, or the
+# live autopilot worker. Does not run inside Render; a separate
+# GitHub-hosted job, so it does not add a new live worker to the deployed
+# app (the same constraint every other research workflow in this repo
+# respects).
+on:
+  schedule:
+    - cron: "0 22 * * *" # Daily at 22:00 UTC (after US market close)
+  workflow_dispatch: {} # Allows a manual on-demand run from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  delta-only-shadow:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      # Only needs the Alpaca *data* API creds (for the current-price fetch,
+      # target tickers only) - the live portfolio/targets themselves come
+      # from the public Render review endpoint below, not from Alpaca
+      # directly, and not from any admin-gated route.
+      - name: Run delta-only live shadow script
+        run: npm run test:etf-rotation-delta-only-live-shadow
+        env:
+          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+      # data/ is gitignored repo-wide (research reports are normally
+      # local-only, see CLAUDE.md) - these three files are a deliberate,
+      # narrow exception via `add -f`, matching forward-validation.yml's own
+      # precedent. On most days (no new meaningful observation) the script
+      # writes nothing, so `git diff --cached --quiet` finds no changes and
+      # this step is a no-op - no daily commit spam.
+      - name: Commit the updated report/log/state if anything changed
+        working-directory: .
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f \
+            backend/data/backtest-reports/etf-rotation/etf-rotation-delta-only-live-shadow-report.md \
+            backend/data/backtest-reports/etf-rotation/etf-rotation-delta-only-live-shadow-log.csv \
+            backend/data/etf-rotation-delta-only-live-shadow-state.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit (no-op day or already-shadowed month)."
+          else
+            git commit -m "chore: record ETF rotation delta-only live shadow observation [skip ci]"
+            git push
+          fi
+      # Same shape as PR #74's forward-validation alert - a broken daily
+      # shadow run must not fail silently for weeks the way the
+      # 2026-07-28 forward-validation incident did. Fail-soft if the
+      # secrets aren't configured, mirroring every other alert step in this
+      # repo.
+      - name: Alert on failure via Telegram
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set as GitHub Actions secrets - skipping alert."
+            exit 0
+          fi
+          node -e '
+            const https = require("https");
+            const text = [
+              `${process.env.WORKFLOW_NAME} workflow FAILED`,
+              `Workflow: ${process.env.WORKFLOW_NAME}`,
+              `Branch: ${process.env.BRANCH_NAME}`,
+              "Conclusion: failure",
+              `Run: ${process.env.RUN_URL}`,
+            ].join("\n");
+            const body = JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text });
+            const req = https.request(
+              `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+              { method: "POST", headers: { "Content-Type": "application/json" } },
+              (res) => {
+                res.on("data", () => {});
+                res.on("end", () => process.exit(res.statusCode && res.statusCode < 400 ? 0 : 1));
+              },
+            );
+            req.on("error", (err) => { console.error(err); process.exit(1); });
+            req.write(body);
+            req.end();
+          '
