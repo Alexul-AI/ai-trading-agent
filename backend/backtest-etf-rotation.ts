@@ -176,7 +176,7 @@ function findSimStartIndex(
   return commonDates.length;
 }
 
-interface TradeLogEntry {
+export interface TradeLogEntry {
   date: string;
   ticker: string;
   action: "BUY" | "SELL";
@@ -184,7 +184,7 @@ interface TradeLogEntry {
   price: number;
 }
 
-interface EquityCurvePoint {
+export interface EquityCurvePoint {
   date: string;
   equity: number;
   cash: number;
