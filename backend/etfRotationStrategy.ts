@@ -322,3 +322,85 @@ export function computeRebalanceOrders(
 
   return orders;
 }
+
+/**
+ * Delta-only alternative to computeRebalanceOrders (2026-08-10, research
+ * only - see the "ETF Rotation delta-only rebalance feasibility" plan).
+ * Trades only the difference between current and target shares, instead
+ * of fully liquidating then rebuying. A separate function rather than a
+ * mode flag on computeRebalanceOrders - the internal logic differs enough
+ * to warrant it, matching this file's own computeRampMaxShares/
+ * computeRampMaxNotional-style convention of separate named functions
+ * over branching one function on a mode.
+ *
+ * Algebraic property (proved directly by unit tests, not inferred from a
+ * simulation): for identical inputs and thresholdPercent=0, this function
+ * produces orders that result in the exact same final holdings as
+ * computeRebalanceOrders - both compute the identical
+ * targetShares = Math.floor(targetDollars / price) from the same
+ * weightPercent x currentEquity, the only difference is how you get
+ * there (a full round-trip vs. trading just the delta). Tracking drift
+ * only becomes a real cost once thresholdPercent > 0 deliberately skips a
+ * rebalance to save further turnover.
+ *
+ * Exit (currently held, no longer a target) is always a full SELL,
+ * unconditional on thresholdPercent - a dropped pick is a different
+ * signal than "still a pick but slightly overweight," so the tolerance
+ * band never applies to it, matching computeRebalanceOrders' own exit
+ * behavior exactly.
+ *
+ * No fractional/notional support in v1 - deliberately, to keep this
+ * comparison directly against today's actual whole-share live behavior
+ * rather than combining two research questions at once.
+ */
+export function computeDeltaRebalanceOrders(
+  targets: RotationTarget[],
+  currentEquity: number,
+  currentSharesByTicker: Map<string, number>,
+  currentPriceByTicker: Map<string, number>,
+  universe: string[],
+  thresholdPercent = 0,
+): RebalanceOrder[] {
+  const sellOrders: RebalanceOrder[] = [];
+  const buyOrders: RebalanceOrder[] = [];
+  const targetsByTicker = new Map(targets.map((target) => [target.ticker, target]));
+
+  for (const ticker of universe) {
+    const currentShares = currentSharesByTicker.get(ticker) ?? 0;
+    if (currentShares > 0 && !targetsByTicker.has(ticker)) {
+      sellOrders.push({ ticker, action: "SELL", shares: currentShares });
+    }
+  }
+
+  for (const target of targets) {
+    const price = currentPriceByTicker.get(target.ticker) ?? 0;
+    if (price <= 0) continue;
+
+    const currentShares = currentSharesByTicker.get(target.ticker) ?? 0;
+    const currentWeightPercent =
+      currentEquity > 0 ? ((currentShares * price) / currentEquity) * 100 : 0;
+    const deviationPercent = Math.abs(currentWeightPercent - target.weightPercent);
+
+    // Within the tolerance band - deliberately leave the position as-is,
+    // even if that means it's not exactly at target this rebalance.
+    if (deviationPercent < thresholdPercent) continue;
+
+    const targetDollars = (target.weightPercent / 100) * currentEquity;
+    const targetShares = Math.floor(targetDollars / price);
+    const deltaShares = targetShares - currentShares;
+
+    if (deltaShares > 0) {
+      buyOrders.push({
+        ticker: target.ticker,
+        action: "BUY",
+        shares: deltaShares,
+        targetWeightPercent: target.weightPercent,
+      });
+    } else if (deltaShares < 0) {
+      sellOrders.push({ ticker: target.ticker, action: "SELL", shares: -deltaShares });
+    }
+    // deltaShares === 0: already exactly at target, nothing to trade.
+  }
+
+  return [...sellOrders, ...buyOrders];
+}
