@@ -4,6 +4,7 @@ import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 
 import {
+  computeDeltaRebalanceOrders,
   computeRebalanceOrders,
   decideRotationTargets,
   DEFAULT_ETF_ROTATION_CONFIG,
@@ -217,6 +218,26 @@ export interface EtfRotationSimResult {
   /** True if a rebalance decided on the last simulated day never got a following day to execute on (next_open only) - a window-edge effect, not dropped silently. */
   finalRebalanceUnexecuted: boolean;
   totalSimDays: number;
+  /**
+   * Resulting holdings after each rebalance date's orders were fully
+   * processed (2026-08-10, delta-only rebalance feasibility diagnostic) -
+   * captured for both rebalanceMode values. Powers a simulation-level
+   * target-state comparison between full-liquidate and delta-only(0%) runs
+   * of the same window/config - purely additive, every existing caller
+   * ignores it.
+   */
+  holdingsAfterEachRebalance: { date: string; holdings: Record<string, number> }[];
+  /**
+   * Mean |currentWeightPercent - target.weightPercent| across every target
+   * ticker at every rebalance date except the first (nothing to have
+   * drifted from yet), measured BEFORE any threshold gating is applied -
+   * comparable across all rebalanceMode variants, not just the thresholded
+   * ones. For full-liquidate this reflects pure intra-month price drift
+   * since the last full reset; for thresholded delta-only it additionally
+   * reflects drift carried over from any skipped rebalances. 0 when there
+   * are fewer than 2 rebalances (nothing to measure).
+   */
+  averagePreRebalanceDeviationPercent: number;
 }
 
 function priceHistoryUpTo(
@@ -235,6 +256,8 @@ function priceHistoryUpTo(
 
   return result;
 }
+
+export type RebalanceMode = "full-liquidate" | "delta-only";
 
 export function runEtfRotationSimulation(
   barsByTicker: Map<string, AlpacaBar[]>,
@@ -258,11 +281,22 @@ export function runEtfRotationSimulation(
   rampMaxPositionEquityPercent: number | undefined = undefined,
   allowFractionalShares = false,
   minFractionalNotionalUsd = 5,
+  /**
+   * Optional, additive (2026-08-10, delta-only rebalance feasibility) -
+   * every existing caller omits these 2 and keeps today's full-liquidate
+   * behavior unchanged. "delta-only" calls computeDeltaRebalanceOrders
+   * (etfRotationStrategy.ts) instead of computeRebalanceOrders -
+   * deltaThresholdPercent is only meaningful in that mode.
+   */
+  rebalanceMode: RebalanceMode = "full-liquidate",
+  deltaThresholdPercent = 0,
 ): EtfRotationSimResult {
   let cash = startingEquity;
   const holdings = new Map<string, number>();
   const trades: TradeLogEntry[] = [];
   const equityCurve: EquityCurvePoint[] = [];
+  const holdingsAfterEachRebalance: { date: string; holdings: Record<string, number> }[] = [];
+  const preRebalanceDeviations: number[] = [];
 
   let runningPeak = startingEquity;
   let maxDrawdown = 0;
@@ -307,12 +341,15 @@ export function runEtfRotationSimulation(
   // same set of SELLs happens either way, just summed into `cash` in a
   // different order, which can only ever shift a floating-point sum at a
   // precision far below this project's 2-decimal-place reporting.
+  let executedRebalanceCount = 0;
+
   function executeRebalance(
     targets: RotationTarget[],
     date: string,
     field: "o" | "c",
   ) {
     const equityBeforeTrade = computeEquity(date, field);
+    const currentSharesSnapshot = new Map(holdings);
 
     const buyPriceByTicker = new Map<string, number>();
     for (const ticker of config.universe) {
@@ -322,24 +359,72 @@ export function runEtfRotationSimulation(
       }
     }
 
-    const orders = computeRebalanceOrders(
-      targets,
-      equityBeforeTrade,
-      new Map(holdings),
-      buyPriceByTicker,
-      config.universe,
-      allowFractionalShares,
-      minFractionalNotionalUsd,
-    );
+    const orders =
+      rebalanceMode === "delta-only"
+        ? computeDeltaRebalanceOrders(
+            targets,
+            equityBeforeTrade,
+            currentSharesSnapshot,
+            buyPriceByTicker,
+            config.universe,
+            deltaThresholdPercent,
+          )
+        : computeRebalanceOrders(
+            targets,
+            equityBeforeTrade,
+            currentSharesSnapshot,
+            buyPriceByTicker,
+            config.universe,
+            allowFractionalShares,
+            minFractionalNotionalUsd,
+          );
 
     totalBuySlotCount += targets.length;
-    holdings.clear();
+
+    // Pre-rebalance drift diagnostic (2026-08-10) - how far off target each
+    // continuing pick had drifted BEFORE this rebalance's decision, using
+    // the real (non-slippage-adjusted) price - a portfolio-drift
+    // measurement, not an execution-cost artifact. Skipped on the very
+    // first executed rebalance (nothing to have drifted from yet).
+    // Comparable across rebalanceMode: full-liquidate's own drift here
+    // reflects pure intra-month price movement since the last full reset.
+    if (executedRebalanceCount > 0) {
+      for (const target of targets) {
+        const price = priceAt(target.ticker, date, field);
+        if (price <= 0) continue;
+        const currentShares = currentSharesSnapshot.get(target.ticker) ?? 0;
+        const currentWeightPercent =
+          equityBeforeTrade > 0 ? ((currentShares * price) / equityBeforeTrade) * 100 : 0;
+        preRebalanceDeviations.push(Math.abs(currentWeightPercent - target.weightPercent));
+      }
+    }
+    executedRebalanceCount += 1;
+
+    // Only full-liquidate starts every rebalance from a clean slate - it
+    // always produces a complete SELL for every currently-held ticker, so
+    // clearing first and rebuilding purely from this rebalance's orders is
+    // safe. delta-only's orders are intentionally partial (a ticker within
+    // its tolerance band gets no order at all, and a partial SELL/BUY only
+    // adjusts, never replaces) - clearing here would silently drop
+    // untouched positions, so delta-only holdings are mutated incrementally
+    // below instead.
+    if (rebalanceMode === "full-liquidate") {
+      holdings.clear();
+    }
 
     for (const order of orders) {
       if (order.action === "SELL") {
         const sellPrice = priceAt(order.ticker, date, field) * (1 - SLIPPAGE_PERCENT);
         cash += order.shares * sellPrice;
         trades.push({ date, ticker: order.ticker, action: "SELL", shares: order.shares, price: sellPrice });
+
+        // Safe for both modes: full-liquidate already cleared holdings
+        // above, so this decrements from 0 and deletes (a no-op, matching
+        // the pre-delta-only behavior where SELL never touched `holdings`
+        // at all). delta-only needs this decrement for real.
+        const remaining = (holdings.get(order.ticker) ?? 0) - order.shares;
+        if (remaining <= 0) holdings.delete(order.ticker);
+        else holdings.set(order.ticker, remaining);
         continue;
       }
 
@@ -367,7 +452,11 @@ export function runEtfRotationSimulation(
         // round for us, unlike the live/paper path.
         const shares = cappedNotional / buyPrice;
         cash -= cappedNotional;
-        holdings.set(order.ticker, shares);
+        // Safe for both modes: full-liquidate's holdings entry for this
+        // ticker is always 0 at this point (cleared above, and
+        // computeRebalanceOrders never emits two BUYs for the same
+        // ticker), so adding is equivalent to the prior plain `.set`.
+        holdings.set(order.ticker, (holdings.get(order.ticker) ?? 0) + shares);
         trades.push({ date, ticker: order.ticker, action: "BUY", shares, price: buyPrice });
         continue;
       }
@@ -381,9 +470,11 @@ export function runEtfRotationSimulation(
       if (cappedShares <= 0) continue;
 
       cash -= cappedShares * buyPrice;
-      holdings.set(order.ticker, cappedShares);
+      holdings.set(order.ticker, (holdings.get(order.ticker) ?? 0) + cappedShares);
       trades.push({ date, ticker: order.ticker, action: "BUY", shares: cappedShares, price: buyPrice });
     }
+
+    holdingsAfterEachRebalance.push({ date, holdings: Object.fromEntries(holdings) });
 
     // A qualifying target that still has no real position afterward -
     // whole-share rounding, the fractional floor, or the ramp cap all
@@ -441,6 +532,10 @@ export function runEtfRotationSimulation(
 
   const totalSimDays = commonDates.length - simStartIndex;
   const finalEquity = equityCurve.length > 0 ? equityCurve[equityCurve.length - 1]!.equity : startingEquity;
+  const averagePreRebalanceDeviationPercent =
+    preRebalanceDeviations.length > 0
+      ? preRebalanceDeviations.reduce((sum, d) => sum + d, 0) / preRebalanceDeviations.length
+      : 0;
 
   return {
     finalEquity,
@@ -455,6 +550,8 @@ export function runEtfRotationSimulation(
     totalBuySlotCount,
     finalRebalanceUnexecuted,
     totalSimDays,
+    holdingsAfterEachRebalance,
+    averagePreRebalanceDeviationPercent,
   };
 }
 
@@ -584,6 +681,13 @@ export async function runEtfRotationWindowAnalysis(options: {
    */
   allowFractionalShares?: boolean;
   minFractionalNotionalUsd?: number;
+  /**
+   * Optional and additive (2026-08-10, delta-only rebalance feasibility) -
+   * every existing caller omits these and keeps today's full-liquidate
+   * behavior unchanged. See RebalanceMode's own doc comment.
+   */
+  rebalanceMode?: RebalanceMode;
+  deltaThresholdPercent?: number;
 }): Promise<EtfRotationWindowAnalysisResult> {
   const config = options.config ?? DEFAULT_ETF_ROTATION_CONFIG;
   const adjustment = options.adjustment ?? "raw";
@@ -640,6 +744,8 @@ export async function runEtfRotationWindowAnalysis(options: {
         options.rampMaxPositionEquityPercent,
         options.allowFractionalShares,
         options.minFractionalNotionalUsd,
+        options.rebalanceMode,
+        options.deltaThresholdPercent,
       ),
     );
   }
