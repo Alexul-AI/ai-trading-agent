@@ -1,0 +1,5 @@
+rebalance_month_key,observed_at,config_variant,threshold_pct,real_full_liquidate_gross_usd,delta_only_gross_usd,gross_reduction_pct,leg_count
+2026-08,2026-08-12T22:30:44.903Z,"baseline-2 (holdCount=2, original MVP)",0,93334.55,85857.85,8.01,2
+2026-08,2026-08-12T22:30:44.903Z,"baseline-2 (holdCount=2, original MVP)",1,93334.55,85857.85,8.01,2
+2026-08,2026-08-12T22:30:44.903Z,"baseline-2 (holdCount=2, original MVP)",2,93334.55,85857.85,8.01,2
+2026-08,2026-08-12T22:30:44.903Z,"baseline-2 (holdCount=2, original MVP)",5,93334.55,85857.85,8.01,2
