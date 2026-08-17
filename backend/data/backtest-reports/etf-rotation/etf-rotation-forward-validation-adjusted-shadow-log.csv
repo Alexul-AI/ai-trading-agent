@@ -1,2 +1,3 @@
 run_timestamp,anchor_date_target,actual_window_start,actual_window_end,sim_trading_days,rebalance_count,baseline2_return_pct,baseline2_maxdd_pct,candidate3_return_pct,candidate3_maxdd_pct,spy_return_pct,equalweight_return_pct
 2026-08-10T23:41:52.826Z,2026-08-08,2026-08-10,2026-08-10,1,1,0.00,0.00,0.00,0.00,0.00,0.00
+2026-08-17T23:29:35.878Z,2026-08-08,2026-08-10,2026-08-17,6,1,0.26,-0.57,0.15,-0.51,-0.05,0.31

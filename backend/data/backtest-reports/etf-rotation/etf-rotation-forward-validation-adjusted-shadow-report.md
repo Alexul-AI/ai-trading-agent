@@ -1,13 +1,13 @@
 # ETF rotation ADJUSTED-SHADOW forward validation report
 
-Generated: 2026-08-10T23:41:52.826Z
+Generated: 2026-08-17T23:29:35.877Z
 Target anchor (adjustment=all shadow-tracking decided): 2026-08-08
 
 **ADJUSTED-SHADOW TRACKING - methodology evidence, not production clearance.** This track simulates the same two config variants under `adjustment=all` (dividend/distribution-adjusted bars) instead of the live `raw` default - it answers "would `adjustment=all` change forward results," not "does candidate-hold3 beat baseline-2 under the current production methodology" (see the separate raw-production forward-validation report for that - its own clock is untouched by this track). Does not by itself trigger any live or config change. Full decision plan: `docs/product/ROADMAP.md` Phase 2.
 
 ## Simulated window (fresh cash start, pinned to the anchor)
-- baseline-2: 2026-08-10 to 2026-08-10 (1 trading days)
-- candidate-hold3: 2026-08-10 to 2026-08-10 (1 trading days)
+- baseline-2: 2026-08-10 to 2026-08-17 (6 trading days)
+- candidate-hold3: 2026-08-10 to 2026-08-17 (6 trading days)
 - Achieved start is 2 calendar day(s) after the target anchor (the anchor fell on a non-trading day; still no pre-anchor data included).
 
 Both simulations start with pure cash and execute their first rebalance immediately on day one (isMonthlyRebalanceDate's "first simulated day" rule). The simulated window is pinned to never start earlier than the anchor (via runEtfRotationWindowAnalysis's simStartDateOverride) - pre-anchor price history is used only to warm up momentum/SMA indicators, never simulated or traded. This fixes a real bug caught in review before merge: an earlier version of this script let the simulation start wherever warmup happened to clear, which drifted 26 calendar days before the anchor and included pre-anchor performance in what was meant to be a forward-only read (see PR #31 review).
@@ -15,21 +15,22 @@ Both simulations start with pure cash and execute their first rebalance immediat
 ## Result (NEXT_OPEN)
 | series | return% | maxDD% | trading days | rebalances |
 |---|---|---|---|---|
-| baseline-2 | 0.00 | 0.00 | 1 | 1 |
-| candidate-hold3 | 0.00 | 0.00 | 1 | 1 |
-
-A rebalance decided on the last simulated day had no following day to execute on yet (NEXT_OPEN window-edge effect) - it will appear in the Decisions section below once this script is re-run after that day has passed, not dropped silently.
+| baseline-2 | 0.26 | -0.57 | 6 | 1 |
+| candidate-hold3 | 0.15 | -0.51 | 6 | 1 |
 
 
 ## Benchmarks (same period, context)
-- SPY buy & hold: 0.00%
-- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): 0.00%
+- SPY buy & hold: -0.05%
+- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): 0.31%
 
 ## Decisions - baseline-2
-_(none yet)_
+- 2026-08-11 BUY QQQ - 6 sh @ $723.37 (~43.6% of equity)
+- 2026-08-11 BUY SPY - 6 sh @ $774.90 (~46.8% of equity)
 
 ## Decisions - candidate-hold3
-_(none yet)_
+- 2026-08-11 BUY QQQ - 4 sh @ $723.37 (~29.1% of equity)
+- 2026-08-11 BUY SPY - 4 sh @ $774.90 (~31.2% of equity)
+- 2026-08-11 BUY EFA - 30 sh @ $108.53 (~32.7% of equity)
 
 ## Pre-declared read criteria (written before any forward data existed)
 - 0 rebalances: nothing to read yet.
