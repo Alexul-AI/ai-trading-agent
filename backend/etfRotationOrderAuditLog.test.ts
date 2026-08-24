@@ -153,6 +153,18 @@ describe("etfRotationOrderAuditLog", () => {
       expect(events).toEqual([augustEvent]);
     });
 
+    it("returns newest-first, matching readEtfRotationOrderAuditLog's convention - caught in review before this shipped", async () => {
+      const older = makeEvent({ rebalanceMonthKey: "2026-08", ticker: "QQQ", timestamp: new Date(2026, 7, 3).toISOString() });
+      const newer = makeEvent({ rebalanceMonthKey: "2026-08", ticker: "SPY", timestamp: new Date(2026, 7, 10).toISOString() });
+
+      await appendEtfRotationOrderAuditEvent(older, tmpFile);
+      await appendEtfRotationOrderAuditEvent(newer, tmpFile);
+
+      const events = await readEtfRotationOrderAuditLogForRebalanceMonth("2026-08", tmpFile);
+
+      expect(events).toEqual([newer, older]);
+    });
+
     it("still finds an old failed-BUY event after 20+ same-month reminder events push it past any count-based window - the 2026-08-03 QQQ incident's actual bug", async () => {
       const rejected = makeEvent({
         type: "ORDER_REJECTED",

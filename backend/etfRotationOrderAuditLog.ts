@@ -183,10 +183,19 @@ export async function readEtfRotationOrderAuditLog(
 // offTarget back to false (and silencing the reminder) while QQQ was still
 // unbought. Scoped by rebalanceMonthKey instead of a count, so it can never
 // be crowded out by unrelated or repeated events.
+//
+// Newest-first, matching readEtfRotationOrderAuditLog's own convention
+// (caught in review, 2026-08-24, before this ever shipped): readAllAuditEvents
+// returns file order (oldest-first, append-only), and a bare .filter() would
+// have preserved that - deriveEtfRotationOffTargetState's .find() then picks
+// the FIRST match in array order, so an unreversed result would surface the
+// oldest recorded failure reason for a ticker, not the current one, if the
+// same ticker+side ever failed more than once in the same month (e.g. an
+// original rejection followed by a later failed repair attempt).
 export async function readEtfRotationOrderAuditLogForRebalanceMonth(
   rebalanceMonthKey: string,
   filePath: string = AUDIT_LOG_FILE,
 ): Promise<EtfRotationOrderAuditEvent[]> {
   const events = await readAllAuditEvents(filePath);
-  return events.filter((event) => event.rebalanceMonthKey === rebalanceMonthKey);
+  return events.filter((event) => event.rebalanceMonthKey === rebalanceMonthKey).reverse();
 }
