@@ -85,6 +85,39 @@ describe("deriveEtfRotationOffTargetState", () => {
     ]);
   });
 
+  it("uses the most recent failure reason when a ticker's BUY failed more than once this month (e.g. a later failed repair attempt) - events must be newest-first for this to work", () => {
+    // Mirrors what readEtfRotationOrderAuditLogForRebalanceMonth actually
+    // returns (newest-first) - an oldest-first list would silently surface
+    // the stale first-ever reason via .find() instead.
+    const events: EtfRotationOrderAuditEvent[] = [
+      auditEvent({
+        type: "ORDER_REJECTED",
+        ticker: "QQQ",
+        side: "BUY",
+        timestamp: "2026-08-10T00:00:00.000Z",
+        error: "insufficient buying power",
+      }),
+      auditEvent({
+        type: "ORDER_REJECTED",
+        ticker: "QQQ",
+        side: "BUY",
+        timestamp: "2026-08-03T13:52:26.000Z",
+        error: "Request failed with status code 403",
+      }),
+    ];
+
+    const result = deriveEtfRotationOffTargetState({
+      targets: TARGETS,
+      plannedOrders: PLANNED_ORDERS,
+      positions: {},
+      recentOrderAuditEvents: events,
+      rebalanceMonthKey: MONTH,
+    });
+
+    expect(result.offTarget).toBe(true);
+    expect(result.missingLegs[0]!.reason).toBe("insufficient buying power");
+  });
+
   it("is not off-target (nothing attempted yet) when a target has zero shares but no BUY was ever attempted this month", () => {
     // A brand-new month's rebalance that hasn't run yet - not the same as
     // "broken", and must not be conflated with it.
@@ -177,6 +210,43 @@ describe("deriveEtfRotationOffTargetState", () => {
     });
 
     expect(result).toEqual({ offTarget: false, missingLegs: [] });
+  });
+
+  it("stays off-target: true even after 20+ same-month OFF_TARGET_REMINDER_SENT events - the fix for the 2026-08-03 QQQ incident's self-clearing bug", () => {
+    // Simulates what readEtfRotationOrderAuditLogForRebalanceMonth now
+    // returns (every event for this rebalanceMonthKey, not a count-capped
+    // window) - proves the pure detection logic here was always correct
+    // once given the full, correctly-scoped event list; the bug was
+    // upstream in how that list used to get truncated before reaching here.
+    const reminders: EtfRotationOrderAuditEvent[] = Array.from({ length: 25 }, (_, i) =>
+      auditEvent({
+        type: "OFF_TARGET_REMINDER_SENT",
+        ticker: undefined as unknown as string,
+        side: undefined as unknown as "BUY",
+        timestamp: `2026-08-${String(4 + i).padStart(2, "0")}T21:30:00.000Z`,
+        reason: "QQQ: Request failed with status code 403",
+      }),
+    );
+    const events: EtfRotationOrderAuditEvent[] = [
+      auditEvent({
+        type: "ORDER_REJECTED",
+        ticker: "QQQ",
+        side: "BUY",
+        error: "Request failed with status code 403",
+      }),
+      ...reminders,
+    ];
+
+    const result = deriveEtfRotationOffTargetState({
+      targets: TARGETS,
+      plannedOrders: PLANNED_ORDERS,
+      positions: { SPY: { shares: 2 } },
+      recentOrderAuditEvents: events,
+      rebalanceMonthKey: MONTH,
+    });
+
+    expect(result.offTarget).toBe(true);
+    expect(result.missingLegs[0]!.ticker).toBe("QQQ");
   });
 
   it("falls back to a generic reason when the failed audit event has no error text", () => {
