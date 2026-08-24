@@ -26,6 +26,7 @@ import {
 import {
   appendEtfRotationOrderAuditEvent,
   readEtfRotationOrderAuditLog,
+  readEtfRotationOrderAuditLogForRebalanceMonth,
 } from "./etfRotationOrderAuditLog.js";
 import { deriveEtfRotationOffTargetState } from "./etfRotationReview.js";
 import {
@@ -1292,12 +1293,23 @@ app.get("/api/autopilot/etf-rotation/review", async (_req, res) => {
       getPortfolioSnapshot(),
     ]);
 
+    const rebalanceMonthKey = stateResult.state.rebalanceMonthKey ?? null;
+
+    // Scoped by rebalanceMonthKey, not the count-based recentOrderEvents
+    // above (that one is a "last 20 for display" list - the wrong basis for
+    // off-target detection, see readEtfRotationOrderAuditLogForRebalanceMonth's
+    // own doc comment for why).
+    const offTargetAuditEvents =
+      rebalanceMonthKey !== null
+        ? await readEtfRotationOrderAuditLogForRebalanceMonth(rebalanceMonthKey)
+        : [];
+
     const offTargetReview = deriveEtfRotationOffTargetState({
       targets: stateResult.state.targets ?? null,
       plannedOrders: stateResult.state.plannedOrders ?? null,
       positions: portfolio.positions,
-      recentOrderAuditEvents: recentOrderEvents,
-      rebalanceMonthKey: stateResult.state.rebalanceMonthKey ?? null,
+      recentOrderAuditEvents: offTargetAuditEvents,
+      rebalanceMonthKey,
     });
 
     res.json({

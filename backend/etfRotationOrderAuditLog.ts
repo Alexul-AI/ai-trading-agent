@@ -137,10 +137,7 @@ export async function appendEtfRotationOrderAuditEvent(
 // Same append-only-JSONL, tail-safe-parse pattern as circuitBreakerAuditLog.ts
 // - a corrupt/partial trailing line is skipped rather than failing the whole
 // read, since this log is only ever appended to, never rewritten in place.
-export async function readEtfRotationOrderAuditLog(
-  limit = 100,
-  filePath: string = AUDIT_LOG_FILE,
-): Promise<EtfRotationOrderAuditEvent[]> {
+async function readAllAuditEvents(filePath: string): Promise<EtfRotationOrderAuditEvent[]> {
   try {
     const raw = await fs.readFile(filePath, "utf-8");
     const lines = raw
@@ -148,7 +145,7 @@ export async function readEtfRotationOrderAuditLog(
       .map((line) => line.trim())
       .filter(Boolean);
 
-    const events = lines
+    return lines
       .map((line) => {
         try {
           return JSON.parse(line) as EtfRotationOrderAuditEvent;
@@ -157,8 +154,6 @@ export async function readEtfRotationOrderAuditLog(
         }
       })
       .filter((event): event is EtfRotationOrderAuditEvent => event !== null);
-
-    return events.slice(-limit).reverse();
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") {
       return [];
@@ -166,4 +161,32 @@ export async function readEtfRotationOrderAuditLog(
 
     throw error;
   }
+}
+
+export async function readEtfRotationOrderAuditLog(
+  limit = 100,
+  filePath: string = AUDIT_LOG_FILE,
+): Promise<EtfRotationOrderAuditEvent[]> {
+  const events = await readAllAuditEvents(filePath);
+  return events.slice(-limit).reverse();
+}
+
+// Added 2026-08-24, direct response to the 2026-08-03 QQQ incident's
+// off-target detector silently self-clearing: readEtfRotationOrderAuditLog's
+// count-based limit is right for a "show recent history" display list, but
+// wrong for off-target detection (deriveEtfRotationOffTargetState,
+// etfRotationReview.ts) - that needs every event for the CURRENT rebalance
+// cycle, no matter how old, not "whichever ones happen to still be within
+// the last N events of the whole file". The daily OFF_TARGET_REMINDER_SENT
+// events this same detector writes were themselves crowding the original
+// ORDER_REJECTED out of a count-based window after ~20 days, flipping
+// offTarget back to false (and silencing the reminder) while QQQ was still
+// unbought. Scoped by rebalanceMonthKey instead of a count, so it can never
+// be crowded out by unrelated or repeated events.
+export async function readEtfRotationOrderAuditLogForRebalanceMonth(
+  rebalanceMonthKey: string,
+  filePath: string = AUDIT_LOG_FILE,
+): Promise<EtfRotationOrderAuditEvent[]> {
+  const events = await readAllAuditEvents(filePath);
+  return events.filter((event) => event.rebalanceMonthKey === rebalanceMonthKey);
 }

@@ -8,6 +8,7 @@ import {
   appendEtfRotationOrderAuditEvent,
   deriveLegType,
   readEtfRotationOrderAuditLog,
+  readEtfRotationOrderAuditLogForRebalanceMonth,
   type EtfRotationOrderAuditEvent,
 } from "./etfRotationOrderAuditLog.js";
 
@@ -131,6 +132,60 @@ describe("etfRotationOrderAuditLog", () => {
     expect(events[0]).toEqual(clearEvent);
     expect(events[0]!.ticker).toBeUndefined();
     expect(events[0]!.reason).toContain("safe to clear");
+  });
+
+  describe("readEtfRotationOrderAuditLogForRebalanceMonth", () => {
+    it("returns an empty array when the file doesn't exist yet", async () => {
+      const events = await readEtfRotationOrderAuditLogForRebalanceMonth("2026-08", tmpFile);
+
+      expect(events).toEqual([]);
+    });
+
+    it("only returns events matching the given rebalanceMonthKey, filtering out other months", async () => {
+      const julyEvent = makeEvent({ rebalanceMonthKey: "2026-07", ticker: "SPY" });
+      const augustEvent = makeEvent({ rebalanceMonthKey: "2026-08", ticker: "QQQ" });
+
+      await appendEtfRotationOrderAuditEvent(julyEvent, tmpFile);
+      await appendEtfRotationOrderAuditEvent(augustEvent, tmpFile);
+
+      const events = await readEtfRotationOrderAuditLogForRebalanceMonth("2026-08", tmpFile);
+
+      expect(events).toEqual([augustEvent]);
+    });
+
+    it("still finds an old failed-BUY event after 20+ same-month reminder events push it past any count-based window - the 2026-08-03 QQQ incident's actual bug", async () => {
+      const rejected = makeEvent({
+        type: "ORDER_REJECTED",
+        rebalanceMonthKey: "2026-08",
+        ticker: "QQQ",
+        side: "BUY",
+        error: "Request failed with status code 403",
+      });
+      await appendEtfRotationOrderAuditEvent(rejected, tmpFile);
+
+      for (let i = 0; i < 25; i += 1) {
+        await appendEtfRotationOrderAuditEvent(
+          {
+            type: "OFF_TARGET_REMINDER_SENT",
+            timestamp: new Date(2026, 7, 4 + i).toISOString(),
+            rebalanceMonthKey: "2026-08",
+            configVariantKey: "baseline-2",
+            reason: "QQQ: Request failed with status code 403",
+          },
+          tmpFile,
+        );
+      }
+
+      // readEtfRotationOrderAuditLog(20, ...) - the count-based reader used
+      // for display purposes - would have already dropped `rejected` from
+      // its result at this point (25 newer same-file events exist). The
+      // month-scoped reader must not have the same failure mode.
+      const scoped = await readEtfRotationOrderAuditLogForRebalanceMonth("2026-08", tmpFile);
+      expect(scoped).toContainEqual(rejected);
+
+      const countBased = await readEtfRotationOrderAuditLog(20, tmpFile);
+      expect(countBased).not.toContainEqual(rejected);
+    });
   });
 });
 

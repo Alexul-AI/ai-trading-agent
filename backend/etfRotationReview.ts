@@ -28,7 +28,7 @@
 // read-only visibility pass.
 import {
   appendEtfRotationOrderAuditEvent,
-  readEtfRotationOrderAuditLog,
+  readEtfRotationOrderAuditLogForRebalanceMonth,
   type EtfRotationOrderAuditEvent,
 } from "./etfRotationOrderAuditLog.js";
 import type { RebalanceOrder, RotationTarget } from "./etfRotationStrategy.js";
@@ -175,12 +175,23 @@ export async function runEtfOffTargetReminderCheck(params: {
   etfRotationOrderAuditLogFilePath?: string;
 }): Promise<void> {
   try {
-    const [offTargetStateResult, offTargetPortfolio, offTargetAuditEvents] =
-      await Promise.all([
-        readRebalanceStateStrict(params.etfRotationStateFilePath),
-        params.getPortfolioSnapshot(),
-        readEtfRotationOrderAuditLog(20, params.etfRotationOrderAuditLogFilePath),
-      ]);
+    const [offTargetStateResult, offTargetPortfolio] = await Promise.all([
+      readRebalanceStateStrict(params.etfRotationStateFilePath),
+      params.getPortfolioSnapshot(),
+    ]);
+
+    const rebalanceMonthKey = offTargetStateResult.state.rebalanceMonthKey ?? null;
+
+    // Scoped by rebalanceMonthKey, not a count-based window - see
+    // readEtfRotationOrderAuditLogForRebalanceMonth's own doc comment for why
+    // a count-based read is wrong for this specific purpose.
+    const offTargetAuditEvents =
+      rebalanceMonthKey !== null
+        ? await readEtfRotationOrderAuditLogForRebalanceMonth(
+            rebalanceMonthKey,
+            params.etfRotationOrderAuditLogFilePath,
+          )
+        : [];
 
     // A corrupt/unreadable state file falls back to { targets: undefined },
     // which deriveEtfRotationOffTargetState already treats as offTarget:
@@ -191,7 +202,7 @@ export async function runEtfOffTargetReminderCheck(params: {
       plannedOrders: offTargetStateResult.state.plannedOrders ?? null,
       positions: offTargetPortfolio.positions,
       recentOrderAuditEvents: offTargetAuditEvents,
-      rebalanceMonthKey: offTargetStateResult.state.rebalanceMonthKey ?? null,
+      rebalanceMonthKey,
     });
 
     if (

@@ -179,6 +179,43 @@ describe("deriveEtfRotationOffTargetState", () => {
     expect(result).toEqual({ offTarget: false, missingLegs: [] });
   });
 
+  it("stays off-target: true even after 20+ same-month OFF_TARGET_REMINDER_SENT events - the fix for the 2026-08-03 QQQ incident's self-clearing bug", () => {
+    // Simulates what readEtfRotationOrderAuditLogForRebalanceMonth now
+    // returns (every event for this rebalanceMonthKey, not a count-capped
+    // window) - proves the pure detection logic here was always correct
+    // once given the full, correctly-scoped event list; the bug was
+    // upstream in how that list used to get truncated before reaching here.
+    const reminders: EtfRotationOrderAuditEvent[] = Array.from({ length: 25 }, (_, i) =>
+      auditEvent({
+        type: "OFF_TARGET_REMINDER_SENT",
+        ticker: undefined as unknown as string,
+        side: undefined as unknown as "BUY",
+        timestamp: `2026-08-${String(4 + i).padStart(2, "0")}T21:30:00.000Z`,
+        reason: "QQQ: Request failed with status code 403",
+      }),
+    );
+    const events: EtfRotationOrderAuditEvent[] = [
+      auditEvent({
+        type: "ORDER_REJECTED",
+        ticker: "QQQ",
+        side: "BUY",
+        error: "Request failed with status code 403",
+      }),
+      ...reminders,
+    ];
+
+    const result = deriveEtfRotationOffTargetState({
+      targets: TARGETS,
+      plannedOrders: PLANNED_ORDERS,
+      positions: { SPY: { shares: 2 } },
+      recentOrderAuditEvents: events,
+      rebalanceMonthKey: MONTH,
+    });
+
+    expect(result.offTarget).toBe(true);
+    expect(result.missingLegs[0]!.ticker).toBe("QQQ");
+  });
+
   it("falls back to a generic reason when the failed audit event has no error text", () => {
     const events: EtfRotationOrderAuditEvent[] = [
       auditEvent({ type: "PAIRED_SELL_FILL_UNCONFIRMED", ticker: "QQQ", side: "BUY" }),
