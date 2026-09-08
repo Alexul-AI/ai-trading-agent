@@ -1,13 +1,13 @@
 # ETF rotation ADJUSTED-SHADOW forward validation report
 
-Generated: 2026-09-01T01:45:44.362Z
+Generated: 2026-09-08T01:05:23.767Z
 Target anchor (adjustment=all shadow-tracking decided): 2026-08-08
 
 **ADJUSTED-SHADOW TRACKING - methodology evidence, not production clearance.** This track simulates the same two config variants under `adjustment=all` (dividend/distribution-adjusted bars) instead of the live `raw` default - it answers "would `adjustment=all` change forward results," not "does candidate-hold3 beat baseline-2 under the current production methodology" (see the separate raw-production forward-validation report for that - its own clock is untouched by this track). Does not by itself trigger any live or config change. Full decision plan: `docs/product/ROADMAP.md` Phase 2.
 
 ## Simulated window (fresh cash start, pinned to the anchor)
-- baseline-2: 2026-08-10 to 2026-08-31 (16 trading days)
-- candidate-hold3: 2026-08-10 to 2026-08-31 (16 trading days)
+- baseline-2: 2026-08-10 to 2026-09-04 (20 trading days)
+- candidate-hold3: 2026-08-10 to 2026-09-04 (20 trading days)
 - Achieved start is 2 calendar day(s) after the target anchor (the anchor fell on a non-trading day; still no pre-anchor data included).
 
 Both simulations start with pure cash and execute their first rebalance immediately on day one (isMonthlyRebalanceDate's "first simulated day" rule). The simulated window is pinned to never start earlier than the anchor (via runEtfRotationWindowAnalysis's simStartDateOverride) - pre-anchor price history is used only to warm up momentum/SMA indicators, never simulated or traded. This fixes a real bug caught in review before merge: an earlier version of this script let the simulation start wherever warmup happened to clear, which drifted 26 calendar days before the anchor and included pre-anchor performance in what was meant to be a forward-only read (see PR #31 review).
@@ -15,22 +15,32 @@ Both simulations start with pure cash and execute their first rebalance immediat
 ## Result (NEXT_OPEN)
 | series | return% | maxDD% | trading days | rebalances |
 |---|---|---|---|---|
-| baseline-2 | -0.88 | -2.39 | 16 | 1 |
-| candidate-hold3 | -0.92 | -1.85 | 16 | 1 |
+| baseline-2 | -0.63 | -2.42 | 20 | 2 |
+| candidate-hold3 | -0.50 | -2.27 | 20 | 2 |
 
 
 ## Benchmarks (same period, context)
-- SPY buy & hold: -0.80%
-- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): 0.03%
+- SPY buy & hold: -0.37%
+- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): 0.27%
 
 ## Decisions - baseline-2
 - 2026-08-11 BUY QQQ - 6 sh @ $723.37 (~43.6% of equity)
 - 2026-08-11 BUY SPY - 6 sh @ $774.90 (~46.8% of equity)
+- 2026-09-02 SELL SPY - 6 sh @ $762.01 (~46.4% of equity)
+- 2026-09-02 SELL QQQ - 6 sh @ $706.47 (~43.0% of equity)
+- 2026-09-02 BUY QQQ - 6 sh @ $707.17 (~43.1% of equity)
+- 2026-09-02 BUY SPY - 6 sh @ $762.77 (~46.5% of equity)
 
 ## Decisions - candidate-hold3
 - 2026-08-11 BUY QQQ - 4 sh @ $723.37 (~29.1% of equity)
 - 2026-08-11 BUY SPY - 4 sh @ $774.90 (~31.2% of equity)
 - 2026-08-11 BUY EFA - 30 sh @ $108.53 (~32.7% of equity)
+- 2026-09-02 SELL SPY - 4 sh @ $762.01 (~30.9% of equity)
+- 2026-09-02 SELL QQQ - 4 sh @ $706.47 (~28.7% of equity)
+- 2026-09-02 SELL EFA - 30 sh @ $106.68 (~32.5% of equity)
+- 2026-09-02 BUY QQQ - 4 sh @ $707.17 (~28.7% of equity)
+- 2026-09-02 BUY SPY - 4 sh @ $762.77 (~31.0% of equity)
+- 2026-09-02 BUY EFA - 30 sh @ $106.78 (~32.5% of equity)
 
 ## Pre-declared read criteria (written before any forward data existed)
 - 0 rebalances: nothing to read yet.
@@ -39,7 +49,7 @@ Both simulations start with pure cash and execute their first rebalance immediat
 - Regardless of the read at any sample size: this is supplementary color on top of the already-completed historical multi-window validation (PR #27/#28), not a replacement for it. It does not by itself trigger promoting candidate-hold3 to DEFAULT_ETF_ROTATION_CONFIG - that stays a separate, explicit, user-approved step.
 
 ## Current read
-1 rebalance(s) since the anchor - too early for a promotion decision, informational only.
+2 rebalance(s) since the anchor - too early for a promotion decision, informational only.
 
 **ADJUSTED-SHADOW TRACK**: this read is about candidate-hold3 vs baseline-2 UNDER adjustment=all specifically - it is not a read on production (raw) methodology, has its own separate clock from the raw-production track, and does not by itself trigger any live or config change.
 
