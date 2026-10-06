@@ -1,11 +1,11 @@
 # ETF rotation forward validation report
 
-Generated: 2026-09-29T02:32:42.090Z
+Generated: 2026-10-06T02:51:16.845Z
 Target anchor (candidate-hold3 named, historical out-of-sample declared exhausted): 2026-07-14
 
 ## Simulated window (fresh cash start, pinned to the anchor)
-- baseline-2: 2026-07-14 to 2026-09-28 (54 trading days)
-- candidate-hold3: 2026-07-14 to 2026-09-28 (54 trading days)
+- baseline-2: 2026-07-14 to 2026-10-05 (59 trading days)
+- candidate-hold3: 2026-07-14 to 2026-10-05 (59 trading days)
 - Achieved start is exactly on the target anchor (no pre-anchor data included).
 
 Both simulations start with pure cash and execute their first rebalance immediately on day one (isMonthlyRebalanceDate's "first simulated day" rule). The simulated window is pinned to never start earlier than the anchor (via runEtfRotationWindowAnalysis's simStartDateOverride) - pre-anchor price history is used only to warm up momentum/SMA indicators, never simulated or traded. This fixes a real bug caught in review before merge: an earlier version of this script let the simulation start wherever warmup happened to clear, which drifted 26 calendar days before the anchor and included pre-anchor performance in what was meant to be a forward-only read (see PR #31 review).
@@ -13,13 +13,13 @@ Both simulations start with pure cash and execute their first rebalance immediat
 ## Result (NEXT_OPEN)
 | series | return% | maxDD% | trading days | rebalances |
 |---|---|---|---|---|
-| baseline-2 | 1.47 | -5.28 | 54 | 3 |
-| candidate-hold3 | 0.91 | -3.86 | 54 | 3 |
+| baseline-2 | 3.26 | -5.28 | 59 | 4 |
+| candidate-hold3 | 1.68 | -3.86 | 59 | 4 |
 
 
 ## Benchmarks (same period, context)
-- SPY buy & hold: 1.80%
-- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): 0.05%
+- SPY buy & hold: 3.06%
+- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): 0.38%
 
 ## Decisions - baseline-2
 - 2026-07-15 BUY QQQ - 6 sh @ $724.52 (~43.6% of equity)
@@ -32,6 +32,10 @@ Both simulations start with pure cash and execute their first rebalance immediat
 - 2026-09-02 SELL QQQ - 7 sh @ $706.47 (~49.7% of equity)
 - 2026-09-02 BUY QQQ - 7 sh @ $707.17 (~49.7% of equity)
 - 2026-09-02 BUY SPY - 6 sh @ $762.77 (~46.0% of equity)
+- 2026-10-02 SELL SPY - 6 sh @ $770.29 (~45.1% of equity)
+- 2026-10-02 SELL QQQ - 7 sh @ $750.93 (~51.3% of equity)
+- 2026-10-02 BUY QQQ - 6 sh @ $751.69 (~44.0% of equity)
+- 2026-10-02 BUY SPY - 6 sh @ $771.07 (~45.1% of equity)
 
 ## Decisions - candidate-hold3
 - 2026-07-15 BUY QQQ - 4 sh @ $724.52 (~29.0% of equity)
@@ -49,6 +53,12 @@ Both simulations start with pure cash and execute their first rebalance immediat
 - 2026-09-02 BUY QQQ - 4 sh @ $707.17 (~28.2% of equity)
 - 2026-09-02 BUY SPY - 4 sh @ $762.77 (~30.4% of equity)
 - 2026-09-02 BUY EFA - 31 sh @ $106.78 (~33.0% of equity)
+- 2026-10-02 SELL SPY - 4 sh @ $770.29 (~30.5% of equity)
+- 2026-10-02 SELL QQQ - 4 sh @ $750.93 (~29.7% of equity)
+- 2026-10-02 SELL EFA - 31 sh @ $103.66 (~31.8% of equity)
+- 2026-10-02 BUY QQQ - 4 sh @ $751.69 (~29.7% of equity)
+- 2026-10-02 BUY SPY - 4 sh @ $771.07 (~30.5% of equity)
+- 2026-10-02 BUY EFA - 32 sh @ $103.76 (~32.8% of equity)
 
 ## Pre-declared read criteria (written before any forward data existed)
 - 0 rebalances: nothing to read yet.
@@ -57,7 +67,7 @@ Both simulations start with pure cash and execute their first rebalance immediat
 - Regardless of the read at any sample size: this is supplementary color on top of the already-completed historical multi-window validation (PR #27/#28), not a replacement for it. It does not by itself trigger promoting candidate-hold3 to DEFAULT_ETF_ROTATION_CONFIG - that stays a separate, explicit, user-approved step.
 
 ## Current read
-3 rebalances since the anchor - candidate-hold3 holding up so far (maxDD not worse, return within 5pt tolerance of baseline-2).
+4 rebalances since the anchor - candidate-hold3 holding up so far (maxDD not worse, return within 5pt tolerance of baseline-2).
 
 ## Caveats
 - Raw Alpaca bars (adjustment=raw) - no dividends/distributions, same caveat as every other ETF rotation report in this repo.
