@@ -12,6 +12,9 @@ import {
   type EtfRotationExecutionGates,
   type EtfRotationSubmitOrderLeg,
   type GetOrderStatus,
+  type SellFillWaitDiagnostics,
+  type SellFillWaitOutcome,
+  type WaitForSellFill,
 } from "./etfRotationExecution.js";
 import type {
   EtfRotationOrderAuditEvent,
@@ -1028,6 +1031,135 @@ describe("executeEtfRotationOrders - paired SELL fill-confirmation wait (2026-08
     expect(audit.events.map((e) => e.type)).toContain("PAIRED_SELL_FILL_UNCONFIRMED");
   });
 
+  describe("wait diagnostics reach the audit log (2026-10-10, after the 2026-10-01 unconfirmed-fill incident)", () => {
+    const DIAGNOSTICS: SellFillWaitDiagnostics = {
+      lastObservedStatus: "accepted",
+      pollAttempts: 20,
+      pollErrorCount: 0,
+      elapsedMs: 10012,
+      timeoutMs: 10000,
+      pollIntervalMs: 500,
+    };
+
+    function waitReporting(
+      outcome: SellFillWaitOutcome,
+      diagnostics: SellFillWaitDiagnostics = DIAGNOSTICS,
+    ): WaitForSellFill {
+      return async (_brokerOrderId, _ticker, onDiagnostics) => {
+        onDiagnostics?.(diagnostics);
+        return outcome;
+      };
+    }
+
+    function acceptingLegs(): EtfRotationSubmitOrderLeg {
+      return async (ticker, action) => ({
+        outcome: "accepted",
+        brokerOrderId: `broker-${ticker}-${action}`,
+      });
+    }
+
+    it("records SELL_FILL_CONFIRMED with the diagnostics after a SELL is confirmed filled, and the rebuild BUY still proceeds", async () => {
+      const audit = collectingAuditRecorder();
+      const filledDiagnostics = { ...DIAGNOSTICS, lastObservedStatus: "filled", pollAttempts: 3 };
+
+      const result = await executeEtfRotationOrders({
+        ...baseParams,
+        orders: buildPairedOrders(),
+        executionGates: ALLOW_ALL,
+        submitOrderLeg: acceptingLegs(),
+        appendAuditEvent: audit.appendAuditEvent,
+        refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+        waitForSellFill: waitReporting("filled", filledDiagnostics),
+      });
+
+      expect(result.status).toBe("accepted");
+      const spyEvents = audit.events.filter((e) => e.ticker === "SPY");
+      expect(spyEvents.map((e) => `${e.side}:${e.type}`)).toEqual([
+        "SELL:ORDER_SUBMITTED",
+        "SELL:ORDER_ACCEPTED",
+        "SELL:SELL_FILL_CONFIRMED",
+        "BUY:ORDER_SUBMITTED",
+        "BUY:ORDER_ACCEPTED",
+      ]);
+      const confirmed = spyEvents.find((e) => e.type === "SELL_FILL_CONFIRMED")!;
+      expect(confirmed.sellFillWait).toEqual(filledDiagnostics);
+      expect(confirmed.brokerOrderId).toBe("broker-SPY-SELL");
+      expect(confirmed.legType).toBe("liquidate_existing");
+    });
+
+    it("attaches the diagnostics to PAIRED_SELL_FILL_UNCONFIRMED and writes no SELL_FILL_CONFIRMED", async () => {
+      const audit = collectingAuditRecorder();
+
+      await executeEtfRotationOrders({
+        ...baseParams,
+        orders: buildPairedOrders(),
+        executionGates: ALLOW_ALL,
+        submitOrderLeg: acceptingLegs(),
+        appendAuditEvent: audit.appendAuditEvent,
+        refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+        waitForSellFill: waitReporting("unconfirmed"),
+      });
+
+      const unconfirmed = audit.events.find((e) => e.type === "PAIRED_SELL_FILL_UNCONFIRMED")!;
+      expect(unconfirmed.sellFillWait).toEqual(DIAGNOSTICS);
+      expect(audit.events.map((e) => e.type)).not.toContain("SELL_FILL_CONFIRMED");
+    });
+
+    it("attaches the diagnostics to ORDER_AMBIGUOUS for an unpaired SELL whose fill is unconfirmed", async () => {
+      const audit = collectingAuditRecorder();
+
+      await executeEtfRotationOrders({
+        ...baseParams,
+        orders: [{ ticker: "GLD", action: "SELL", shares: 10 }],
+        executionGates: ALLOW_ALL,
+        submitOrderLeg: acceptingLegs(),
+        appendAuditEvent: audit.appendAuditEvent,
+        refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+        waitForSellFill: waitReporting("unconfirmed"),
+      });
+
+      const ambiguous = audit.events.find((e) => e.type === "ORDER_AMBIGUOUS")!;
+      expect(ambiguous.sellFillWait).toEqual(DIAGNOSTICS);
+      expect(audit.events.map((e) => e.type)).not.toContain("SELL_FILL_CONFIRMED");
+    });
+
+    it("attaches the diagnostics to ORDER_REJECTED when the SELL definitively did not fill, and writes no SELL_FILL_CONFIRMED", async () => {
+      const audit = collectingAuditRecorder();
+      const rejectedDiagnostics = { ...DIAGNOSTICS, lastObservedStatus: "canceled" };
+
+      await executeEtfRotationOrders({
+        ...baseParams,
+        orders: buildPairedOrders(),
+        executionGates: ALLOW_ALL,
+        submitOrderLeg: acceptingLegs(),
+        appendAuditEvent: audit.appendAuditEvent,
+        refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+        waitForSellFill: waitReporting("definitively_not_filled", rejectedDiagnostics),
+      });
+
+      const rejected = audit.events.find((e) => e.type === "ORDER_REJECTED")!;
+      expect(rejected.sellFillWait).toEqual(rejectedDiagnostics);
+      expect(audit.events.map((e) => e.type)).not.toContain("SELL_FILL_CONFIRMED");
+    });
+
+    it("still works with a waitForSellFill that never reports diagnostics (events carry no sellFillWait)", async () => {
+      const audit = collectingAuditRecorder();
+
+      await executeEtfRotationOrders({
+        ...baseParams,
+        orders: buildPairedOrders(),
+        executionGates: ALLOW_ALL,
+        submitOrderLeg: acceptingLegs(),
+        appendAuditEvent: audit.appendAuditEvent,
+        refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+        waitForSellFill: async () => "unconfirmed",
+      });
+
+      const unconfirmed = audit.events.find((e) => e.type === "PAIRED_SELL_FILL_UNCONFIRMED")!;
+      expect(unconfirmed.sellFillWait).toBeUndefined();
+    });
+  });
+
   it("calls waitForSellFill for an exit_removed SELL too (no paired BUY, but still needs fill confirmation - 2026-08-08 generalization) and proceeds normally when filled", async () => {
     const orders: RebalanceOrder[] = [{ ticker: "GLD", action: "SELL", shares: 10 }];
     const waitForSellFill = vi.fn(async (): Promise<"filled"> => "filled");
@@ -1043,7 +1175,7 @@ describe("executeEtfRotationOrders - paired SELL fill-confirmation wait (2026-08
     });
 
     expect(waitForSellFill).toHaveBeenCalledTimes(1);
-    expect(waitForSellFill).toHaveBeenCalledWith("broker-1", "GLD");
+    expect(waitForSellFill).toHaveBeenCalledWith("broker-1", "GLD", expect.any(Function));
     expect(result.acceptedOrders.map((o) => o.ticker)).toEqual(["GLD"]);
   });
 
@@ -1217,6 +1349,136 @@ describe("createWaitForSellFill", () => {
 
     await expect(waitForSellFill("order-1", "SPY")).resolves.toBe("filled");
     expect(callCount).toBe(3);
+  });
+
+  describe("diagnostics (2026-10-10)", () => {
+    async function runWithDiagnostics(
+      getOrderStatus: GetOrderStatus,
+      pollIntervalMs: number,
+      timeoutMs: number,
+    ): Promise<{ outcome: SellFillWaitOutcome; reports: SellFillWaitDiagnostics[] }> {
+      const reports: SellFillWaitDiagnostics[] = [];
+      const outcome = await createWaitForSellFill(getOrderStatus, pollIntervalMs, timeoutMs)(
+        "order-1",
+        "SPY",
+        (d) => reports.push(d),
+      );
+      return { outcome, reports };
+    }
+
+    it("pending -> filled: reports the last status, attempt count, and no errors", async () => {
+      const statuses = ["new", "accepted", "filled"];
+      let i = 0;
+      const { outcome, reports } = await runWithDiagnostics(
+        async () => statuses[i++] ?? "filled",
+        5,
+        500,
+      );
+
+      expect(outcome).toBe("filled");
+      expect(reports).toHaveLength(1);
+      expect(reports[0]).toMatchObject({
+        lastObservedStatus: "filled",
+        pollAttempts: 3,
+        pollErrorCount: 0,
+        timeoutMs: 500,
+        pollIntervalMs: 5,
+      });
+      expect(reports[0]!.lastPollError).toBeUndefined();
+      expect(reports[0]!.elapsedMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it("poll errors -> filled: counts the errors and keeps the last sanitized one even though the wait succeeded", async () => {
+      let i = 0;
+      const { outcome, reports } = await runWithDiagnostics(
+        async () => {
+          i += 1;
+          if (i === 1) throw new Error("Request failed with status code 429");
+          if (i === 2) throw new Error("connect ETIMEDOUT");
+          return "filled";
+        },
+        5,
+        500,
+      );
+
+      expect(outcome).toBe("filled");
+      expect(reports[0]).toMatchObject({
+        lastObservedStatus: "filled",
+        pollAttempts: 3,
+        pollErrorCount: 2,
+        lastPollError: "connect ETIMEDOUT",
+      });
+    });
+
+    it("terminal rejection: reports the terminal status that ended the wait", async () => {
+      const statuses = ["new", "canceled"];
+      let i = 0;
+      const { outcome, reports } = await runWithDiagnostics(
+        async () => statuses[i++] ?? "canceled",
+        5,
+        500,
+      );
+
+      expect(outcome).toBe("definitively_not_filled");
+      expect(reports[0]).toMatchObject({
+        lastObservedStatus: "canceled",
+        pollAttempts: 2,
+        pollErrorCount: 0,
+      });
+    });
+
+    it("timeout while still pending: says the broker kept answering 'accepted' (not a poll failure) and that the full timeout elapsed", async () => {
+      const { outcome, reports } = await runWithDiagnostics(async () => "accepted", 5, 40);
+
+      expect(outcome).toBe("unconfirmed");
+      expect(reports).toHaveLength(1);
+      expect(reports[0]!.lastObservedStatus).toBe("accepted");
+      expect(reports[0]!.pollErrorCount).toBe(0);
+      expect(reports[0]!.pollAttempts).toBeGreaterThan(1);
+      expect(reports[0]!.elapsedMs).toBeGreaterThanOrEqual(40);
+      expect(reports[0]!.timeoutMs).toBe(40);
+    });
+
+    it("timeout where every poll failed: lastObservedStatus is null and every attempt counts as an error - distinguishable from 'still pending'", async () => {
+      const { outcome, reports } = await runWithDiagnostics(
+        async () => {
+          throw new Error("socket hang up");
+        },
+        5,
+        40,
+      );
+
+      expect(outcome).toBe("unconfirmed");
+      expect(reports[0]!.lastObservedStatus).toBeNull();
+      expect(reports[0]!.pollErrorCount).toBe(reports[0]!.pollAttempts);
+      expect(reports[0]!.lastPollError).toBe("socket hang up");
+    });
+
+    it("sanitizes a poll error: collapses newlines/whitespace to one line, caps the length, and never includes anything but the message text", async () => {
+      const longMultiline = `Request failed\n  with   status code 500\n${"x".repeat(500)}`;
+      const error = Object.assign(new Error(longMultiline), {
+        config: { headers: { "APCA-API-SECRET-KEY": "super-secret-value" } },
+      });
+      const { reports } = await runWithDiagnostics(
+        async () => {
+          throw error;
+        },
+        5,
+        20,
+      );
+
+      const sanitized = reports[0]!.lastPollError!;
+      expect(sanitized).not.toMatch(/\s{2,}|\n/);
+      expect(sanitized.length).toBeLessThanOrEqual(200);
+      expect(sanitized.startsWith("Request failed with status code 500")).toBe(true);
+      expect(JSON.stringify(reports[0])).not.toContain("super-secret-value");
+    });
+
+    it("still resolves normally when no diagnostics callback is passed", async () => {
+      const waitForSellFill = createWaitForSellFill(async () => "filled", 5, 50);
+
+      await expect(waitForSellFill("order-1", "SPY")).resolves.toBe("filled");
+    });
   });
 });
 

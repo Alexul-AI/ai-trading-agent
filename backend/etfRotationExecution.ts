@@ -69,6 +69,7 @@ import {
   deriveLegType,
   type EtfRotationOrderAuditEvent,
   type EtfRotationOrderLegType,
+  type EtfRotationSellFillWaitDiagnostics,
 } from "./etfRotationOrderAuditLog.js";
 import type { RebalanceOrder } from "./etfRotationStrategy.js";
 import type { PortfolioSnapshot } from "./src/strategy/portfolioSafety.js";
@@ -123,9 +124,16 @@ export type SellFillWaitOutcome =
 // order shape.
 export type GetOrderStatus = (brokerOrderId: string) => Promise<string>;
 
+export type SellFillWaitDiagnostics = EtfRotationSellFillWaitDiagnostics;
+
+// onDiagnostics is an optional side channel rather than a richer return
+// type, so every existing implementation/test stub that returns just the
+// outcome string keeps working unchanged. Called exactly once, right before
+// the outcome is returned.
 export type WaitForSellFill = (
   brokerOrderId: string,
   ticker: string,
+  onDiagnostics?: (diagnostics: SellFillWaitDiagnostics) => void,
 ) => Promise<SellFillWaitOutcome>;
 
 const FILLED_ORDER_STATUSES = new Set(["filled"]);
@@ -156,26 +164,73 @@ export function createWaitForSellFill(
   pollIntervalMs: number,
   timeoutMs: number,
 ): WaitForSellFill {
-  return async (brokerOrderId: string): Promise<SellFillWaitOutcome> => {
-    const deadline = Date.now() + timeoutMs;
+  return async (
+    brokerOrderId: string,
+    _ticker: string,
+    onDiagnostics?: (diagnostics: SellFillWaitDiagnostics) => void,
+  ): Promise<SellFillWaitOutcome> => {
+    const startedAt = Date.now();
+    const deadline = startedAt + timeoutMs;
+    let pollAttempts = 0;
+    let pollErrorCount = 0;
+    let lastObservedStatus: string | null = null;
+    let lastPollError: string | undefined;
+
+    const finish = (outcome: SellFillWaitOutcome): SellFillWaitOutcome => {
+      onDiagnostics?.({
+        lastObservedStatus,
+        pollAttempts,
+        pollErrorCount,
+        ...(lastPollError !== undefined ? { lastPollError } : {}),
+        elapsedMs: Date.now() - startedAt,
+        timeoutMs,
+        pollIntervalMs,
+      });
+      return outcome;
+    };
 
     while (true) {
       let status = "";
+      pollAttempts += 1;
       try {
         status = await getOrderStatus(brokerOrderId);
-      } catch {
-        // Treated as still-unknown - see the function doc comment above.
+        lastObservedStatus = status;
+      } catch (error) {
+        // Still treated as unknown and retried - see the function doc
+        // comment above. Only counted/recorded here so a later "unconfirmed"
+        // can say whether the broker kept answering "pending" or the polls
+        // themselves were failing.
+        pollErrorCount += 1;
+        lastPollError = sanitizePollError(error);
       }
 
-      if (FILLED_ORDER_STATUSES.has(status)) return "filled";
+      if (FILLED_ORDER_STATUSES.has(status)) return finish("filled");
       if (TERMINAL_NOT_FILLED_ORDER_STATUSES.has(status)) {
-        return "definitively_not_filled";
+        return finish("definitively_not_filled");
       }
-      if (Date.now() >= deadline) return "unconfirmed";
+      if (Date.now() >= deadline) return finish("unconfirmed");
 
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }
   };
+}
+
+const MAX_POLL_ERROR_LENGTH = 200;
+
+// Message text only - never the error object itself, whose request config
+// (and headers) an HTTP client may attach. Single line and length-capped so
+// it is safe to persist in the audit log.
+function sanitizePollError(error: unknown): string {
+  const raw =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "Unknown error";
+  const singleLine = raw.replace(/\s+/g, " ").trim();
+  return singleLine.length > MAX_POLL_ERROR_LENGTH
+    ? `${singleLine.slice(0, MAX_POLL_ERROR_LENGTH - 3)}...`
+    : singleLine;
 }
 
 /**
@@ -684,8 +739,18 @@ export async function executeEtfRotationOrders(
 
     if (wasAccepted) {
       const acceptedOutcome = acceptedOrders[acceptedOrders.length - 1]!;
+      // Held in an object, not a bare `let`: TypeScript narrows a `let`
+      // assigned only inside a callback to its initial value and then types
+      // reads of it as `never`.
+      const waitRecord: { diagnostics?: SellFillWaitDiagnostics } = {};
       const waitOutcome = acceptedOutcome.brokerOrderId
-        ? await waitForSellFill(acceptedOutcome.brokerOrderId, order.ticker)
+        ? await waitForSellFill(
+            acceptedOutcome.brokerOrderId,
+            order.ticker,
+            (diagnostics) => {
+              waitRecord.diagnostics = diagnostics;
+            },
+          )
         : "unconfirmed"; // no broker order id to poll against - can't confirm
 
       if (waitOutcome === "definitively_not_filled") {
@@ -717,6 +782,7 @@ export async function executeEtfRotationOrders(
           submittedQty: acceptedOutcome.submittedQty,
           brokerOrderId: acceptedOutcome.brokerOrderId,
           error: acceptedOutcome.error,
+          sellFillWait: waitRecord.diagnostics,
         });
       } else if (waitOutcome === "unconfirmed") {
         sellFailedTickers.add(order.ticker);
@@ -740,6 +806,7 @@ export async function executeEtfRotationOrders(
             requestedQty: pairedBuyOrder.shares,
             brokerOrderId: acceptedOutcome.brokerOrderId,
             error: buyOutcome.error,
+            sellFillWait: waitRecord.diagnostics,
           });
         } else {
           // No paired BUY to redirect into - the SELL's OWN outcome is
@@ -766,11 +833,27 @@ export async function executeEtfRotationOrders(
             submittedQty: acceptedOutcome.submittedQty,
             brokerOrderId: acceptedOutcome.brokerOrderId,
             error: acceptedOutcome.error,
+            sellFillWait: waitRecord.diagnostics,
           });
         }
+      } else if (waitOutcome === "filled") {
+        // The (paired or unpaired) SELL's acceptance stands and any paired
+        // BUY proceeds normally below. Only recorded here, after the
+        // broker itself reported "filled" - never inferred from acceptance.
+        await appendAuditEvent({
+          type: "SELL_FILL_CONFIRMED",
+          timestamp: now(),
+          rebalanceMonthKey,
+          configVariantKey,
+          ticker: order.ticker,
+          side: "SELL",
+          legType: acceptedOutcome.legType,
+          requestedQty: acceptedOutcome.requestedQty,
+          submittedQty: acceptedOutcome.submittedQty,
+          brokerOrderId: acceptedOutcome.brokerOrderId,
+          sellFillWait: waitRecord.diagnostics,
+        });
       }
-      // "filled" - no action needed, the (paired or unpaired) SELL's
-      // acceptance stands and any paired BUY proceeds normally below.
     }
   }
 
