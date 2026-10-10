@@ -878,6 +878,15 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
       lastDecisions,
       circuitBreaker: lastCircuitBreakerState,
       circuitBreakerMaxDrawdownFromPeakPercent: getMaxDrawdownFromPeakPercent(),
+      etfRotationExecution:
+        AUTOPILOT_STRATEGY === "etf_rotation"
+          ? {
+              rampMaxPositionEquityPercent:
+                AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT ?? null,
+              sellFillTimeoutMs: AUTOPILOT_ETF_ROTATION_SELL_FILL_TIMEOUT_MS,
+              sellFillPollIntervalMs: AUTOPILOT_ETF_ROTATION_SELL_FILL_POLL_MS,
+            }
+          : null,
     };
   }
 
