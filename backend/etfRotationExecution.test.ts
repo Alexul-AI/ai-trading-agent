@@ -1087,6 +1087,43 @@ describe("executeEtfRotationOrders - paired SELL fill-confirmation wait (2026-08
       expect(confirmed.legType).toBe("liquidate_existing");
     });
 
+    it("a failing SELL_FILL_CONFIRMED audit write is non-fatal: the cycle still runs the rebuild BUY and finishes accepted", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const written: string[] = [];
+      const attempted: string[] = [];
+
+      try {
+        const result = await executeEtfRotationOrders({
+          ...baseParams,
+          orders: buildPairedOrders(),
+          executionGates: ALLOW_ALL,
+          submitOrderLeg: async (ticker, action) => {
+            attempted.push(`${ticker}:${action}`);
+            return { outcome: "accepted", brokerOrderId: `broker-${ticker}-${action}` };
+          },
+          appendAuditEvent: async (event) => {
+            if (event.type === "SELL_FILL_CONFIRMED") throw new Error("ENOSPC: no space left on device");
+            written.push(event.type);
+          },
+          refreshPortfolioSnapshot: async () => makeSnapshot(100000),
+          waitForSellFill: waitReporting("filled"),
+        });
+
+        expect(attempted).toEqual(["SPY:SELL", "SPY:BUY"]);
+        expect(result.status).toBe("accepted");
+        expect(written).toEqual([
+          "ORDER_SUBMITTED",
+          "ORDER_ACCEPTED",
+          "ORDER_SUBMITTED",
+          "ORDER_ACCEPTED",
+        ]);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(String(warn.mock.calls[0]![0])).toContain("ENOSPC");
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
     it("attaches the diagnostics to PAIRED_SELL_FILL_UNCONFIRMED and writes no SELL_FILL_CONFIRMED", async () => {
       const audit = collectingAuditRecorder();
 

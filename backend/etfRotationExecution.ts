@@ -840,19 +840,33 @@ export async function executeEtfRotationOrders(
         // The (paired or unpaired) SELL's acceptance stands and any paired
         // BUY proceeds normally below. Only recorded here, after the
         // broker itself reported "filled" - never inferred from acceptance.
-        await appendAuditEvent({
-          type: "SELL_FILL_CONFIRMED",
-          timestamp: now(),
-          rebalanceMonthKey,
-          configVariantKey,
-          ticker: order.ticker,
-          side: "SELL",
-          legType: acceptedOutcome.legType,
-          requestedQty: acceptedOutcome.requestedQty,
-          submittedQty: acceptedOutcome.submittedQty,
-          brokerOrderId: acceptedOutcome.brokerOrderId,
-          sellFillWait: waitRecord.diagnostics,
-        });
+        //
+        // Best-effort, unlike every other append in this function: this is
+        // an informational success-path event, and a failed write here would
+        // otherwise abort the cycle between a confirmed SELL and the BUY
+        // phase (leaving the rebalance state stuck in "executing") for no
+        // safety benefit. The failure-path events above stay mandatory.
+        try {
+          await appendAuditEvent({
+            type: "SELL_FILL_CONFIRMED",
+            timestamp: now(),
+            rebalanceMonthKey,
+            configVariantKey,
+            ticker: order.ticker,
+            side: "SELL",
+            legType: acceptedOutcome.legType,
+            requestedQty: acceptedOutcome.requestedQty,
+            submittedQty: acceptedOutcome.submittedQty,
+            brokerOrderId: acceptedOutcome.brokerOrderId,
+            sellFillWait: waitRecord.diagnostics,
+          });
+        } catch (error) {
+          console.warn(
+            `[ETF_ROTATION] SELL_FILL_CONFIRMED audit write failed for ${order.ticker} (non-fatal, cycle continues): ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
       }
     }
   }
