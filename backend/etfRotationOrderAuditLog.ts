@@ -56,7 +56,36 @@ export type EtfRotationOrderAuditEventType =
   // legType: "repair" (see EtfRotationOrderLegType below) - deliberately
   // not a new combined "RESOLVED"-with-outcome-field type, since this log
   // has never used that shape anywhere else.
-  | "REPAIR_MISSING_BUY_ATTEMPTED";
+  | "REPAIR_MISSING_BUY_ATTEMPTED"
+  // Emitted only after the broker itself reported a SELL as "filled" (see
+  // etfRotationExecution.ts's waitForSellFill) - the success-path
+  // counterpart to PAIRED_SELL_FILL_UNCONFIRMED/ORDER_AMBIGUOUS/
+  // ORDER_REJECTED, so a slow-but-successful fill is visible in the log
+  // instead of only its failures being. Informational only: not in
+  // etfRotationReview.ts's FAILED_BUY_AUDIT_EVENT_TYPES, so it never
+  // affects off-target detection.
+  | "SELL_FILL_CONFIRMED";
+
+/**
+ * What waitForSellFill actually observed while waiting for one SELL to fill
+ * (2026-10-10, after the 2026-10-01 incident: both SELLs were accepted and
+ * filled 22-33s later, but the 10s wait gave up and the log couldn't say
+ * whether the broker kept returning a pending status or the status polls
+ * themselves were failing). Attached to every event that records the
+ * outcome of that wait.
+ */
+export interface EtfRotationSellFillWaitDiagnostics {
+  /** The last status string the broker actually returned; null if no poll ever succeeded. */
+  lastObservedStatus: string | null;
+  pollAttempts: number;
+  /** Polls that threw instead of returning a status. */
+  pollErrorCount: number;
+  /** Sanitized (single line, truncated) message of the most recent poll error, if any poll failed. */
+  lastPollError?: string;
+  elapsedMs: number;
+  timeoutMs: number;
+  pollIntervalMs: number;
+}
 
 // Audit-only classification of why a leg exists - never drives any
 // execution decision (design doc §11's Stage 2A resolution). Derived at
@@ -98,6 +127,8 @@ export interface EtfRotationOrderAuditEvent {
   clientOrderId?: string;
   brokerOrderId?: string;
   error?: string;
+  /** Present on events that record the outcome of a post-SELL fill-confirmation wait; absent otherwise (and on older log lines). */
+  sellFillWait?: EtfRotationSellFillWaitDiagnostics;
   // Only meaningful (and only ever populated) for REBALANCE_MANUALLY_CLEARED
   // - the whole point of a manual-only clear is that it always has one,
   // mirroring circuitBreakerAuditLog.ts's CIRCUIT_BREAKER_RESET convention.

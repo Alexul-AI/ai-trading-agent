@@ -134,6 +134,34 @@ describe("etfRotationOrderAuditLog", () => {
     expect(events[0]!.reason).toContain("safe to clear");
   });
 
+  it("round-trips a SELL_FILL_CONFIRMED event with nested sellFillWait diagnostics, and still reads older lines that have none", async () => {
+    const oldStyle = makeEvent({ type: "ORDER_ACCEPTED", ticker: "SPY", side: "SELL" });
+    const confirmed: EtfRotationOrderAuditEvent = makeEvent({
+      type: "SELL_FILL_CONFIRMED",
+      timestamp: new Date(2026, 0, 2).toISOString(),
+      ticker: "SPY",
+      side: "SELL",
+      legType: "liquidate_existing",
+      sellFillWait: {
+        lastObservedStatus: "filled",
+        pollAttempts: 4,
+        pollErrorCount: 1,
+        lastPollError: "Request failed with status code 429",
+        elapsedMs: 1730,
+        timeoutMs: 10000,
+        pollIntervalMs: 500,
+      },
+    });
+
+    await appendEtfRotationOrderAuditEvent(oldStyle, tmpFile);
+    await appendEtfRotationOrderAuditEvent(confirmed, tmpFile);
+
+    const events = await readEtfRotationOrderAuditLog(100, tmpFile);
+
+    expect(events[0]).toEqual(confirmed);
+    expect(events[1]!.sellFillWait).toBeUndefined();
+  });
+
   describe("readEtfRotationOrderAuditLogForRebalanceMonth", () => {
     it("returns an empty array when the file doesn't exist yet", async () => {
       const events = await readEtfRotationOrderAuditLogForRebalanceMonth("2026-08", tmpFile);

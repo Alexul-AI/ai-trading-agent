@@ -249,6 +249,55 @@ describe("deriveEtfRotationOffTargetState", () => {
     expect(result.missingLegs[0]!.ticker).toBe("QQQ");
   });
 
+  it("SELL_FILL_CONFIRMED events (success-path, informational) never create or mask an off-target signal", () => {
+    const confirmed = (ticker: string) =>
+      auditEvent({
+        type: "SELL_FILL_CONFIRMED",
+        ticker,
+        side: "SELL",
+        legType: "liquidate_existing",
+        sellFillWait: {
+          lastObservedStatus: "filled",
+          pollAttempts: 3,
+          pollErrorCount: 0,
+          elapsedMs: 1500,
+          timeoutMs: 10000,
+          pollIntervalMs: 500,
+        },
+      });
+
+    // A confirmed SELL alone, with the rebuild BUY simply not attempted yet
+    // (zero shares, no recorded failure), is not off-target.
+    expect(
+      deriveEtfRotationOffTargetState({
+        targets: TARGETS,
+        plannedOrders: PLANNED_ORDERS,
+        positions: {},
+        recentOrderAuditEvents: [confirmed("QQQ"), confirmed("SPY")],
+        rebalanceMonthKey: MONTH,
+      }),
+    ).toEqual({ offTarget: false, missingLegs: [] });
+
+    // And it does not hide a real BUY failure recorded alongside it.
+    const withFailure = deriveEtfRotationOffTargetState({
+      targets: TARGETS,
+      plannedOrders: PLANNED_ORDERS,
+      positions: { SPY: { shares: 2 } },
+      recentOrderAuditEvents: [
+        confirmed("QQQ"),
+        auditEvent({
+          type: "ORDER_REJECTED",
+          ticker: "QQQ",
+          side: "BUY",
+          error: "Request failed with status code 403",
+        }),
+      ],
+      rebalanceMonthKey: MONTH,
+    });
+    expect(withFailure.offTarget).toBe(true);
+    expect(withFailure.missingLegs[0]!.ticker).toBe("QQQ");
+  });
+
   it("falls back to a generic reason when the failed audit event has no error text", () => {
     const events: EtfRotationOrderAuditEvent[] = [
       auditEvent({ type: "PAIRED_SELL_FILL_UNCONFIRMED", ticker: "QQQ", side: "BUY" }),

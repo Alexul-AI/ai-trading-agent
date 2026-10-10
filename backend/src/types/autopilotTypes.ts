@@ -165,6 +165,21 @@ export interface AutopilotDecisionLog {
   result?: ExecuteSafeTradeResult;
 }
 
+/**
+ * The ETF Rotation execution settings actually in effect in this process
+ * (read from the same module-level constants the execution path uses), so
+ * they can be checked from outside instead of inferred from a docs snapshot
+ * or from order sizes.
+ */
+export interface EtfRotationExecutionStatus {
+  /** AUTOPILOT_ETF_ROTATION_RAMP_MAX_POSITION_PERCENT; null means unset, i.e. uncapped. */
+  rampMaxPositionEquityPercent: number | null;
+  /** AUTOPILOT_ETF_ROTATION_SELL_FILL_TIMEOUT_MS */
+  sellFillTimeoutMs: number;
+  /** AUTOPILOT_ETF_ROTATION_SELL_FILL_POLL_MS */
+  sellFillPollIntervalMs: number;
+}
+
 export interface AutopilotStatus {
   enabled: boolean;
   executeTrades: boolean;
@@ -190,6 +205,8 @@ export interface AutopilotStatus {
   lastDecisions: AutopilotDecisionLog[];
   circuitBreaker: CircuitBreakerState | null;
   circuitBreakerMaxDrawdownFromPeakPercent: number;
+  /** Null unless the active strategy is ETF Rotation. */
+  etfRotationExecution: EtfRotationExecutionStatus | null;
 }
 
 export type AutopilotStrategyKind = "baseline" | "etf_rotation";
