@@ -1,11 +1,11 @@
 # ETF rotation forward validation report
 
-Generated: 2026-10-06T02:51:16.845Z
+Generated: 2026-10-13T03:28:13.152Z
 Target anchor (candidate-hold3 named, historical out-of-sample declared exhausted): 2026-07-14
 
 ## Simulated window (fresh cash start, pinned to the anchor)
-- baseline-2: 2026-07-14 to 2026-10-05 (59 trading days)
-- candidate-hold3: 2026-07-14 to 2026-10-05 (59 trading days)
+- baseline-2: 2026-07-14 to 2026-10-12 (64 trading days)
+- candidate-hold3: 2026-07-14 to 2026-10-12 (64 trading days)
 - Achieved start is exactly on the target anchor (no pre-anchor data included).
 
 Both simulations start with pure cash and execute their first rebalance immediately on day one (isMonthlyRebalanceDate's "first simulated day" rule). The simulated window is pinned to never start earlier than the anchor (via runEtfRotationWindowAnalysis's simStartDateOverride) - pre-anchor price history is used only to warm up momentum/SMA indicators, never simulated or traded. This fixes a real bug caught in review before merge: an earlier version of this script let the simulation start wherever warmup happened to clear, which drifted 26 calendar days before the anchor and included pre-anchor performance in what was meant to be a forward-only read (see PR #31 review).
@@ -13,13 +13,13 @@ Both simulations start with pure cash and execute their first rebalance immediat
 ## Result (NEXT_OPEN)
 | series | return% | maxDD% | trading days | rebalances |
 |---|---|---|---|---|
-| baseline-2 | 3.26 | -5.28 | 59 | 4 |
-| candidate-hold3 | 1.68 | -3.86 | 59 | 4 |
+| baseline-2 | 2.84 | -5.28 | 64 | 4 |
+| candidate-hold3 | 1.08 | -3.86 | 64 | 4 |
 
 
 ## Benchmarks (same period, context)
-- SPY buy & hold: 3.06%
-- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): 0.38%
+- SPY buy & hold: 3.47%
+- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): 0.35%
 
 ## Decisions - baseline-2
 - 2026-07-15 BUY QQQ - 6 sh @ $724.52 (~43.6% of equity)
