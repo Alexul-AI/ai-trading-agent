@@ -1,13 +1,13 @@
 # ETF rotation ADJUSTED-SHADOW forward validation report
 
-Generated: 2026-10-13T03:28:14.199Z
+Generated: 2026-10-20T01:40:17.509Z
 Target anchor (adjustment=all shadow-tracking decided): 2026-08-08
 
 **ADJUSTED-SHADOW TRACKING - methodology evidence, not production clearance.** This track simulates the same two config variants under `adjustment=all` (dividend/distribution-adjusted bars) instead of the live `raw` default - it answers "would `adjustment=all` change forward results," not "does candidate-hold3 beat baseline-2 under the current production methodology" (see the separate raw-production forward-validation report for that - its own clock is untouched by this track). Does not by itself trigger any live or config change. Full decision plan: `docs/product/ROADMAP.md` Phase 2.
 
 ## Simulated window (fresh cash start, pinned to the anchor)
-- baseline-2: 2026-08-10 to 2026-10-12 (45 trading days)
-- candidate-hold3: 2026-08-10 to 2026-10-12 (45 trading days)
+- baseline-2: 2026-08-10 to 2026-10-19 (50 trading days)
+- candidate-hold3: 2026-08-10 to 2026-10-19 (50 trading days)
 - Achieved start is 2 calendar day(s) after the target anchor (the anchor fell on a non-trading day; still no pre-anchor data included).
 
 Both simulations start with pure cash and execute their first rebalance immediately on day one (isMonthlyRebalanceDate's "first simulated day" rule). The simulated window is pinned to never start earlier than the anchor (via runEtfRotationWindowAnalysis's simStartDateOverride) - pre-anchor price history is used only to warm up momentum/SMA indicators, never simulated or traded. This fixes a real bug caught in review before merge: an earlier version of this script let the simulation start wherever warmup happened to clear, which drifted 26 calendar days before the anchor and included pre-anchor performance in what was meant to be a forward-only read (see PR #31 review).
@@ -15,13 +15,13 @@ Both simulations start with pure cash and execute their first rebalance immediat
 ## Result (NEXT_OPEN)
 | series | return% | maxDD% | trading days | rebalances |
 |---|---|---|---|---|
-| baseline-2 | 1.53 | -3.13 | 45 | 3 |
-| candidate-hold3 | -0.69 | -3.22 | 45 | 3 |
+| baseline-2 | -0.82 | -3.84 | 50 | 3 |
+| candidate-hold3 | -2.31 | -3.22 | 50 | 3 |
 
 
 ## Benchmarks (same period, context)
-- SPY buy & hold: 0.90%
-- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): -1.86%
+- SPY buy & hold: -0.58%
+- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): -2.73%
 
 ## Decisions - baseline-2
 - 2026-08-11 BUY QQQ - 6 sh @ $722.62 (~43.6% of equity)
@@ -59,7 +59,7 @@ Both simulations start with pure cash and execute their first rebalance immediat
 - Regardless of the read at any sample size: this is supplementary color on top of the already-completed historical multi-window validation (PR #27/#28), not a replacement for it. It does not by itself trigger promoting candidate-hold3 to DEFAULT_ETF_ROTATION_CONFIG - that stays a separate, explicit, user-approved step.
 
 ## Current read
-3 rebalances since the anchor - concern flagged (maxDD worse than baseline-2. ) - worth more data/discussion, not an automatic rejection.
+3 rebalances since the anchor - candidate-hold3 holding up so far (maxDD not worse, return within 5pt tolerance of baseline-2).
 
 **ADJUSTED-SHADOW TRACK**: this read is about candidate-hold3 vs baseline-2 UNDER adjustment=all specifically - it is not a read on production (raw) methodology, has its own separate clock from the raw-production track, and does not by itself trigger any live or config change.
 
