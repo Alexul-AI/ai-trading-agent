@@ -1,13 +1,13 @@
 # ETF rotation ADJUSTED-SHADOW forward validation report
 
-Generated: 2026-10-20T01:40:17.509Z
+Generated: 2026-10-27T01:57:33.492Z
 Target anchor (adjustment=all shadow-tracking decided): 2026-08-08
 
 **ADJUSTED-SHADOW TRACKING - methodology evidence, not production clearance.** This track simulates the same two config variants under `adjustment=all` (dividend/distribution-adjusted bars) instead of the live `raw` default - it answers "would `adjustment=all` change forward results," not "does candidate-hold3 beat baseline-2 under the current production methodology" (see the separate raw-production forward-validation report for that - its own clock is untouched by this track). Does not by itself trigger any live or config change. Full decision plan: `docs/product/ROADMAP.md` Phase 2.
 
 ## Simulated window (fresh cash start, pinned to the anchor)
-- baseline-2: 2026-08-10 to 2026-10-19 (50 trading days)
-- candidate-hold3: 2026-08-10 to 2026-10-19 (50 trading days)
+- baseline-2: 2026-08-10 to 2026-10-26 (55 trading days)
+- candidate-hold3: 2026-08-10 to 2026-10-26 (55 trading days)
 - Achieved start is 2 calendar day(s) after the target anchor (the anchor fell on a non-trading day; still no pre-anchor data included).
 
 Both simulations start with pure cash and execute their first rebalance immediately on day one (isMonthlyRebalanceDate's "first simulated day" rule). The simulated window is pinned to never start earlier than the anchor (via runEtfRotationWindowAnalysis's simStartDateOverride) - pre-anchor price history is used only to warm up momentum/SMA indicators, never simulated or traded. This fixes a real bug caught in review before merge: an earlier version of this script let the simulation start wherever warmup happened to clear, which drifted 26 calendar days before the anchor and included pre-anchor performance in what was meant to be a forward-only read (see PR #31 review).
@@ -15,13 +15,13 @@ Both simulations start with pure cash and execute their first rebalance immediat
 ## Result (NEXT_OPEN)
 | series | return% | maxDD% | trading days | rebalances |
 |---|---|---|---|---|
-| baseline-2 | -0.82 | -3.84 | 50 | 3 |
-| candidate-hold3 | -2.31 | -3.22 | 50 | 3 |
+| baseline-2 | -1.28 | -4.38 | 55 | 3 |
+| candidate-hold3 | -2.61 | -3.72 | 55 | 3 |
 
 
 ## Benchmarks (same period, context)
-- SPY buy & hold: -0.58%
-- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): -2.73%
+- SPY buy & hold: -0.76%
+- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): -2.97%
 
 ## Decisions - baseline-2
 - 2026-08-11 BUY QQQ - 6 sh @ $722.62 (~43.6% of equity)
