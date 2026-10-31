@@ -62,6 +62,8 @@ export interface AutopilotWorkerOptions {
   executeSafeTrade: ExecuteSafeTrade;
   /** Used by the ETF Rotation execution path to poll a just-accepted SELL leg for its actual fill status before submitting a paired rebuild BUY - see etfRotationExecution.ts's waitForSellFill. */
   getOrderStatus: (orderId: string) => Promise<string>;
+  /** Live broker market clock (`is_open`). The ETF Rotation path defers a rebalance whenever this is false or the read fails - see etfRotationCycle.ts's market-hours gate. Required so a worker built without it is a compile error. */
+  getMarketIsOpen: () => Promise<boolean>;
   broadcastSSE: (payload: unknown) => void;
   sendTelegramAlert?: (message: string) => Promise<void>;
   /**

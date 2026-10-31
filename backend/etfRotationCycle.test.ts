@@ -12,9 +12,15 @@ import {
 } from "./autopilotWorker.characterization.helpers.js";
 import {
   buildLiveSubmitOrderLeg,
+  checkMarketIsOpen,
   rejectUnsupportedNotionalLeg,
   runEtfRotationCycle,
 } from "./etfRotationCycle.js";
+import {
+  readRebalanceStateStrict,
+  recordRebalancePlanned,
+  recordRebalanceTerminal,
+} from "./etfRotationWorkerState.js";
 import { ETF_ROTATION_MVP_BASELINE_CONFIG } from "./etfRotationStrategy.js";
 import type { ExecuteSafeTradeResult } from "./src/types/autopilotTypes.js";
 
@@ -86,6 +92,7 @@ describe("runEtfRotationCycle: asymmetric allowBuy/allowRebalanceSells gates", (
       broadcastSSE: () => {},
       executeSafeTrade,
       getPortfolioSnapshot: async () => portfolio,
+      getMarketIsOpen: async () => true,
       etfRotationStateFilePath: path.join(tempDir, "etf-rotation-worker-state.json"),
       etfRotationOrderAuditLogFilePath: path.join(tempDir, "etf-rotation-order-audit.jsonl"),
     });
@@ -154,6 +161,7 @@ describe("runEtfRotationCycle: asymmetric allowBuy/allowRebalanceSells gates", (
       broadcastSSE: () => {},
       executeSafeTrade,
       getPortfolioSnapshot: async () => portfolio,
+      getMarketIsOpen: async () => true,
       // GLD's SELL is unpaired (not a top-2 pick this cycle, so no GLD BUY
       // to pair it with) - since 2026-08-08, every accepted SELL is
       // fill-confirmed before the BUY phase, paired or not (see
@@ -264,6 +272,7 @@ describe("runEtfRotationCycle: real accepted-outcome bookkeeping", () => {
       broadcastSSE: () => {},
       executeSafeTrade,
       getPortfolioSnapshot: async () => portfolio,
+      getMarketIsOpen: async () => true,
       etfRotationStateFilePath,
       etfRotationOrderAuditLogFilePath: path.join(tempDir, "etf-rotation-order-audit.jsonl"),
     });
@@ -333,6 +342,7 @@ describe("runEtfRotationCycle: cheap already-done-this-month short-circuit (2026
         throw new Error("executeSafeTrade should never be called - already done this month.");
       }),
       getPortfolioSnapshot: async () => portfolio,
+      getMarketIsOpen: async () => true,
       etfRotationStateFilePath,
       etfRotationOrderAuditLogFilePath: path.join(tempDir, "etf-rotation-order-audit.jsonl"),
     });
@@ -364,5 +374,208 @@ describe("runEtfRotationCycle: cheap already-done-this-month short-circuit (2026
     // The state file's own month must actually match "now" for this test
     // to be a meaningful proof, not an accident of a stale fixture.
     expect(month).toBe(today.slice(0, 7));
+  });
+});
+
+describe("checkMarketIsOpen", () => {
+  it("maps an explicit true to open and an explicit false to closed", async () => {
+    await expect(checkMarketIsOpen(async () => true)).resolves.toEqual({ status: "open" });
+    await expect(checkMarketIsOpen(async () => false)).resolves.toEqual({ status: "closed" });
+  });
+
+  it("treats anything that is not exactly true as closed - never as a guess that the market is open", async () => {
+    await expect(
+      checkMarketIsOpen(async () => undefined as unknown as boolean),
+    ).resolves.toEqual({ status: "closed" });
+    await expect(
+      checkMarketIsOpen(async () => "true" as unknown as boolean),
+    ).resolves.toEqual({ status: "closed" });
+  });
+
+  it("reports a thrown clock error as unavailable, with a single-line message", async () => {
+    const result = await checkMarketIsOpen(async () => {
+      throw new Error("Alpaca market clock failed: HTTP 503\n  upstream   unavailable");
+    });
+
+    expect(result).toEqual({
+      status: "unavailable",
+      error: "Alpaca market clock failed: HTTP 503 upstream unavailable",
+    });
+  });
+
+  it("bounds a hung clock read by the timeout instead of waiting forever", async () => {
+    const result = await checkMarketIsOpen(() => new Promise<boolean>(() => {}), 20);
+
+    expect(result.status).toBe("unavailable");
+    expect(result.status === "unavailable" && result.error).toContain("timed out after 20ms");
+  });
+});
+
+describe("runEtfRotationCycle: market-hours gate (deferral, never a terminal failure)", () => {
+  const OPEN_GATES = {
+    executeTradesEnabled: true,
+    allowBuy: true,
+    allowRebalanceSells: true,
+    maxAllowedPositions: Number.POSITIVE_INFINITY,
+  };
+
+  async function setup(prefix: string) {
+    const tempDir = await makeTempDataDir(prefix);
+    const today = todayDateKey();
+    const statePath = path.join(tempDir, "etf-rotation-worker-state.json");
+    const auditPath = path.join(tempDir, "etf-rotation-order-audit.jsonl");
+    const portfolio = makePortfolioSnapshot({ equity: 10_000, balance: 10_000 });
+    const executeSafeTrade = vi.fn(
+      async (ticker: string): Promise<ExecuteSafeTradeResult> => ({
+        status: "success",
+        order: { id: `broker-order-${ticker}` },
+      }),
+    );
+
+    const run = (
+      getMarketIsOpen: () => Promise<boolean>,
+      executeTradesEnabled = true,
+    ) =>
+      runEtfRotationCycle({
+        portfolio,
+        config: ETF_ROTATION_MVP_BASELINE_CONFIG,
+        configVariantKey: "baseline-2",
+        barsDays: 400,
+        warmupTradingDays: 210,
+        executionGates: { ...OPEN_GATES, executeTradesEnabled },
+        fetchBars: makeFetchBars(makeBarsByTicker(today)),
+        broadcastSSE: () => {},
+        executeSafeTrade,
+        getPortfolioSnapshot: async () => portfolio,
+        waitForSellFill: async () => "filled" as const,
+        getMarketIsOpen,
+        etfRotationStateFilePath: statePath,
+        etfRotationOrderAuditLogFilePath: auditPath,
+      });
+
+    return { today, statePath, auditPath, executeSafeTrade, run };
+  }
+
+  async function exists(filePath: string): Promise<boolean> {
+    try {
+      await fs.access(filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("market closed: defers the whole rebalance - no order, no audit event, and not even a state file is written", async () => {
+    const { statePath, auditPath, executeSafeTrade, run } = await setup("etf-rotation-gate-closed-");
+
+    const decisions = await run(async () => false);
+
+    expect(executeSafeTrade).not.toHaveBeenCalled();
+    expect(await exists(statePath)).toBe(false);
+    expect(await exists(auditPath)).toBe(false);
+    expect(decisions).toHaveLength(ETF_ROTATION_MVP_BASELINE_CONFIG.universe.length);
+    for (const decision of decisions) {
+      expect(decision.action).toBe("HOLD");
+      expect(decision.executed).toBe(false);
+      expect(decision.executionStatus).toBe("not_attempted");
+      expect(decision.blockReasonCode).toBe("ETF_ROTATION_MARKET_CLOSED");
+      expect(decision.reason).toContain("no manual clear is needed");
+    }
+  });
+
+  it("clock API error: fails closed the same way, with its own reason code, and logs a warning", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { statePath, executeSafeTrade, run } = await setup("etf-rotation-gate-clockerr-");
+
+    try {
+      const decisions = await run(async () => {
+        throw new Error("Alpaca market clock failed: HTTP 503");
+      });
+
+      expect(executeSafeTrade).not.toHaveBeenCalled();
+      expect(await exists(statePath)).toBe(false);
+      for (const decision of decisions) {
+        expect(decision.blockReasonCode).toBe("ETF_ROTATION_MARKET_CLOCK_UNAVAILABLE");
+        expect(decision.blockReasonCategory).toBe("error");
+        expect(decision.reason).toContain("HTTP 503");
+      }
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("dry-run (execution disabled) never consults the clock, so a closed or broken clock cannot block read-only planning", async () => {
+    const { statePath, executeSafeTrade, run } = await setup("etf-rotation-gate-dryrun-");
+    const clock = vi.fn(async (): Promise<boolean> => {
+      throw new Error("the clock must not be consulted in dry-run");
+    });
+
+    const decisions = await run(clock, false);
+
+    expect(clock).not.toHaveBeenCalled();
+    expect(executeSafeTrade).not.toHaveBeenCalled();
+    expect(decisions.some((d) => d.reasonType === "REBALANCE_BUY")).toBe(true);
+    expect(decisions.every((d) => d.blockReasonCode !== "ETF_ROTATION_MARKET_CLOSED")).toBe(true);
+    // Dry-run planning still records its planned state exactly as before.
+    expect((await readRebalanceStateStrict(statePath)).state.status).toBe("planned");
+  });
+
+  it("a month that is already rebalanced short-circuits before the clock is ever read", async () => {
+    const { today, statePath, auditPath, executeSafeTrade, run } = await setup("etf-rotation-gate-done-");
+    await recordRebalancePlanned(
+      {
+        dateKey: today,
+        rebalanceMonthKey: currentMonthKey(),
+        configVariantKey: "baseline-2",
+        targets: [],
+        plannedOrders: [],
+      },
+      statePath,
+    );
+    await recordRebalanceTerminal("executed", statePath);
+    const clock = vi.fn(async (): Promise<boolean> => {
+      throw new Error("the clock must not be read for an already-rebalanced month");
+    });
+
+    const decisions = await run(clock);
+
+    expect(clock).not.toHaveBeenCalled();
+    expect(executeSafeTrade).not.toHaveBeenCalled();
+    expect(await exists(auditPath)).toBe(false);
+    expect(decisions.every((d) => d.reason?.startsWith("Already rebalanced this month"))).toBe(true);
+  });
+
+  it("the recovery scenario: after a manual clear (state cancelled), a closed market leaves the state untouched and a later open-market cycle completes the rebalance by itself", async () => {
+    const { today, statePath, executeSafeTrade, run } = await setup("etf-rotation-gate-recovery-");
+    // What POST /clear-review leaves behind: this month's rebalance is
+    // "cancelled" - not done, so the next cycle may try again.
+    await recordRebalancePlanned(
+      {
+        dateKey: today,
+        rebalanceMonthKey: currentMonthKey(),
+        configVariantKey: "baseline-2",
+        targets: [],
+        plannedOrders: [],
+      },
+      statePath,
+    );
+    await recordRebalanceTerminal("cancelled", statePath);
+    const before = await readRebalanceStateStrict(statePath);
+
+    // Weekend / pre-market cycle: deferred, state exactly what it was.
+    const deferred = await run(async () => false);
+    expect(deferred.every((d) => d.blockReasonCode === "ETF_ROTATION_MARKET_CLOSED")).toBe(true);
+    expect(executeSafeTrade).not.toHaveBeenCalled();
+    const afterDeferral = await readRebalanceStateStrict(statePath);
+    expect(afterDeferral.state).toEqual(before.state);
+    expect(afterDeferral.state.status).toBe("cancelled");
+
+    // Next cycle with the market open: no manual step in between.
+    const executed = await run(async () => true);
+    const calledTickers = executeSafeTrade.mock.calls.map((call) => call[0]);
+    expect(calledTickers).toEqual(expect.arrayContaining(["SPY", "QQQ"]));
+    expect(executed.find((d) => d.ticker === "SPY")?.executed).toBe(true);
+    expect((await readRebalanceStateStrict(statePath)).state.status).toBe("executed");
   });
 });

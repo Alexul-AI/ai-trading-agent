@@ -99,6 +99,11 @@ export function makeThrowingExecuteSafeTrade() {
   });
 }
 
+/** A broker clock that always says the market is open - for scenarios that exercise real execution and are not about the market-hours gate itself (which defers whenever the clock is closed or unreadable, so a worker built without one never executes). */
+export function makeAlwaysOpenGetMarketIsOpen() {
+  return vi.fn(async (): Promise<boolean> => true);
+}
+
 /** Same "prove it's genuinely unreached" convention as makeThrowingExecuteSafeTrade - waitForSellFill only calls this for an accepted liquidate_existing SELL leg, which none of the non-rebuild characterization scenarios reach. */
 export function makeThrowingGetOrderStatus() {
   return vi.fn(async (): Promise<string> => {

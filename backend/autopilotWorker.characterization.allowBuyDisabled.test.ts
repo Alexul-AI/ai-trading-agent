@@ -4,6 +4,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   assertRealDataFilesUnchanged,
+  makeAlwaysOpenGetMarketIsOpen,
   makeDailyBarsSeries,
   makePortfolioSnapshot,
   makeTempDataDir,
@@ -62,6 +63,7 @@ describe("autopilotWorker characterization: AUTOPILOT_ALLOW_BUY/ALLOW_SELL=false
       getEquityHistorySince: async () => [],
       executeSafeTrade,
       getOrderStatus: makeThrowingGetOrderStatus(),
+      getMarketIsOpen: makeAlwaysOpenGetMarketIsOpen(),
       broadcastSSE: () => {},
       testDataFilePaths: {
         lockFilePath: path.join(tempDir, "autopilot-worker.lock"),
