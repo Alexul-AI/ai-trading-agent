@@ -1520,11 +1520,21 @@ describe("createWaitForSellFill", () => {
 });
 
 describe("resolveEtfRotationSellFillTimingMs", () => {
-  it("defaults to 10000ms timeout / 500ms poll when both env vars are absent", () => {
+  it("defaults to 60000ms timeout / 1000ms poll when both env vars are absent", () => {
     expect(resolveEtfRotationSellFillTimingMs(undefined, undefined)).toEqual({
-      timeoutMs: 10000,
-      pollIntervalMs: 500,
+      timeoutMs: 60000,
+      pollIntervalMs: 1000,
     });
+  });
+
+  it("the default timeout covers the slowest SELL fill actually observed in production (SPY, 2026-10-01: 32.95s) and stays below the production worker-lock staleness window even for the worst case of 5 sequential SELLs", () => {
+    const { timeoutMs } = resolveEtfRotationSellFillTimingMs(undefined, undefined);
+    const slowestObservedFillMs = 32_950;
+    const productionLockStaleAfterMs = 600_000;
+    const maxSellLegs = 5;
+
+    expect(timeoutMs).toBeGreaterThan(slowestObservedFillMs);
+    expect(timeoutMs * maxSellLegs).toBeLessThan(productionLockStaleAfterMs);
   });
 
   it("uses explicit values when set", () => {

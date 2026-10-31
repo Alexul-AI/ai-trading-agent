@@ -239,6 +239,16 @@ function sanitizePollError(error: unknown): string {
  * fail-loud-at-module-load convention as resolveRampMaxPositionEquityPercent
  * - a fat-fingered value ("10abc") must never silently become a truncated
  * number.
+ *
+ * Defaults: 60s timeout / 1s poll (2026-10, was 10s / 500ms). On 2026-10-01
+ * both rebalance SELLs were accepted and filled 32.95s (SPY) and 22.50s
+ * (QQQ) after submission, so the old 10s wait gave up and the rebalance
+ * ended failed_needs_review (September's SELL had filled in 1.48s). 60s
+ * covers the worst observed fill with ~1.8x headroom and is still a hard,
+ * finite bound; polling every 1s halves the status-request rate. Worst
+ * case a cycle spends timeout x (number of SELL legs) waiting - at most 5
+ * SELLs for the 5-ETF universe, i.e. 5 minutes, below the 10-minute
+ * AUTOPILOT_LOCK_STALE_AFTER_MS used in production.
  */
 export function resolveEtfRotationSellFillTimingMs(
   rawTimeoutMs: string | undefined,
@@ -247,12 +257,12 @@ export function resolveEtfRotationSellFillTimingMs(
   const timeoutMs = parseStrictPositiveIntEnv(
     "AUTOPILOT_ETF_ROTATION_SELL_FILL_TIMEOUT_MS",
     rawTimeoutMs,
-    10000,
+    60000,
   );
   const pollIntervalMs = parseStrictPositiveIntEnv(
     "AUTOPILOT_ETF_ROTATION_SELL_FILL_POLL_MS",
     rawPollIntervalMs,
-    500,
+    1000,
   );
   return { timeoutMs, pollIntervalMs };
 }
