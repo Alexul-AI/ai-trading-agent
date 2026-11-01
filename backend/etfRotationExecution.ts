@@ -158,11 +158,21 @@ const TERMINAL_NOT_FILLED_ORDER_STATUSES = new Set([
  * unknown" and just retried on the next poll rather than surfaced - if it
  * keeps failing until the timeout, that correctly resolves to "unconfirmed"
  * on its own, no separate error handling needed.
+ *
+ * `timeoutMs` is a hard bound on the whole wait, not just a deadline looked
+ * at between polls: every status request is itself raced against the time
+ * left (capped at `singlePollTimeoutCapMs` so one stalled request cannot eat
+ * the whole budget and the next poll still gets its turn), and the sleep
+ * between polls never runs past the deadline. A request that never answers
+ * therefore ends the wait as "unconfirmed" at ~`timeoutMs`, with the stalled
+ * poll counted as a poll error - it can no longer hold the cycle (and the
+ * worker lock) forever.
  */
 export function createWaitForSellFill(
   getOrderStatus: GetOrderStatus,
   pollIntervalMs: number,
   timeoutMs: number,
+  singlePollTimeoutCapMs: number = MAX_SINGLE_POLL_MS,
 ): WaitForSellFill {
   return async (
     brokerOrderId: string,
@@ -190,10 +200,23 @@ export function createWaitForSellFill(
     };
 
     while (true) {
+      // The sleep below is capped to the time left, so it can end exactly at
+      // the deadline. Don't start a poll with a zero budget there: it would
+      // be recorded as a poll failure that never really happened.
+      if (pollAttempts > 0 && Date.now() >= deadline) return finish("unconfirmed");
+
       let status = "";
       pollAttempts += 1;
+      const pollBudgetMs = Math.min(
+        Math.max(0, deadline - Date.now()),
+        singlePollTimeoutCapMs,
+      );
       try {
-        status = await getOrderStatus(brokerOrderId);
+        status = await withTimeout(
+          getOrderStatus(brokerOrderId),
+          pollBudgetMs,
+          `status poll timed out after ${pollBudgetMs}ms`,
+        );
         lastObservedStatus = status;
       } catch (error) {
         // Still treated as unknown and retried - see the function doc
@@ -210,9 +233,32 @@ export function createWaitForSellFill(
       }
       if (Date.now() >= deadline) return finish("unconfirmed");
 
-      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(pollIntervalMs, Math.max(0, deadline - Date.now()))),
+      );
     }
   };
+}
+
+// One status request is normally well under a second; this only bounds a
+// stalled one.
+const MAX_SINGLE_POLL_MS = 10_000;
+
+// Rejects with `message` if `promise` has not settled within `ms`. The
+// underlying request cannot be cancelled from here, so if it settles later
+// its result is simply ignored (Promise.race has already attached handlers
+// to it, so a late rejection is not an unhandled one).
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+    }),
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
 }
 
 const MAX_POLL_ERROR_LENGTH = 200;
