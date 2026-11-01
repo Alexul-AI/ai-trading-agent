@@ -479,6 +479,10 @@ describe("runEtfRotationCycle: market-hours gate (deferral, never a terminal fai
       expect(decision.executed).toBe(false);
       expect(decision.executionStatus).toBe("not_attempted");
       expect(decision.blockReasonCode).toBe("ETF_ROTATION_MARKET_CLOSED");
+      // Not NOT_REBALANCE_DAY: this is a rebalance day that was deferred,
+      // and the journal summary counts decisions per reasonType.
+      expect(decision.reasonType).toBe("ETF_ROTATION_MARKET_CLOSED");
+      expect(decision.reasonType).not.toBe("NOT_REBALANCE_DAY");
       expect(decision.reason).toContain("no manual clear is needed");
     }
   });
@@ -496,6 +500,7 @@ describe("runEtfRotationCycle: market-hours gate (deferral, never a terminal fai
       expect(await exists(statePath)).toBe(false);
       for (const decision of decisions) {
         expect(decision.blockReasonCode).toBe("ETF_ROTATION_MARKET_CLOCK_UNAVAILABLE");
+        expect(decision.reasonType).toBe("ETF_ROTATION_MARKET_CLOCK_UNAVAILABLE");
         expect(decision.blockReasonCategory).toBe("error");
         expect(decision.reason).toContain("HTTP 503");
       }
@@ -566,6 +571,7 @@ describe("runEtfRotationCycle: market-hours gate (deferral, never a terminal fai
     // Weekend / pre-market cycle: deferred, state exactly what it was.
     const deferred = await run(async () => false);
     expect(deferred.every((d) => d.blockReasonCode === "ETF_ROTATION_MARKET_CLOSED")).toBe(true);
+    expect(deferred.every((d) => d.reasonType === "ETF_ROTATION_MARKET_CLOSED")).toBe(true);
     expect(executeSafeTrade).not.toHaveBeenCalled();
     const afterDeferral = await readRebalanceStateStrict(statePath);
     expect(afterDeferral.state).toEqual(before.state);

@@ -562,6 +562,16 @@ export async function runEtfRotationCycle(
         );
       }
 
+      // reasonType is the same code as blockReasonCode, deliberately NOT
+      // "NOT_REBALANCE_DAY": this IS a rebalance day whose execution was
+      // deferred. The journal summary counts decisions per reasonType, so
+      // reusing NOT_REBALANCE_DAY would bury a deferral among the hundreds
+      // of ordinary "already rebalanced this month" cycles and read as a
+      // plain HOLD.
+      const deferralCode = closed
+        ? "ETF_ROTATION_MARKET_CLOSED"
+        : "ETF_ROTATION_MARKET_CLOCK_UNAVAILABLE";
+
       return config.universe.map(
         (ticker): AutopilotDecisionLog => ({
           ticker,
@@ -570,16 +580,14 @@ export async function runEtfRotationCycle(
           action: "HOLD",
           confidence: 0,
           suggestedShares: 0,
-          reasonType: "NOT_REBALANCE_DAY",
+          reasonType: deferralCode,
           reason,
           finalStatus: "blocked",
           signalStatus: "blocked",
           executionStatus: "not_attempted",
           isSignalReady: false,
           blockReasonCategory: closed ? "other" : "error",
-          blockReasonCode: closed
-            ? "ETF_ROTATION_MARKET_CLOSED"
-            : "ETF_ROTATION_MARKET_CLOCK_UNAVAILABLE",
+          blockReasonCode: deferralCode,
           blockReasonDetail: reason,
           executed: false,
           skippedReason: reason,

@@ -13,7 +13,12 @@ export type ReasonType =
   | "REBALANCE_BUY"
   | "REBALANCE_SELL"
   | "REBALANCE_HOLD"
-  | "NOT_REBALANCE_DAY";
+  | "NOT_REBALANCE_DAY"
+  // A rebalance day whose execution was deferred (market closed / clock
+  // unreadable) - distinct from NOT_REBALANCE_DAY, see
+  // backend/etfRotationCycle.ts's market-hours gate.
+  | "ETF_ROTATION_MARKET_CLOSED"
+  | "ETF_ROTATION_MARKET_CLOCK_UNAVAILABLE";
 
 export interface Position {
   shares: number;
