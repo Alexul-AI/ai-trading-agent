@@ -547,6 +547,7 @@ export function createAutopilotWorker(options: AutopilotWorkerOptions) {
           executeSafeTrade: options.executeSafeTrade,
           getPortfolioSnapshot: options.getPortfolioSnapshot,
           waitForSellFill,
+          getMarketIsOpen: options.getMarketIsOpen,
           etfRotationStateFilePath: options.testDataFilePaths?.etfRotationStateFilePath,
           etfRotationOrderAuditLogFilePath:
             options.testDataFilePaths?.etfRotationOrderAuditLogFilePath,

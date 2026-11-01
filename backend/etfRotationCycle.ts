@@ -165,6 +165,49 @@ export function mapEtfRotationExecutionStatusToRebalanceStatus(
   }
 }
 
+export type MarketClockCheckResult =
+  | { status: "open" }
+  | { status: "closed" }
+  | { status: "unavailable"; error: string };
+
+const MARKET_CLOCK_CHECK_TIMEOUT_MS = 10_000;
+
+/**
+ * Reads the broker's market clock and fails closed: anything other than an
+ * explicit `true` from a clock read that finished in time is "not open" -
+ * a thrown error and a hang (bounded by timeoutMs, since the underlying
+ * fetch has no timeout of its own) both come back as "unavailable", never
+ * as a guess that the market is open.
+ */
+export async function checkMarketIsOpen(
+  getMarketIsOpen: () => Promise<boolean>,
+  timeoutMs: number = MARKET_CLOCK_CHECK_TIMEOUT_MS,
+): Promise<MarketClockCheckResult> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    const isOpen = await Promise.race([
+      getMarketIsOpen(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`market clock read timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+
+    return isOpen === true ? { status: "open" } : { status: "closed" };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      status: "unavailable",
+      error: message.replace(/\s+/g, " ").trim().slice(0, 200),
+    };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export interface RunEtfRotationCycleParams {
   portfolio: PortfolioSnapshot;
   config: EtfRotationConfig;
@@ -180,6 +223,14 @@ export interface RunEtfRotationCycleParams {
   getPortfolioSnapshot: () => Promise<PortfolioSnapshot>;
   /** See ExecuteEtfRotationOrdersParams.waitForSellFill's own doc comment. */
   waitForSellFill: WaitForSellFill;
+  /**
+   * Live broker clock (Alpaca /v2/clock `is_open`). Required, not optional:
+   * a construction that forgets it must be a compile error, not a gate that
+   * silently isn't there. Only consulted when order execution is enabled
+   * and a rebalance is actually about to be planned - never in dry-run, and
+   * never on a month that is already rebalanced.
+   */
+  getMarketIsOpen: () => Promise<boolean>;
   etfRotationStateFilePath?: string;
   etfRotationOrderAuditLogFilePath?: string;
 }
@@ -200,6 +251,7 @@ export async function runEtfRotationCycle(
     executeSafeTrade,
     getPortfolioSnapshot,
     waitForSellFill,
+    getMarketIsOpen,
     etfRotationStateFilePath,
     etfRotationOrderAuditLogFilePath,
   } = params;
@@ -485,6 +537,64 @@ export async function runEtfRotationCycle(
     currentPriceByTicker,
     config.universe,
   );
+
+  // Market-hours gate (2026-10). Placed after every read-only calculation
+  // (bars, targets, orders) and before the FIRST state write, so a deferral
+  // changes nothing on disk: the rebalance stays exactly as unfinished as it
+  // was, and the next cycle simply tries again - never a terminal status,
+  // never a manual clear. Only when real execution is enabled: dry-run has
+  // nothing to protect and must not depend on the clock API. A closed
+  // market or an unreadable clock both defer; the rotation path used to have
+  // no clock check at all (only the repair endpoint did), so a recovery
+  // after `clear-review` on a weekend would have sent BUYs to a closed market.
+  if (executionGates.executeTradesEnabled) {
+    const marketCheck = await checkMarketIsOpen(getMarketIsOpen);
+
+    if (marketCheck.status !== "open") {
+      const closed = marketCheck.status === "closed";
+      const reason = closed
+        ? `ETF Rotation rebalance for ${monthKey} is deferred: the market is closed per the Alpaca clock. Nothing was changed; the next cycle retries automatically - no manual clear is needed.`
+        : `ETF Rotation rebalance for ${monthKey} is deferred: the Alpaca market clock could not be read (${marketCheck.error}). Failing closed, nothing was changed; the next cycle retries automatically - no manual clear is needed.`;
+
+      if (!closed) {
+        console.warn(
+          `[ETF_ROTATION] Market clock unavailable - rebalance for ${monthKey} deferred: ${marketCheck.error}`,
+        );
+      }
+
+      // reasonType is the same code as blockReasonCode, deliberately NOT
+      // "NOT_REBALANCE_DAY": this IS a rebalance day whose execution was
+      // deferred. The journal summary counts decisions per reasonType, so
+      // reusing NOT_REBALANCE_DAY would bury a deferral among the hundreds
+      // of ordinary "already rebalanced this month" cycles and read as a
+      // plain HOLD.
+      const deferralCode = closed
+        ? "ETF_ROTATION_MARKET_CLOSED"
+        : "ETF_ROTATION_MARKET_CLOCK_UNAVAILABLE";
+
+      return config.universe.map(
+        (ticker): AutopilotDecisionLog => ({
+          ticker,
+          timestamp,
+          price: currentPriceByTicker.get(ticker) ?? 0,
+          action: "HOLD",
+          confidence: 0,
+          suggestedShares: 0,
+          reasonType: deferralCode,
+          reason,
+          finalStatus: "blocked",
+          signalStatus: "blocked",
+          executionStatus: "not_attempted",
+          isSignalReady: false,
+          blockReasonCategory: closed ? "other" : "error",
+          blockReasonCode: deferralCode,
+          blockReasonDetail: reason,
+          executed: false,
+          skippedReason: reason,
+        }),
+      );
+    }
+  }
 
   // Status "planned".
   await recordRebalancePlanned(

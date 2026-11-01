@@ -767,12 +767,20 @@ async function getOrderStatus(orderId: string): Promise<string> {
   return toStringValue(order.status);
 }
 
+// Broker market clock for the ETF Rotation market-hours gate: strictly the
+// regular session per Alpaca's own /v2/clock `is_open`, never server-local
+// time. A thrown error here is handled by the gate (it defers the cycle).
+async function getMarketIsOpen(): Promise<boolean> {
+  return (await fetchAlpacaMarketClock()).isOpen;
+}
+
 const autopilotWorker = createAutopilotWorker({
   tradeMode: ENV.TRADE_MODE,
   getPortfolioSnapshot,
   getEquityHistorySince,
   executeSafeTrade,
   getOrderStatus,
+  getMarketIsOpen,
   broadcastSSE,
   sendTelegramAlert,
 });
