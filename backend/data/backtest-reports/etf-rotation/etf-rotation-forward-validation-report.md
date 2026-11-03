@@ -1,11 +1,11 @@
 # ETF rotation forward validation report
 
-Generated: 2026-10-27T01:57:31.655Z
+Generated: 2026-11-03T03:53:28.447Z
 Target anchor (candidate-hold3 named, historical out-of-sample declared exhausted): 2026-07-14
 
 ## Simulated window (fresh cash start, pinned to the anchor)
-- baseline-2: 2026-07-14 to 2026-10-26 (74 trading days)
-- candidate-hold3: 2026-07-14 to 2026-10-26 (74 trading days)
+- baseline-2: 2026-07-14 to 2026-11-02 (79 trading days)
+- candidate-hold3: 2026-07-14 to 2026-11-02 (79 trading days)
 - Achieved start is exactly on the target anchor (no pre-anchor data included).
 
 Both simulations start with pure cash and execute their first rebalance immediately on day one (isMonthlyRebalanceDate's "first simulated day" rule). The simulated window is pinned to never start earlier than the anchor (via runEtfRotationWindowAnalysis's simStartDateOverride) - pre-anchor price history is used only to warm up momentum/SMA indicators, never simulated or traded. This fixes a real bug caught in review before merge: an earlier version of this script let the simulation start wherever warmup happened to clear, which drifted 26 calendar days before the anchor and included pre-anchor performance in what was meant to be a forward-only read (see PR #31 review).
@@ -13,13 +13,15 @@ Both simulations start with pure cash and execute their first rebalance immediat
 ## Result (NEXT_OPEN)
 | series | return% | maxDD% | trading days | rebalances |
 |---|---|---|---|---|
-| baseline-2 | 0.04 | -5.28 | 74 | 4 |
-| candidate-hold3 | -0.84 | -3.86 | 74 | 4 |
+| baseline-2 | -2.61 | -6.10 | 79 | 5 |
+| candidate-hold3 | -2.35 | -4.68 | 79 | 5 |
+
+A rebalance decided on the last simulated day had no following day to execute on yet (NEXT_OPEN window-edge effect) - it will appear in the Decisions section below once this script is re-run after that day has passed, not dropped silently.
 
 
 ## Benchmarks (same period, context)
-- SPY buy & hold: 1.77%
-- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): -0.86%
+- SPY buy & hold: 0.01%
+- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): -2.24%
 
 ## Decisions - baseline-2
 - 2026-07-15 BUY QQQ - 6 sh @ $724.52 (~43.6% of equity)
@@ -67,7 +69,7 @@ Both simulations start with pure cash and execute their first rebalance immediat
 - Regardless of the read at any sample size: this is supplementary color on top of the already-completed historical multi-window validation (PR #27/#28), not a replacement for it. It does not by itself trigger promoting candidate-hold3 to DEFAULT_ETF_ROTATION_CONFIG - that stays a separate, explicit, user-approved step.
 
 ## Current read
-4 rebalances since the anchor - candidate-hold3 holding up so far (maxDD not worse, return within 5pt tolerance of baseline-2).
+5 rebalances since the anchor - candidate-hold3 holding up so far (maxDD not worse, return within 5pt tolerance of baseline-2).
 
 ## Caveats
 - Raw Alpaca bars (adjustment=raw) - no dividends/distributions, same caveat as every other ETF rotation report in this repo.
