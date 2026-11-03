@@ -1393,13 +1393,15 @@ describe("createWaitForSellFill", () => {
       getOrderStatus: GetOrderStatus,
       pollIntervalMs: number,
       timeoutMs: number,
+      singlePollTimeoutCapMs?: number,
     ): Promise<{ outcome: SellFillWaitOutcome; reports: SellFillWaitDiagnostics[] }> {
       const reports: SellFillWaitDiagnostics[] = [];
-      const outcome = await createWaitForSellFill(getOrderStatus, pollIntervalMs, timeoutMs)(
-        "order-1",
-        "SPY",
-        (d) => reports.push(d),
-      );
+      const outcome = await createWaitForSellFill(
+        getOrderStatus,
+        pollIntervalMs,
+        timeoutMs,
+        singlePollTimeoutCapMs,
+      )("order-1", "SPY", (d) => reports.push(d));
       return { outcome, reports };
     }
 
@@ -1491,6 +1493,73 @@ describe("createWaitForSellFill", () => {
       expect(reports[0]!.lastPollError).toBe("socket hang up");
     });
 
+    // The timeout must be a real bound, not just a deadline that is looked at
+    // between polls: a status request that never answers (a stalled
+    // connection to the broker) would otherwise hold the whole cycle, and
+    // the worker lock with it, forever.
+    describe("a status request that never answers cannot hold the wait past the timeout", () => {
+      const NEVER_ANSWERS: GetOrderStatus = () => new Promise<string>(() => {});
+
+      it("returns unconfirmed at about the overall timeout, and the diagnostics say the poll timed out rather than the broker answering 'pending'", async () => {
+        const startedAt = Date.now();
+        const { outcome, reports } = await runWithDiagnostics(NEVER_ANSWERS, 5, 80);
+        const elapsed = Date.now() - startedAt;
+
+        expect(outcome).toBe("unconfirmed");
+        expect(elapsed).toBeGreaterThanOrEqual(70);
+        expect(elapsed).toBeLessThan(500);
+        expect(reports).toHaveLength(1);
+        expect(reports[0]!.lastObservedStatus).toBeNull();
+        expect(reports[0]!.pollAttempts).toBe(1);
+        expect(reports[0]!.pollErrorCount).toBe(1);
+        expect(reports[0]!.lastPollError).toContain("timed out");
+        expect(reports[0]!.elapsedMs).toBeGreaterThanOrEqual(70);
+        expect(reports[0]!.elapsedMs).toBeLessThan(500);
+      });
+
+      it("a single hung poll is bounded by the per-poll cap, so the next poll still gets its turn within the same overall timeout", async () => {
+        let calls = 0;
+        const { outcome, reports } = await runWithDiagnostics(
+          () => {
+            calls += 1;
+            return calls === 1 ? new Promise<string>(() => {}) : Promise.resolve("filled");
+          },
+          5,
+          2000,
+          25,
+        );
+
+        expect(outcome).toBe("filled");
+        expect(reports[0]).toMatchObject({
+          lastObservedStatus: "filled",
+          pollAttempts: 2,
+          pollErrorCount: 1,
+        });
+        expect(reports[0]!.lastPollError).toContain("timed out after 25ms");
+        // Nowhere near the 2000ms overall timeout - the hung poll cost only its own cap.
+        expect(reports[0]!.elapsedMs).toBeLessThan(500);
+      });
+
+      it("the sleep between polls is also capped by the time left, so a long poll interval cannot overshoot the deadline", async () => {
+        const startedAt = Date.now();
+        const { outcome } = await runWithDiagnostics(async () => "accepted", 500, 60);
+        const elapsed = Date.now() - startedAt;
+
+        expect(outcome).toBe("unconfirmed");
+        expect(elapsed).toBeLessThan(300);
+      });
+
+      it("a request that rejects only after the wait has already given up does not surface as an unhandled rejection", async () => {
+        const lateRejection: GetOrderStatus = () =>
+          new Promise<string>((_, reject) => setTimeout(() => reject(new Error("late failure")), 40));
+
+        const { outcome } = await runWithDiagnostics(lateRejection, 5, 20);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+
+        expect(outcome).toBe("unconfirmed");
+      });
+    });
+
     it("sanitizes a poll error: collapses newlines/whitespace to one line, caps the length, and never includes anything but the message text", async () => {
       const longMultiline = `Request failed\n  with   status code 500\n${"x".repeat(500)}`;
       const error = Object.assign(new Error(longMultiline), {
@@ -1520,11 +1589,21 @@ describe("createWaitForSellFill", () => {
 });
 
 describe("resolveEtfRotationSellFillTimingMs", () => {
-  it("defaults to 10000ms timeout / 500ms poll when both env vars are absent", () => {
+  it("defaults to 60000ms timeout / 1000ms poll when both env vars are absent", () => {
     expect(resolveEtfRotationSellFillTimingMs(undefined, undefined)).toEqual({
-      timeoutMs: 10000,
-      pollIntervalMs: 500,
+      timeoutMs: 60000,
+      pollIntervalMs: 1000,
     });
+  });
+
+  it("the default timeout covers the slowest SELL fill actually observed in production (SPY, 2026-10-01: 32.95s) and stays below the production worker-lock staleness window even for the worst case of 5 sequential SELLs", () => {
+    const { timeoutMs } = resolveEtfRotationSellFillTimingMs(undefined, undefined);
+    const slowestObservedFillMs = 32_950;
+    const productionLockStaleAfterMs = 600_000;
+    const maxSellLegs = 5;
+
+    expect(timeoutMs).toBeGreaterThan(slowestObservedFillMs);
+    expect(timeoutMs * maxSellLegs).toBeLessThan(productionLockStaleAfterMs);
   });
 
   it("uses explicit values when set", () => {
