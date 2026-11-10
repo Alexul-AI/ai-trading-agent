@@ -1,11 +1,11 @@
 # ETF rotation forward validation report
 
-Generated: 2026-11-03T03:53:28.447Z
+Generated: 2026-11-10T04:33:43.217Z
 Target anchor (candidate-hold3 named, historical out-of-sample declared exhausted): 2026-07-14
 
 ## Simulated window (fresh cash start, pinned to the anchor)
-- baseline-2: 2026-07-14 to 2026-11-02 (79 trading days)
-- candidate-hold3: 2026-07-14 to 2026-11-02 (79 trading days)
+- baseline-2: 2026-07-14 to 2026-11-09 (84 trading days)
+- candidate-hold3: 2026-07-14 to 2026-11-09 (84 trading days)
 - Achieved start is exactly on the target anchor (no pre-anchor data included).
 
 Both simulations start with pure cash and execute their first rebalance immediately on day one (isMonthlyRebalanceDate's "first simulated day" rule). The simulated window is pinned to never start earlier than the anchor (via runEtfRotationWindowAnalysis's simStartDateOverride) - pre-anchor price history is used only to warm up momentum/SMA indicators, never simulated or traded. This fixes a real bug caught in review before merge: an earlier version of this script let the simulation start wherever warmup happened to clear, which drifted 26 calendar days before the anchor and included pre-anchor performance in what was meant to be a forward-only read (see PR #31 review).
@@ -13,15 +13,13 @@ Both simulations start with pure cash and execute their first rebalance immediat
 ## Result (NEXT_OPEN)
 | series | return% | maxDD% | trading days | rebalances |
 |---|---|---|---|---|
-| baseline-2 | -2.61 | -6.10 | 79 | 5 |
-| candidate-hold3 | -2.35 | -4.68 | 79 | 5 |
-
-A rebalance decided on the last simulated day had no following day to execute on yet (NEXT_OPEN window-edge effect) - it will appear in the Decisions section below once this script is re-run after that day has passed, not dropped silently.
+| baseline-2 | -1.91 | -7.83 | 84 | 5 |
+| candidate-hold3 | -2.12 | -7.10 | 84 | 5 |
 
 
 ## Benchmarks (same period, context)
-- SPY buy & hold: 0.01%
-- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): -2.24%
+- SPY buy & hold: 0.10%
+- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): -1.03%
 
 ## Decisions - baseline-2
 - 2026-07-15 BUY QQQ - 6 sh @ $724.52 (~43.6% of equity)
@@ -38,6 +36,10 @@ A rebalance decided on the last simulated day had no following day to execute on
 - 2026-10-02 SELL QQQ - 7 sh @ $750.93 (~51.3% of equity)
 - 2026-10-02 BUY QQQ - 6 sh @ $751.69 (~44.0% of equity)
 - 2026-10-02 BUY SPY - 6 sh @ $771.07 (~45.1% of equity)
+- 2026-11-03 SELL SPY - 6 sh @ $752.23 (~46.4% of equity)
+- 2026-11-03 SELL QQQ - 6 sh @ $683.79 (~42.2% of equity)
+- 2026-11-03 BUY SPY - 6 sh @ $752.99 (~46.4% of equity)
+- 2026-11-03 BUY EFA - 47 sh @ $103.80 (~50.1% of equity)
 
 ## Decisions - candidate-hold3
 - 2026-07-15 BUY QQQ - 4 sh @ $724.52 (~29.0% of equity)
@@ -61,6 +63,12 @@ A rebalance decided on the last simulated day had no following day to execute on
 - 2026-10-02 BUY QQQ - 4 sh @ $751.69 (~29.7% of equity)
 - 2026-10-02 BUY SPY - 4 sh @ $771.07 (~30.5% of equity)
 - 2026-10-02 BUY EFA - 32 sh @ $103.76 (~32.8% of equity)
+- 2026-11-03 SELL SPY - 4 sh @ $752.23 (~30.8% of equity)
+- 2026-11-03 SELL QQQ - 4 sh @ $683.79 (~28.0% of equity)
+- 2026-11-03 SELL EFA - 32 sh @ $103.70 (~34.0% of equity)
+- 2026-11-03 BUY SPY - 4 sh @ $752.99 (~30.9% of equity)
+- 2026-11-03 BUY EFA - 31 sh @ $103.80 (~33.0% of equity)
+- 2026-11-03 BUY QQQ - 4 sh @ $684.47 (~28.0% of equity)
 
 ## Pre-declared read criteria (written before any forward data existed)
 - 0 rebalances: nothing to read yet.
