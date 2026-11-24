@@ -1,11 +1,11 @@
 # ETF rotation forward validation report
 
-Generated: 2026-11-17T05:00:35.607Z
+Generated: 2026-11-24T06:53:17.867Z
 Target anchor (candidate-hold3 named, historical out-of-sample declared exhausted): 2026-07-14
 
 ## Simulated window (fresh cash start, pinned to the anchor)
-- baseline-2: 2026-07-14 to 2026-11-16 (89 trading days)
-- candidate-hold3: 2026-07-14 to 2026-11-16 (89 trading days)
+- baseline-2: 2026-07-14 to 2026-11-23 (94 trading days)
+- candidate-hold3: 2026-07-14 to 2026-11-23 (94 trading days)
 - Achieved start is exactly on the target anchor (no pre-anchor data included).
 
 Both simulations start with pure cash and execute their first rebalance immediately on day one (isMonthlyRebalanceDate's "first simulated day" rule). The simulated window is pinned to never start earlier than the anchor (via runEtfRotationWindowAnalysis's simStartDateOverride) - pre-anchor price history is used only to warm up momentum/SMA indicators, never simulated or traded. This fixes a real bug caught in review before merge: an earlier version of this script let the simulation start wherever warmup happened to clear, which drifted 26 calendar days before the anchor and included pre-anchor performance in what was meant to be a forward-only read (see PR #31 review).
@@ -13,13 +13,13 @@ Both simulations start with pure cash and execute their first rebalance immediat
 ## Result (NEXT_OPEN)
 | series | return% | maxDD% | trading days | rebalances |
 |---|---|---|---|---|
-| baseline-2 | -3.75 | -7.83 | 89 | 5 |
-| candidate-hold3 | -4.02 | -7.10 | 89 | 5 |
+| baseline-2 | -6.63 | -13.01 | 94 | 5 |
+| candidate-hold3 | -6.35 | -12.24 | 94 | 5 |
 
 
 ## Benchmarks (same period, context)
-- SPY buy & hold: -1.58%
-- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): -4.33%
+- SPY buy & hold: -3.91%
+- Equal-weight 5-ETF (approx. - simple average of individual price returns, not a whole-share rebalanced sim): -6.36%
 
 ## Decisions - baseline-2
 - 2026-07-15 BUY QQQ - 6 sh @ $724.52 (~43.6% of equity)
