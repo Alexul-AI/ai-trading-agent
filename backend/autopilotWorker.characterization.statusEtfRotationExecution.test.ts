@@ -77,8 +77,8 @@ describe("autopilotWorker getStatus: etfRotationExecution", () => {
 
     expect(status.etfRotationExecution).toEqual({
       rampMaxPositionEquityPercent: null,
-      sellFillTimeoutMs: 10000,
-      sellFillPollIntervalMs: 500,
+      sellFillTimeoutMs: 60000,
+      sellFillPollIntervalMs: 1000,
     });
   });
 
